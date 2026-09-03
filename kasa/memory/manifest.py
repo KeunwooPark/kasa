@@ -20,7 +20,13 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kasa.memory.document import MemoryDoc, MemoryError_, Problem, is_memory_id
+from kasa.memory.document import (
+    MemoryDoc,
+    MemoryError_,
+    Problem,
+    is_memory_id,
+    read_memory_bytes,
+)
 from kasa.memory.layout import MANIFEST_PATH, MEMORY_DIR, is_memory_path
 from kasa.memory.schema import SCHEMA_VERSION
 
@@ -87,7 +93,9 @@ class Manifest(BaseModel):
             if not is_memory_path(relative):
                 continue
             try:
-                doc = MemoryDoc.parse(path.read_bytes().decode(), source=relative)
+                doc = MemoryDoc.parse(
+                    read_memory_bytes(path, source=relative).decode(), source=relative
+                )
             except (MemoryError_, UnicodeDecodeError) as exc:
                 # Decoding explicitly, and counted as a problem rather than
                 # raised: a `.md` that is not text is one broken file, and it

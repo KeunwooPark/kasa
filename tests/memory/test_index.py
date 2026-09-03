@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import run_git
 from kasa.memory.index import MemoryIndex, blob_sha
 from kasa.memory.lease import INDEX_LEASE_NAME, Lease, LeaseError
+from kasa.memory.manifest import Manifest
 from kasa.store import Store
 
 
@@ -407,3 +410,81 @@ async def test_the_lock_is_not_put_in_the_repo(repo: Path, store: Store) -> None
     assert MemoryIndex(store, repo)._lock_path() == Path(store.path).parent / (
         f".{Path(store.path).name}.index.lock"
     )
+
+
+# -- entries under memory/ that are not readable files (#97) ------------------
+
+
+def a_directory(root: Path) -> None:
+    (root / "memory" / "facts" / "adir.md").mkdir(parents=True)
+
+
+def a_symlink_loop(root: Path) -> None:
+    target = root / "memory" / "facts" / "loop.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(target)
+
+
+def a_dangling_symlink(root: Path) -> None:
+    facts = root / "memory" / "facts"
+    facts.mkdir(parents=True, exist_ok=True)
+    (facts / "dangling.md").symlink_to(facts / "nope.md")
+
+
+def a_fifo(root: Path) -> None:
+    facts = root / "memory" / "facts"
+    facts.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(facts / "pipe.md")
+
+
+def an_unreadable_file(root: Path) -> None:
+    path = root / "memory" / "facts" / "locked.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(MemoryDoc.new(type="fact", title="Locked", body="b").render())
+    path.chmod(0o000)
+
+
+@pytest.mark.parametrize(
+    ("make", "name"),
+    [
+        (a_directory, "adir.md"),
+        (a_symlink_loop, "loop.md"),
+        (a_dangling_symlink, "dangling.md"),
+        # A fifo is the one that could not be fixed by catching anything: the
+        # open blocks forever with no writer. Hence the shape check.
+        (a_fifo, "pipe.md"),
+        (an_unreadable_file, "locked.md"),
+    ],
+)
+async def test_an_entry_that_is_not_a_readable_file_costs_only_itself(
+    repo: Path, store: Store, make: Callable[[Path], None], name: str
+) -> None:
+    """#97. `rglob("*.md")` matches on the name, and every one of these raised
+    an `OSError` nobody caught — so one entry created by accident cost the whole
+    index and the whole manifest."""
+    add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    make(repo)
+
+    result = await MemoryIndex(store, repo).reindex()
+
+    assert result.indexed, "the readable memory was still indexed"
+    assert [p.path for p in result.problems] == [f"memory/facts/{name}"]
+    assert await search(store, "deploys")
+
+    manifest, problems = Manifest.rebuild(repo)
+    assert len(manifest) == 1
+    assert [p.path for p in problems] == [f"memory/facts/{name}"]
+
+
+async def test_a_symlink_to_a_real_file_is_still_indexed(repo: Path, store: Store) -> None:
+    """The guard is "not a readable file", not "not a plain path"."""
+    doc = MemoryDoc.new(type="fact", title="Elsewhere", body="Kept outside the tree.")
+    outside = repo.parent / "outside.md"
+    outside.write_text(doc.render())
+    (repo / "memory" / "facts").mkdir(parents=True, exist_ok=True)
+    (repo / "memory" / "facts" / "link.md").symlink_to(outside)
+
+    result = await MemoryIndex(store, repo).reindex()
+
+    assert result.problems == []
+    assert "memory/facts/link.md" in result.indexed

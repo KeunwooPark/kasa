@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from kasa.memory.chunk import Chunk, chunk_document
-from kasa.memory.document import MemoryDoc, MemoryError_, Problem
+from kasa.memory.document import MemoryDoc, MemoryError_, Problem, read_memory_bytes
 from kasa.memory.layout import MEMORY_DIR, is_memory_path
 from kasa.memory.lease import INDEX_LEASE_NAME, INDEX_LOCK_SUFFIX, Lease
 from kasa.store import Store
@@ -131,21 +131,25 @@ class MemoryIndex:
             relative = path.relative_to(self._root).as_posix()
             if not is_memory_path(relative):
                 continue
+            # Added before the read, so an entry that cannot be read is not
+            # then treated as deleted — its rows would be dropped on every run
+            # and `freshness` would report it as removed forever.
             on_disk.add(relative)
 
-            raw = path.read_bytes()
-            sha = blob_sha(raw)
-            if state.get(relative) == sha:
-                result.skipped.append(relative)
-                continue
-
             try:
+                raw = read_memory_bytes(path, source=relative)
+                sha = blob_sha(raw)
+                if state.get(relative) == sha:
+                    result.skipped.append(relative)
+                    continue
                 doc = MemoryDoc.parse(raw.decode(), source=relative)
             except (MemoryError_, UnicodeDecodeError) as exc:
                 # One file somebody broke by hand must not cost the whole index.
                 # `UnicodeDecodeError` because a `.md` that is not text at all —
                 # a stray binary, a bad `git add` — used to take the command
-                # down before it reported any of the work it had already done.
+                # down before it reported any of the work it had already done;
+                # `read_memory_bytes` covers the ways an entry can fail before
+                # its contents are even reached.
                 reason = exc.reason if isinstance(exc, MemoryError_) else str(exc)
                 log.warning("index: %s: %s", relative, reason)
                 result.problems.append(Problem(relative, reason))
@@ -197,10 +201,10 @@ class MemoryIndex:
                 continue
             on_disk.add(relative)
 
-            raw = path.read_bytes()
-            if state.get(relative) == blob_sha(raw):
-                continue
             try:
+                raw = read_memory_bytes(path, source=relative)
+                if state.get(relative) == blob_sha(raw):
+                    continue
                 MemoryDoc.parse(raw.decode(), source=relative)
             except (MemoryError_, UnicodeDecodeError):
                 fresh.unreadable.append(relative)
