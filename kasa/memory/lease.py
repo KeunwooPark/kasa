@@ -32,7 +32,21 @@ log = logging.getLogger(__name__)
 
 LEASE_NAME = "ltm"
 LOCK_FILENAME = "kasa-writer.lock"
+
+#: The index is a second resource with a second writer. It gets its own lease
+#: rather than sharing the repo's: making a reindex wait on an in-flight memory
+#: write, and vice versa, would be a bigger change than the problem warrants —
+#: a reindex reading the tree mid-write is a benign race the next reindex
+#: fixes, and a half-applied index is not (#95).
+INDEX_LEASE_NAME = "index"
+#: Appended to the database's own filename. The index lives in the database,
+#: so its lock belongs beside it rather than in the repo.
+INDEX_LOCK_SUFFIX = ".index.lock"
+
 DEFAULT_TTL = 900.0
+
+#: What each lease is called in the message somebody reads when it is taken.
+_DESCRIPTIONS = {LEASE_NAME: "memory write lease", INDEX_LEASE_NAME: "index rebuild lease"}
 
 
 class LeaseError(KasaError):
@@ -105,8 +119,8 @@ class Lease:
         # that died holding it.
         if (stale := await self._store.get_lease(self._name)) is not None:
             log.warning(
-                "took over the memory write lease from %s (job %s, since %s), "
-                "which did not release it",
+                "took over the %s from %s (job %s, since %s), which did not release it",
+                _DESCRIPTIONS.get(self._name, self._name),
                 stale["holder"],
                 stale["job"] or "unknown",
                 stale["acquired_at"],
@@ -141,14 +155,17 @@ class Lease:
         await self.release()
 
     async def _describe_holder(self) -> str:
+        what = _DESCRIPTIONS.get(self._name, f"{self._name} lease")
         row = await self._store.get_lease(self._name)
         if row is None:
+            # The flock is taken before the row is written, so a contender
+            # arriving inside that window sees a lock with nobody named. The
+            # refusal is still right; only the explanation is missing.
             return (
-                "another process holds the memory write lease "
-                f"(lock file {self._path}), but did not record who"
+                f"another process holds the {what} (lock file {self._path}), but did not record who"
             )
         return (
-            f"{row['holder']} holds the memory write lease for job "
+            f"{row['holder']} holds the {what} for job "
             f"{row['job'] or 'unknown'}, taken at {row['acquired_at']}"
         )
 

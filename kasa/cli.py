@@ -113,7 +113,9 @@ def reindex(
 ) -> None:
     """Rebuild the search index from the memory repo.
 
-    Safe at any time: the index is derived, and the repo is the source of truth.
+    Safe at any time: the index is derived, and the repo is the source of
+    truth. Not safe twice at once — a second run is refused rather than
+    interleaved with the first.
     """
     # Quiet by default. This command has its own report, and without any
     # logging configured the WARNING records behind that report went out

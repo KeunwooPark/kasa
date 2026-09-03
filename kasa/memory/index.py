@@ -23,6 +23,7 @@ from pathlib import Path
 from kasa.memory.chunk import Chunk, chunk_document
 from kasa.memory.document import MemoryDoc, MemoryError_, Problem
 from kasa.memory.layout import MEMORY_DIR, is_memory_path
+from kasa.memory.lease import INDEX_LEASE_NAME, INDEX_LOCK_SUFFIX, Lease
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -88,7 +89,36 @@ class MemoryIndex:
         self._root = root.expanduser()
 
     async def reindex(self, *, full: bool = False) -> IndexResult:
-        """Bring the index in step with the repo. Returns what it did."""
+        """Bring the index in step with the repo, under the index lease.
+
+        Serialized because `_replace` is delete-then-insert, and SQLite makes
+        each statement atomic rather than the pair: two runs both saw a path as
+        absent and both inserted, so the loser died on `UNIQUE constraint
+        failed: chunks.id` (#95). Nothing was lost — the index is derived — but
+        a command documented as safe at any time should not exit on a traceback.
+        """
+        lock = self._lock_path()
+        if lock is None:
+            return await self._reindex(full=full)
+        async with Lease(self._store, lock, name=INDEX_LEASE_NAME):
+            return await self._reindex(full=full)
+
+    def _lock_path(self) -> Path | None:
+        """Beside the database, not in the repo.
+
+        The database is what is being protected — the repo is only read — and
+        putting it in the repo meant fabricating a `.git` directory for a tree
+        that had none, which git then reads as a broken repository.
+
+        `None` for an in-memory store: each connection is its own database, so
+        there is nothing to serialize and no file to put a lock beside.
+        """
+        if self._store.path == ":memory:":
+            return None
+        database = Path(self._store.path)
+        return database.with_name(f".{database.name}{INDEX_LOCK_SUFFIX}")
+
+    async def _reindex(self, *, full: bool = False) -> IndexResult:
         if full:
             await self._store.write("DELETE FROM chunks")
             await self._store.write("DELETE FROM index_state")
