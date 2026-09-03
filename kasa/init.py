@@ -13,7 +13,6 @@ that already has memories in it.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -33,13 +32,10 @@ from kasa.config import (
     write_config,
 )
 from kasa.errors import ConfigError, GitError
-from kasa.github import GitHubClient, RepoInfo
+from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import bootstrap, is_bootstrapped, refresh_schema
 from kasa.memory.gitcmd import GitRepo, git_available
 from kasa.memory.layout import SCHEMA_PATH
-
-#: `owner/name`, as opposed to anything git would recognize as a URL.
-_FULL_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 _OPTIONAL_ROLES = {
     "utility": "summaries and consolidation; falls back to the chat model",
@@ -165,7 +161,7 @@ async def _resolve_on_github(
     prompter: Prompter, spec: str, settings: LTMSettings, *, github: GitHubClient | None
 ) -> RepoInfo | None:
     """Look the repo up, offering to create it. None for a plain git URL."""
-    if not _FULL_NAME.match(spec):
+    if not is_full_name(spec):
         prompter.warn(
             "Kasa cannot check that this repo is private, because it is not an "
             "owner/name on GitHub. Make sure it is."

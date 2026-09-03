@@ -7,6 +7,7 @@ carrying a hundred endpoints to serve three.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -17,6 +18,14 @@ from kasa.errors import GitHubError
 
 DEFAULT_API_URL = "https://api.github.com"
 _ACCEPT = "application/vnd.github+json"
+
+#: `owner/name`, as opposed to anything git would recognize as a URL.
+_FULL_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def is_full_name(spec: str) -> bool:
+    """True when `spec` names a GitHub repo the API can be asked about."""
+    return bool(_FULL_NAME.match(spec))
 
 
 @dataclass(frozen=True)

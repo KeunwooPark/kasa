@@ -18,9 +18,11 @@ from kasa.config import Config, config_path, load_config
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
 from kasa.core.tools import ToolRegistry, builtin_tools
+from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
+from kasa.redact import Redactor
 from kasa.store import Store
 
 app = typer.Typer(
@@ -73,7 +75,9 @@ def run(
     )
     if not cli:
         raise typer.BadParameter("only --cli is supported at v0")
-    _run(_repl(_load(config)))
+    cfg = _load(config)
+    Redactor.from_config(cfg).install()
+    _run(_repl(cfg))
 
 
 @app.command("config")
@@ -85,6 +89,22 @@ def show_config(config: ConfigOption = None) -> None:
     cfg = _load(config)
     console.print(f"[dim]{config or config_path()}[/dim]")
     console.print_json(json.dumps(cfg.redacted(), indent=2))
+
+
+@app.command()
+def doctor(config: ConfigOption = None) -> None:
+    """Check config, tokens, repo privacy, and the local clone.
+
+    Exits non-zero if anything failed, so it is usable as a health check.
+    """
+
+    async def main() -> None:
+        report = await diagnose(_load(config), path=config or config_path())
+        _print_report(report)
+        if not report.ok:
+            raise typer.Exit(1)
+
+    _run(main())
 
 
 @app.command()
@@ -175,7 +195,33 @@ def _load(path: Path | None) -> Config:
         raise typer.Exit(1) from exc
 
 
+_STATUS_STYLE = {
+    Status.OK: "[green]ok[/green]",
+    Status.WARN: "[yellow]warn[/yellow]",
+    Status.FAIL: "[red]FAIL[/red]",
+    Status.SKIP: "[dim]skip[/dim]",
+}
+
+
+def _print_report(report: Report) -> None:
+    table = Table(show_header=False, box=None)
+    table.add_column("status", no_wrap=True)
+    table.add_column("check", no_wrap=True)
+    # Folded, not truncated: the detail is usually a path, and a path with its
+    # middle replaced by an ellipsis is not something you can act on.
+    table.add_column("detail", overflow="fold")
+    for check in report.checks:
+        table.add_row(_STATUS_STYLE[check.status], check.name, check.detail)
+    console.print(table)
+    if not report.ok:
+        console.print(f"\n[red]{len(report.failed)} check(s) failed.[/red]")
+
+
 async def _repl(cfg: Config) -> None:
+    # A repo that silently became public is a serious incident, so visibility is
+    # re-checked on every start rather than trusted from setup time.
+    await verify_repo_visibility(cfg)
+
     # The store must be closed on every path, including a failure to build the
     # registry: aiosqlite holds a non-daemon thread per connection, so leaking
     # one leaves the process alive after the error has already been printed.
@@ -186,7 +232,7 @@ async def _repl(cfg: Config) -> None:
                 Agent(
                     registry=registry,
                     store=store,
-                    tools=ToolRegistry(builtin_tools()),
+                    tools=ToolRegistry(builtin_tools(), scrub=Redactor.from_config(cfg).scrub),
                     packer=ContextPacker(cfg.context.to_budget(), tokenizer=default_tokenizer()),
                     config=cfg.agent_config(),
                 ),

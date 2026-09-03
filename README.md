@@ -41,10 +41,15 @@ synthesizes one from whatever API key is exported and runs without memory.
 ```
 kasa init         interactive setup; bootstraps the memory repo
 kasa run          start the terminal adapter
+kasa doctor       check config, tokens, repo privacy, and the clone
 kasa config       print the resolved configuration
 kasa cost         token and spend totals
 kasa db migrate   apply pending migrations
 ```
+
+`kasa doctor` exits non-zero if any check failed, so it works as a health check.
+Kasa also re-checks on every start that the memory repo is still private, and
+refuses to run if it is not.
 
 ## Development
 
