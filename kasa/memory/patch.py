@@ -42,6 +42,12 @@ log = logging.getLogger(__name__)
 DELETING_JOBS = frozenset({"forget"})
 
 
+#: The filesystem's own limit on one path component, in bytes. Not a policy
+#: knob: past it the write fails with `OSError` wherever it happens, so the
+#: validator refuses it here rather than letting it out.
+MAX_PATH_COMPONENT = 255
+
+
 class PatchError(KasaError):
     """A plan was rejected. Nothing was written."""
 
@@ -436,6 +442,23 @@ class PatchCompiler:
             raise PatchError(
                 [Rejection(f"{path!r} is not a writable path under {MEMORY_DIR}/", index)]
             )
+        # Before anything touches the filesystem. `_create` used to reach
+        # `os.stat` with an over-long name and come back with an `OSError`
+        # rather than a `Rejection` — from the validator, whose whole contract
+        # is that arbitrary model output leaves here as one or the other (#93).
+        # `slugify` bounds the names Kasa derives; this bounds the ones a plan
+        # supplies for itself.
+        for part in Path(path).parts:
+            if len(part.encode()) > MAX_PATH_COMPONENT:
+                raise PatchError(
+                    [
+                        Rejection(
+                            f"{part[:40]}… is {len(part.encode())} bytes; "
+                            f"a path component may be at most {MAX_PATH_COMPONENT}",
+                            index,
+                        )
+                    ]
+                )
 
     def _require_size(self, content: str, path: str, index: int) -> None:
         size = len(content.encode())

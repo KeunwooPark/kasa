@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from kasa.memory.document import (
+    MAX_SLUG_CHARS,
     Frontmatter,
     MemoryDoc,
     MemoryError_,
@@ -244,3 +246,42 @@ def test_a_parse_error_keeps_the_reason_apart_from_the_file() -> None:
 
 def test_a_parse_error_with_no_file_to_name_is_just_the_reason() -> None:
     assert str(MemoryError_("frontmatter must be a mapping")) == "frontmatter must be a mapping"
+
+
+# -- a filename the filesystem will accept (#93) ------------------------------
+
+
+def test_a_long_title_gives_a_filename_the_filesystem_accepts() -> None:
+    """#93. `NAME_MAX` is 255, and an unbounded slug sailed past it — failing
+    with `OSError` from inside the patch validator rather than as a rejection."""
+    doc = MemoryDoc.new(type="fact", title="Deploy " * 200, body="b")
+
+    name = Path(doc.suggested_path()).name
+
+    assert len(name.encode()) <= MAX_SLUG_CHARS + len(".md")
+    assert name.startswith("deploy-deploy")
+    assert name.endswith(".md")
+
+
+def test_truncation_does_not_leave_a_dangling_separator() -> None:
+    """Cutting mid-word can land on the separator, and `deploy-.md` is not a
+    name anybody wrote."""
+    title = "x" * (MAX_SLUG_CHARS - 1) + " tail"
+
+    name = Path(MemoryDoc.new(type="fact", title=title, body="b").suggested_path()).name
+
+    assert not name.startswith("-") and "-.md" not in name
+
+
+def test_a_title_with_nothing_sluggable_is_still_named() -> None:
+    for title in ("", "   ", "...", "…"):
+        assert (
+            MemoryDoc.new(type="fact", title=title, body="b")
+            .suggested_path()
+            .endswith("untitled.md")
+        )
+
+
+def test_a_short_title_is_untouched() -> None:
+    doc = MemoryDoc.new(type="person", title="Jane Okafor", body="b")
+    assert doc.suggested_path() == "memory/people/jane-okafor.md"

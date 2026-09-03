@@ -455,3 +455,31 @@ async def test_a_rejected_plan_never_reaches_the_repo(tmp_path: Path, store: Sto
     assert repo.head() == before_head
     assert corpus.snapshot() == before_files
     assert not repo.is_dirty()
+
+
+def test_an_over_long_path_is_rejected_not_raised(corpus: Corpus) -> None:
+    """#93. `_create` reached `os.stat` with a name past `NAME_MAX` and came
+    back with an `OSError` — from the validator, whose whole contract is that
+    arbitrary model output leaves here as a plan or as a `PatchError`.
+
+    `slugify` bounds the names Kasa derives; this bounds the ones a plan
+    supplies for itself, which is the half a bounded slug cannot cover.
+    """
+    doc = MemoryDoc.new(type="fact", title="Short", body="b")
+
+    with pytest.raises(PatchError) as caught:
+        corpus.compiler().compile(
+            [Create(memory=doc, path=f"memory/facts/{'z' * 300}.md")], job="promote"
+        )
+
+    assert "303 bytes" in str(caught.value)
+    assert "at most 255" in str(caught.value)
+
+
+def test_a_long_title_now_compiles(corpus: Corpus) -> None:
+    """The derived half: it is the slug that was unbounded."""
+    doc = MemoryDoc.new(type="fact", title="Deploy pipeline " * 40, body="b")
+
+    changes = corpus.compiler().compile([Create(memory=doc)], job="promote")
+
+    assert len(Path(changes[0].path).name.encode()) <= 255
