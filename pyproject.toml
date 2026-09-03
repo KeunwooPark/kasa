@@ -41,6 +41,9 @@ packages = ["kasa"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Prose, not source. The design doc's code blocks are deliberately compact so the
+# shape of a type reads at a glance; formatting them expands them into pages.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
