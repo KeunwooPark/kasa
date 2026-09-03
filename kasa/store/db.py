@@ -17,10 +17,26 @@ from ulid import ULID
 from kasa.errors import KasaError, StoreError
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import ContentBlock, Message
+from kasa.memory.observation import ObservationDraft
+from kasa.memory.subject import normalize_subject
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 _BLOCKS = TypeAdapter(tuple[ContentBlock, ...])
+
+#: One episode, with the two things every consolidation job asks about it that
+#: are not on the row: how much conversation it holds, and who is allowed to
+#: see what comes out of it. Written once because three queries select it, and
+#: three hand-written joins are three chances to forget the scope.
+_EPISODE_VIEW = """
+SELECT e.id, e.session_id, e.started_at, e.ended_at, e.state, e.summary,
+       e.signal_score, s.scope,
+       COUNT(m.id) AS messages,
+       COALESCE(MAX(m.created_at), e.started_at) AS last_message
+FROM episodes e
+JOIN sessions s ON s.id = e.session_id
+LEFT JOIN messages m ON m.episode_id = e.id
+"""
 
 
 def _now() -> str:
@@ -213,14 +229,20 @@ class Store:
             ) as cur:
                 row = await cur.fetchone()
             seq = int(row["next"]) if row else 1
+            # Every message belongs to an episode, and this is the only place
+            # that can know which: the episode a message arrived during is the
+            # open one at the moment it is written, and nothing downstream can
+            # reconstruct that from timestamps once a later one has opened.
+            episode_id = await self.ensure_episode(session_id)
 
             await self._conn.execute(
                 "INSERT INTO messages"
-                " (id, session_id, seq, role, author, content, tokens, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " (id, session_id, episode_id, seq, role, author, content, tokens, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     message_id,
                     session_id,
+                    episode_id,
                     seq,
                     message.role,
                     author,
@@ -331,9 +353,8 @@ class Store:
         """The episode this session is currently accumulating into, if any.
 
         Read when an actor wakes for a session, so a turn knows what it is part
-        of. Opening and closing episodes belongs to `episode_close` (#27); this
-        only reports what is already there, and `None` is the normal answer
-        until that job exists.
+        of. `None` before the session's first message: episodes are opened by
+        the write path, not by looking at one.
         """
         async with self._serial:
             async with self._conn.execute(
@@ -343,6 +364,127 @@ class Store:
             ) as cur:
                 row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def ensure_episode(self, session_id: str) -> str:
+        """The session's open episode, opening one if it has none.
+
+        Opening is cheap and unconditional; deciding when a segment has *ended*
+        is the expensive judgement, and it belongs to `episode_close`. So there
+        is no "start an episode" decision anywhere in the write path — a
+        message arrives, and it lands in whatever is open.
+        """
+        async with self._serial:
+            if (existing := await self.open_episode(session_id)) is not None:
+                return str(existing["id"])
+            episode_id = str(ULID())
+            await self._conn.execute(
+                "INSERT INTO episodes (id, session_id, started_at, state) VALUES (?, ?, ?, 'open')",
+                (episode_id, session_id, _now()),
+            )
+            await self._conn.commit()
+            return episode_id
+
+    async def episode(self, episode_id: str) -> dict[str, Any] | None:
+        """One episode, with the counts and the scope a consolidation job needs."""
+        async with self._serial:
+            async with self._conn.execute(
+                f"{_EPISODE_VIEW} WHERE e.id = ? GROUP BY e.id", (episode_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def due_episodes(
+        self, *, idle_before: str, max_messages: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Open episodes that have gone quiet or grown long.
+
+        `COALESCE(MAX(m.created_at), e.started_at)` is what closes an episode
+        that never received a message: a session opened and abandoned leaves
+        one behind, and an episode nothing can ever close is an episode every
+        later sweep pays to look at.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                f"{_EPISODE_VIEW} WHERE e.state = 'open' GROUP BY e.id"
+                " HAVING COUNT(m.id) >= ? OR COALESCE(MAX(m.created_at), e.started_at) <= ?"
+                " ORDER BY e.started_at LIMIT ?",
+                (max_messages, idle_before, limit),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def open_episodes_of(self, session_id: str) -> list[dict[str, Any]]:
+        """Every open episode of one session, however recent.
+
+        What an explicit session end closes. There is normally exactly one; the
+        list is because "normally" is not a guarantee worth writing a caller
+        against.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                f"{_EPISODE_VIEW} WHERE e.state = 'open' AND e.session_id = ?"
+                " GROUP BY e.id ORDER BY e.started_at",
+                (session_id,),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def episode_messages(self, episode_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        """The transcript of one episode, oldest first."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT id, seq, role, author, content, created_at FROM messages"
+                " WHERE episode_id = ? ORDER BY seq LIMIT ?",
+                (episode_id, limit),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def close_episode(
+        self,
+        episode_id: str,
+        *,
+        summary: str | None = None,
+        observations: Sequence[ObservationDraft] = (),
+    ) -> list[str] | None:
+        """Close an episode and record what was extracted from it, atomically.
+
+        Returns the new observation ids, or None if something else closed the
+        episode first. The guard is `state = 'open'`, so two sweeps racing over
+        one episode produce one close and one None rather than two summaries
+        and two sets of the same facts.
+
+        One transaction, because the two halves are only correct together. A
+        close that commits without its observations discards what the episode
+        was consolidated *for* and can never be retried — the episode is no
+        longer open, so no sweep will look at it again.
+        """
+        async with self._serial:
+            cur = await self._conn.execute(
+                "UPDATE episodes SET state = 'closed', ended_at = ?,"
+                " summary = COALESCE(?, summary) WHERE id = ? AND state = 'open'",
+                (_now(), summary, episode_id),
+            )
+            if cur.rowcount != 1:
+                await self._conn.rollback()
+                return None
+            session_id = await self._session_of_episode(episode_id)
+            ids = [
+                await self._insert_observation(draft, session_id=session_id, episode_id=episode_id)
+                for draft in observations
+            ]
+            await self._conn.commit()
+            return ids
+
+    async def _session_of_episode(self, episode_id: str) -> str | None:
+        async with self._conn.execute(
+            "SELECT session_id FROM episodes WHERE id = ?", (episode_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row["session_id"]) if row else None
 
         # -- observations --------------------------------------------------------
 
@@ -360,31 +502,55 @@ class Store:
     ) -> str:
         """Record a candidate fact. Nothing durable happens until `promote` runs."""
         async with self._serial:
-            observation_id = str(ULID())
-            # An observation outlives the session that produced it, and losing the
-            # fact because the bookkeeping link is missing would be the wrong trade.
-            if session_id is not None and await self.get_session(session_id) is None:
-                session_id = None
-            await self._conn.execute(
-                "INSERT INTO observations"
-                " (id, episode_id, session_id, subject, claim, kind, confidence, scope,"
-                "  source_refs, state, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (
-                    observation_id,
-                    episode_id,
-                    session_id,
-                    subject,
-                    claim,
-                    kind,
-                    confidence,
-                    scope,
-                    json_dumps(list(source_refs)),
-                    _now(),
+            observation_id = await self._insert_observation(
+                ObservationDraft(
+                    subject=subject,
+                    claim=claim,
+                    kind=kind,
+                    scope=scope,
+                    confidence=confidence,
+                    source_refs=tuple(source_refs),
                 ),
+                session_id=session_id,
+                episode_id=episode_id,
             )
             await self._conn.commit()
             return observation_id
+
+    async def _insert_observation(
+        self, draft: ObservationDraft, *, session_id: str | None, episode_id: str | None
+    ) -> str:
+        """The one INSERT. Callers hold `_serial` and own the commit.
+
+        `subject` is normalized here rather than trusted from the caller. It is
+        the key `promote` groups by, so "Jane Doe" from a tool call and "Jane
+        Doe's" from an extraction have to arrive as the same string, or the
+        same person becomes two memories.
+        """
+        observation_id = str(ULID())
+        # An observation outlives the session that produced it, and losing the
+        # fact because the bookkeeping link is missing would be the wrong trade.
+        if session_id is not None and await self.get_session(session_id) is None:
+            session_id = None
+        await self._conn.execute(
+            "INSERT INTO observations"
+            " (id, episode_id, session_id, subject, claim, kind, confidence, scope,"
+            "  source_refs, state, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                observation_id,
+                episode_id,
+                session_id,
+                normalize_subject(draft.subject),
+                draft.claim,
+                draft.kind,
+                draft.confidence,
+                draft.scope,
+                json_dumps(list(draft.source_refs)),
+                _now(),
+            ),
+        )
+        return observation_id
 
     async def pending_observations(self, limit: int = 100) -> list[dict[str, Any]]:
         async with (

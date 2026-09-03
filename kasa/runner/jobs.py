@@ -1,38 +1,114 @@
 """The jobs Kasa actually knows how to run.
 
-Most of `docs/DESIGN.md` §6 arrives later: `episode_close` (#27), `promote`
-(#29), `reflect` (#32), `reorganize` (#33), `forget` (#34). Each is a `JobSpec`
-registered here, and nothing else about the machinery changes when they do.
+The rest of `docs/DESIGN.md` §6 arrives later: `promote` (#29), `reflect`
+(#32), `reorganize` (#33), `forget` (#34). Each is a `JobSpec` registered here,
+and nothing else about the machinery changes when they do.
 
-`reindex` is the one that exists. The design lists it as "on git change /
-manual", so it registers without a cron — but it registers, because the thing
-that rebuilds the index after a memory write should be a job like the others
-rather than only a command somebody remembers to type.
+What a spec is registered *on* is what this module decides, and the two
+conditions are different. `episode_close` needs a model and no repo — it writes
+to SQLite, and it is what fills the queue `promote` will later drain.
+`reindex` needs a repo and no model. A build with neither registers nothing,
+which is why `kasa job list` still works on a machine with no API key.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from kasa.config import Config
+from kasa.llm.registry import ProviderRegistry
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LeaseError
 from kasa.memory.ltm import MemoryStore
 from kasa.runner.cron import Cron
+from kasa.runner.episodes import EpisodeCloser
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
 
+#: Often enough that a thread which went quiet is consolidated while the
+#: conversation is still the same day's, rarely enough that the sweep is not
+#: itself a cost. The idle threshold is what decides when an episode is over;
+#: this only decides how promptly that is noticed.
+EVERY_FIVE_MINUTES = "*/5 * * * *"
 
-def default_specs(cfg: Config, store: Store) -> list[JobSpec]:
-    """Everything this build can run, given what is configured."""
-    if not cfg.ltm.configured:
-        return []
-    # Polling the private repo is how a supervised PR becomes visible after a
-    # human merges it. The job syncs first and then rebuilds both derived views.
-    return [JobSpec(kind="reindex", handler=_reindex(cfg, store), cron=Cron.parse("* * * * *"))]
+
+def default_specs(
+    cfg: Config, store: Store, registry: ProviderRegistry | None = None
+) -> list[JobSpec]:
+    """Everything this build can run, given what is configured.
+
+    `registry` is the daemon's, when there is a daemon. `kasa job run` has no
+    long-lived one and passes nothing, so a job that needs a model builds one
+    for the run and closes it again — which is also what keeps `kasa job list`
+    working on a config with no API key at all.
+    """
+    models = Models(cfg, store, registry)
+    specs = []
+    if "chat" in cfg.llm:
+        specs.append(
+            JobSpec(
+                kind="episode_close",
+                handler=_episode_close(cfg, store, models),
+                cron=Cron.parse(EVERY_FIVE_MINUTES),
+            )
+        )
+    if cfg.ltm.configured:
+        # Polling the private repo is how a supervised PR becomes visible after
+        # a human merges it. The job syncs first and then rebuilds both derived
+        # views.
+        specs.append(
+            JobSpec(kind="reindex", handler=_reindex(cfg, store), cron=Cron.parse("* * * * *"))
+        )
+    return specs
+
+
+class Models:
+    """The registry a job calls, however this process happens to have one.
+
+    A daemon builds one registry and keeps it: its providers hold an httpx
+    client, and a connection pool that is rebuilt every five minutes is not a
+    pool. A one-shot `kasa job run` has none to lend, and building one at
+    import time would make every command that merely *lists* jobs fail on a
+    machine with no API key exported.
+    """
+
+    def __init__(self, cfg: Config, store: Store, registry: ProviderRegistry | None) -> None:
+        self._cfg = cfg
+        self._store = store
+        self._registry = registry
+
+    @asynccontextmanager
+    async def use(self) -> AsyncIterator[ProviderRegistry]:
+        if self._registry is not None:
+            yield self._registry
+            return
+        registry = self._cfg.build_registry(store=self._store)
+        try:
+            yield registry
+        finally:
+            await registry.aclose()
+
+
+def _episode_close(cfg: Config, store: Store, models: Models) -> JobHandler:
+    async def run(job: Job) -> None:
+        async with models.use() as registry:
+            closer = EpisodeCloser(store, registry, cfg.episodes)
+            # A payload naming a session is an explicit end — someone left, or
+            # a surface knows the thread is finished — and closes that session's
+            # episode however recent it is. With no payload this is the clock,
+            # and idleness is the only evidence there is.
+            if session_id := job.payload.get("session_id"):
+                result = await closer.end_session(str(session_id))
+            else:
+                result = await closer.sweep()
+        log.info("episode_close: %s", result.summary())
+
+    return run
 
 
 def _reindex(cfg: Config, store: Store) -> JobHandler:

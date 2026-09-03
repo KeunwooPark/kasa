@@ -145,6 +145,38 @@ class MemorySettings(BaseModel):
     retention_floor_days: int = 30
 
 
+class EpisodeSettings(BaseModel):
+    """When a stretch of conversation is over, and how much of it to read.
+
+    The boundaries are what `docs/DESIGN.md` §6 draws: a thread that has gone
+    quiet, or one that has run long enough to be worth consolidating before it
+    goes quiet at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Quiet for this long and the segment is over. Twenty minutes is the
+    #: design's number: long enough that a slow reply does not split a
+    #: conversation in half, short enough that today's thread is consolidated
+    #: today.
+    idle_minutes: int = 20
+    #: A long thread is closed on length rather than left to grow. An episode
+    #: that never ends is one whose transcript eventually stops fitting in a
+    #: context window, and consolidating the first half of a conversation is
+    #: better than consolidating none of it.
+    max_messages: int = 40
+    #: Episodes consolidated per sweep. A bound rather than a target: it is
+    #: what stops a backlog — a daemon down for a day — from spending its whole
+    #: token budget in one tick.
+    max_per_run: int = 20
+    #: How much of an episode the extractor reads. Above `max_messages` on
+    #: purpose: a session end closes an episode of any length.
+    transcript_messages: int = 200
+    #: More candidate facts than this out of one conversation is a model
+    #: narrating the transcript rather than distilling it.
+    max_observations: int = 12
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -223,6 +255,7 @@ class Config(BaseModel):
 
     ltm: LTMSettings = Field(default_factory=LTMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    episodes: EpisodeSettings = Field(default_factory=EpisodeSettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -438,6 +471,7 @@ def render_toml(cfg: Config) -> str:
 
     for name, section in (
         ("memory", cfg.memory),
+        ("episodes", cfg.episodes),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),

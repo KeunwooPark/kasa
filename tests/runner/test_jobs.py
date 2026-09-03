@@ -11,14 +11,14 @@ from typing import Any
 
 import pytest
 
-from kasa.config import Config, LTMSettings
+from kasa.config import Config, LTMSettings, ProviderConfig
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import INDEX_LEASE_NAME, Lease
 from kasa.memory.manifest import Manifest
-from kasa.runner.jobs import default_specs
+from kasa.runner.jobs import EVERY_FIVE_MINUTES, default_specs
 from kasa.runner.scheduler import Job, JobSpec, Scheduler
 from kasa.store import Store
 
@@ -47,6 +47,11 @@ TERMINAL = frozenset({"done", "failed"})
 
 
 def only_spec(cfg: Config, store: Store) -> JobSpec:
+    """The reindex spec, from a config that registers nothing else.
+
+    `config_for` deliberately has no model configured, so `episode_close` does
+    not register and this stays the one spec these tests are about.
+    """
     specs = default_specs(cfg, store)
     assert [spec.kind for spec in specs] == ["reindex"]
     return specs[0]
@@ -56,6 +61,49 @@ def test_reindex_polls_for_merged_supervised_prs(clone: Path, store: Store) -> N
     spec = only_spec(config_for(clone), store)
     assert spec.cron is not None
     assert spec.cron.expression == "* * * * *"
+
+
+# -- what registers, and on what ---------------------------------------------
+
+
+def with_model(cfg: Config) -> Config:
+    return cfg.model_copy(
+        update={"llm": {"chat": ProviderConfig(kind="anthropic", model="claude-opus-5")}}
+    )
+
+
+def test_episode_close_registers_wherever_there_is_a_model(store: Store) -> None:
+    """No repo, and it still registers: it writes to SQLite, and it is what
+    fills the queue `promote` will later drain."""
+    specs = default_specs(with_model(Config()), store)
+
+    assert [spec.kind for spec in specs] == ["episode_close"]
+    assert specs[0].cron is not None
+    assert specs[0].cron.expression == EVERY_FIVE_MINUTES
+
+
+def test_a_build_with_no_model_registers_no_consolidation(clone: Path, store: Store) -> None:
+    """`kasa job list` has to work on a machine with no API key exported, and a
+    job that fails on every tick is worse than one that is not there."""
+    assert "episode_close" not in [spec.kind for spec in default_specs(config_for(clone), store)]
+
+
+async def test_the_job_closes_the_session_its_payload_names(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit session end, end to end through the queue. The episode is
+    empty, so it closes without ever reaching a provider — which is the only
+    reason this can run without one."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    await store.ensure_session("cli:1", surface="cli")
+    episode_id = await store.ensure_episode("cli:1")
+    scheduler = Scheduler(store, default_specs(with_model(Config()), store))
+
+    row = await scheduler.run_now("episode_close", {"session_id": "cli:1"})
+
+    assert row["state"] == "done", row["last_error"]
+    episode = await store.episode(episode_id)
+    assert episode is not None and episode["state"] == "closed"
 
 
 async def test_a_reindex_that_loses_the_lease_is_done_rather_than_failed(

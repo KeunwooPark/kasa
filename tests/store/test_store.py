@@ -11,6 +11,7 @@ from kasa.core.inbox import Inbox
 from kasa.errors import StoreError
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
+from kasa.memory.observation import ObservationDraft
 from kasa.store import Store
 
 
@@ -252,3 +253,54 @@ async def test_a_method_may_call_another_one(store: Store) -> None:
 
     assert await store.message_count("s1") == 2
     assert [row["id"] for row in await store.pending_observations()] == [observation]
+
+
+# -- episodes ----------------------------------------------------------------
+
+
+async def test_one_episode_stays_open_across_a_conversation(store: Store) -> None:
+    await store.ensure_session("s1", surface="cli")
+
+    first = await store.ensure_episode("s1")
+    await store.append_messages("s1", [Message.user("a"), Message.assistant("b")])
+
+    assert await store.ensure_episode("s1") == first
+    rows = await store.episode_messages(first)
+    assert len(rows) == 2
+
+
+async def test_closing_an_episode_writes_its_observations_with_it(store: Store) -> None:
+    """One transaction. A close that commits without its observations discards
+    what the episode was consolidated for and can never be retried: nothing
+    reopens an episode, so no sweep will look at it again."""
+    await store.ensure_session("s1", surface="cli")
+    episode_id = await store.ensure_episode("s1")
+
+    written = await store.close_episode(
+        episode_id,
+        summary="they talked about deploys",
+        observations=[
+            ObservationDraft(
+                subject="Jane Doe",
+                claim="Jane Doe owns the deploy pipeline.",
+                kind="fact",
+                scope="workspace",
+            )
+        ],
+    )
+
+    assert written is not None and len(written) == 1
+    pending = await store.pending_observations()
+    assert [(o["episode_id"], o["session_id"], o["subject"]) for o in pending] == [
+        (episode_id, "s1", "jane doe")
+    ]
+
+
+async def test_an_episode_can_only_be_closed_once(store: Store) -> None:
+    await store.ensure_session("s1", surface="cli")
+    episode_id = await store.ensure_episode("s1")
+    draft = ObservationDraft(subject="a", claim="a is a thing", kind="fact", scope="workspace")
+
+    assert await store.close_episode(episode_id, observations=[draft]) is not None
+    assert await store.close_episode(episode_id, observations=[draft]) is None
+    assert len(await store.pending_observations()) == 1, "the loser wrote nothing"
