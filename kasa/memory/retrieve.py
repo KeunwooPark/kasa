@@ -231,13 +231,26 @@ def is_self_contained(message: str) -> bool:
 
     "What did Jane say about the deploy pipeline?" is. "What about it?" is not,
     and rewriting it costs a model call that the first case does not need.
+
+    The anaphor may be anywhere. Scanning only the opening words caught the
+    docstring's own example and missed the shape people actually type — "what
+    else do we know about them?", "can you say more about her?" — which was
+    #44: the rewriter was never reached, `build_match` was left with whatever
+    generic words remained, and the turn retrieved nothing at all.
+
+    Scanning the whole message does mean a question that names its subject
+    *and* uses a pronoun is rewritten when it did not need to be. That is the
+    error worth making: an unnecessary rewrite costs one utility-model call and
+    still returns the right memories — and costs nothing at all in the common
+    setup, where no utility model is configured and `_build_query` falls back
+    to carrying terms from the recent turns. A missed rewrite costs the answer.
     """
     words = _WORD.findall(message.lower())
     if len(words) < _SELF_CONTAINED_MIN_WORDS:
         return False
     if not [w for w in words if w not in _STOPWORDS]:
         return False
-    return not (set(words[:3]) & _ANAPHORA)
+    return not (set(words) & _ANAPHORA)
 
 
 def build_match(query: str) -> str:

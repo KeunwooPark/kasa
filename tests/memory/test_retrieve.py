@@ -227,6 +227,12 @@ async def test_derivational_morphology_is_a_known_gap(
         ("Who owns the deploy pipeline?", True),
         ("What did Jane decide about the rota?", True),
         ("what about it?", False),
+        # #44: the anaphor is not always at the front, and these were all
+        # judged self-contained, so the rewriter never saw them.
+        ("What else do we know about them?", False),
+        ("Tell me more about that", False),
+        ("Can you say more about her?", False),
+        ("Does that change the rota?", False),
         ("it?", False),
         ("them", False),
         ("the of and", False),
@@ -259,6 +265,28 @@ async def test_a_follow_up_borrows_terms_from_the_conversation(
     assert retrieval.trace.rewritten is True
     assert "deploy" in retrieval.trace.query
     assert corpus["Jane Okafor"] in retrieval.memory_ids[:3]
+
+
+async def test_a_follow_up_with_a_trailing_pronoun_still_reaches_the_rewriter(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """The two-turn shape from #44, which used to retrieve nothing at all.
+
+    "What else do we know about them?" was judged self-contained because the
+    anaphor is the sixth word, so the query was built from "else", "know" and
+    "about" — which match nothing, from a corpus that plainly has the answer.
+    """
+    search = retriever(store, tokenizer)
+    first = await search.retrieve("Who owns the deploy pipeline?")
+    assert corpus["Jane Okafor"] in first.memory_ids
+
+    second = await search.retrieve(
+        "What else do we know about them?", recent=["Who owns the deploy pipeline?"]
+    )
+
+    assert second.trace is not None
+    assert second.trace.rewritten is True
+    assert corpus["Jane Okafor"] in second.memory_ids
 
 
 async def test_a_supplied_rewriter_is_used(

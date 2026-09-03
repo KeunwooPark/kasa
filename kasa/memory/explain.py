@@ -32,7 +32,11 @@ def _query(trace: RetrievalTrace) -> list[str]:
     if trace.rewritten:
         lines.append(f"  rewritten  {trace.query}")
     else:
-        lines.append("  rewritten  no — the message was already self-contained")
+        # Deliberately not "already self-contained": a message is also left
+        # alone when there is no conversation to rewrite it from, and since #44
+        # widened the anaphora check the two cases diverge often enough to
+        # matter to somebody reading this to work out why a turn found nothing.
+        lines.append("  rewritten  no — the message was used as it stands")
     lines.append(f"  match      {trace.match_expression or '(nothing searchable)'}")
     lines.append(f"  scope      {trace.scope}")
     return [*lines, ""]
