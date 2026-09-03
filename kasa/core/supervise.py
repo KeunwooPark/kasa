@@ -47,9 +47,21 @@ async def keep_running(
     """
     if not start_now:
         await asyncio.sleep(every)
+    failed_ticks = 0
     while True:
         try:
             await body()
         except Exception:
-            log.exception("%s failed; it will try again in %.0fs", name, every)
+            failed_ticks += 1
+            report = log.exception if failed_ticks == 1 else log.error
+            report("%s failed; it will try again in %.0fs", name, every)
+        else:
+            if failed_ticks:
+                log.info(
+                    "%s recovered after %d failed tick%s",
+                    name,
+                    failed_ticks,
+                    "" if failed_ticks == 1 else "s",
+                )
+                failed_ticks = 0
         await asyncio.sleep(every)

@@ -49,6 +49,54 @@ async def test_a_failure_is_reported_with_the_name_of_the_loop(
     assert failure.exc_info is not None  # log.exception, so the traceback is there
 
 
+async def test_only_the_first_consecutive_failure_has_a_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    calls = 0
+
+    async def body() -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            raise RuntimeError("the store was busy")
+
+    task = asyncio.create_task(keep_running(body, every=0.01, name="scheduler clock"))
+    await until(lambda: calls >= 4)
+    await stop(task)
+
+    failures = [r for r in caplog.records if "will try again" in r.message]
+    assert len(failures) == 3
+    assert failures[0].exc_info is not None
+    assert all(record.exc_info is None for record in failures[1:])
+    assert any(
+        record.message == "scheduler clock recovered after 3 failed ticks"
+        for record in caplog.records
+    )
+
+
+async def test_a_new_run_of_failures_gets_a_new_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    async def body() -> None:
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            raise RuntimeError("the store was busy")
+
+    task = asyncio.create_task(
+        keep_running(body, every=0.01, name="scheduler clock", start_now=True)
+    )
+    await until(lambda: calls >= 4)
+    await stop(task)
+
+    failures = [r for r in caplog.records if "will try again" in r.message]
+    assert len(failures) == 2
+    assert all(record.exc_info is not None for record in failures)
+
+
 async def test_the_loop_waits_out_the_first_interval_by_default() -> None:
     """A keepalive with nothing in flight and a sweeper with nothing to sweep
     both have no work at startup."""
