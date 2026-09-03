@@ -177,7 +177,12 @@ class GitRepo:
         Only the index is committed, so an unrelated edit a person left in the
         working copy is neither staged nor swept into Kasa's commit.
         """
-        self.run("add", "--", *(paths or ["."]))
+        # Paths that no longer exist are skipped rather than added: `git add`
+        # treats a pathspec matching nothing as fatal, and a deletion has
+        # already been staged by the `git rm` that removed it.
+        targets = [p for p in (paths or ["."]) if (self.path / p).exists()]
+        if targets:
+            self.run("add", "--", *targets)
         if not self.run("diff", "--cached", "--name-only"):
             return None
         # `-c` rather than `git config`: identity belongs to this commit, not to
@@ -202,3 +207,41 @@ class GitRepo:
 
     def fetch(self) -> None:
         self.authed("fetch", "--prune", "origin")
+
+    def rm(self, path: str) -> None:
+        """Remove a tracked file. The blob stays reachable in history."""
+        self.run("rm", "--quiet", "--", path)
+
+    def rebase_onto(self, branch: str, remote: str = "origin") -> bool:
+        """Rebase onto the remote branch. False when there is nothing to rebase onto."""
+        ref = f"{remote}/{branch}"
+        if run_git("rev-parse", "--verify", "--quiet", ref, cwd=self.path, check=False).returncode:
+            return False
+        result = run_git("rebase", ref, cwd=self.path, check=False)
+        if result.returncode != 0:
+            # Leave no half-finished rebase behind for the next run to trip over.
+            run_git("rebase", "--abort", cwd=self.path, check=False)
+            raise GitError(
+                f"could not rebase onto {ref}", command="git rebase", stderr=result.stderr
+            )
+        return True
+
+    def reset_hard(self, ref: str = "HEAD") -> None:
+        self.run("reset", "--hard", "--quiet", ref)
+
+    def stash(self, message: str) -> bool:
+        """Park uncommitted work. Returns False when there was none.
+
+        Stashing rather than `reset --hard`: the working copy may hold edits a
+        person made by hand, and losing those is the one failure this system
+        cannot apologise its way out of. A stash is recoverable.
+        """
+        if not self.is_dirty():
+            return False
+        self.run("stash", "push", "--include-untracked", "--message", message)
+        return True
+
+    def tracked(self, path: str) -> bool:
+        return not run_git(
+            "ls-files", "--error-unmatch", "--", path, cwd=self.path, check=False
+        ).returncode

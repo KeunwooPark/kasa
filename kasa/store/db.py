@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 
@@ -214,6 +214,39 @@ class Store:
         """Escape hatch for the CLI and tests."""
         async with self._conn.execute(sql, params) as cur:
             return [dict(row) for row in await cur.fetchall()]
+
+    # -- leases --------------------------------------------------------------
+
+    async def take_lease(
+        self, name: str, *, holder: str, job: str | None, ttl_seconds: float
+    ) -> None:
+        """Record that `holder` holds `name`. The flock is what enforces it."""
+        now = datetime.now(UTC)
+        await self._conn.execute(
+            "INSERT INTO leases (name, holder, job, acquired_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET"
+            " holder = excluded.holder, job = excluded.job,"
+            " acquired_at = excluded.acquired_at, expires_at = excluded.expires_at",
+            (
+                name,
+                holder,
+                job,
+                now.isoformat(timespec="milliseconds"),
+                (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="milliseconds"),
+            ),
+        )
+        await self._conn.commit()
+
+    async def release_lease(self, name: str) -> bool:
+        cur = await self._conn.execute("DELETE FROM leases WHERE name = ?", (name,))
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def get_lease(self, name: str) -> dict[str, Any] | None:
+        async with self._conn.execute("SELECT * FROM leases WHERE name = ?", (name,)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 def json_dumps(value: Any) -> str:

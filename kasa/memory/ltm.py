@@ -1,0 +1,304 @@
+"""The write path to long-term memory.
+
+This is the only component in Kasa that can destroy something a person cannot
+get back, so it is built around three rules that are not negotiable:
+
+- **Never force-push.** History is the undo buffer. Everything else in this
+  design — "delete is reversible", "you can revert a bad belief" — is a
+  consequence of that one line, and a single `--force` erases all of it.
+- **Delete is `git rm`.** The blob stays reachable forever.
+- **Never destroy uncommitted work.** A working copy left dirty by a crashed run
+  gets stashed, not reset. A stash is recoverable; a person's hand edits to a
+  memory file are not.
+
+Everything runs under the single-writer lease (see `lease.py`), because two
+daemons pushing concurrently is the one way to lose data here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Self
+
+from kasa.config import Config
+from kasa.errors import GitError, KasaError
+from kasa.memory.bootstrap import is_bootstrapped
+from kasa.memory.gitcmd import GitRepo
+from kasa.memory.layout import MANIFEST_PATH, is_memory_path
+from kasa.memory.lease import LOCK_FILENAME, Lease, stale_lease
+from kasa.memory.manifest import Manifest
+from kasa.store import Store
+
+log = logging.getLogger(__name__)
+
+PUSH_ATTEMPTS = 4
+PUSH_BASE_DELAY = 0.5
+
+#: git's own words when a push lost a race. The answer is to rebase and retry,
+#: never to force.
+_REJECTED = ("non-fast-forward", "fetch first", "rejected", "behind its remote")
+
+
+class MemoryStoreError(KasaError):
+    """The memory repo could not be written."""
+
+
+@dataclass(frozen=True, slots=True)
+class Write:
+    """Create or replace one file."""
+
+    path: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class Remove:
+    """`git rm` one file. The blob stays in history."""
+
+    path: str
+
+
+Change = Write | Remove
+
+
+@dataclass(frozen=True, slots=True)
+class CommitMeta:
+    """What the commit message says, and what its trailers record.
+
+    Machine-parseable on purpose: `git log` is the audit trail for everything the
+    agent decided to believe, and an audit trail you have to grep by prose is one
+    nobody reads.
+    """
+
+    summary: str
+    job: str
+    job_id: str | None = None
+    session: str | None = None
+    memory_ids: Sequence[str] = ()
+
+    def message(self) -> str:
+        trailers = [f"Kasa-Job: {self.job}"]
+        if self.job_id:
+            trailers.append(f"Kasa-Job-Id: {self.job_id}")
+        if self.session:
+            trailers.append(f"Kasa-Session: {self.session}")
+        if self.memory_ids:
+            trailers.append(f"Kasa-Memory-Ids: {', '.join(self.memory_ids)}")
+        return f"memory: {self.summary}\n\n" + "\n".join(trailers) + "\n"
+
+
+@dataclass(slots=True)
+class ApplyResult:
+    sha: str | None = None
+    changed: list[str] = field(default_factory=list)
+    pushed: bool = False
+    #: Set when a crashed run's leftovers were parked before this one ran.
+    stashed: bool = False
+
+
+class MemoryStore:
+    """The local clone, and the only sanctioned way to write to it."""
+
+    def __init__(
+        self,
+        repo: GitRepo,
+        store: Store,
+        *,
+        branch: str = "main",
+        push: bool = True,
+    ) -> None:
+        self._repo = repo
+        self._store = store
+        self._branch = branch
+        self._push = push
+
+    @classmethod
+    async def open(cls, cfg: Config, store: Store) -> Self:
+        """Open the configured clone, reporting anything a crash left behind."""
+        path = cfg.ltm.resolved_clone_path()
+        repo = GitRepo.at(path, token=cfg.ltm.token())
+        if not repo.exists:
+            raise MemoryStoreError(f"no memory repo at {path}; run `kasa init`")
+        if not is_bootstrapped(path):
+            raise MemoryStoreError(f"{path} has no memory skeleton; run `kasa init`")
+
+        opened = cls(repo, store, branch=cfg.ltm.branch, push=bool(repo.remote_url()))
+        if (leftover := await stale_lease(store, opened.lock_path)) is not None:
+            log.warning(
+                "the previous run held the memory write lease (%s, job %s) and did not "
+                "release it; it stopped mid-write",
+                leftover["holder"],
+                leftover["job"] or "unknown",
+            )
+        return opened
+
+    @property
+    def path(self) -> Path:
+        return self._repo.path
+
+    @property
+    def lock_path(self) -> Path:
+        return self._repo.path / ".git" / LOCK_FILENAME
+
+    def lease(self) -> Lease:
+        return Lease(self._store, self.lock_path)
+
+    # -- reading -------------------------------------------------------------
+
+    def read(self, relative_path: str) -> str:
+        target = self._resolve(relative_path)
+        if not target.exists():
+            raise MemoryStoreError(f"{relative_path} does not exist in the memory repo")
+        return target.read_text()
+
+    def manifest(self) -> Manifest:
+        return Manifest.load(self._repo.path)
+
+    # -- writing -------------------------------------------------------------
+
+    async def apply(self, changes: Sequence[Change], meta: CommitMeta) -> ApplyResult:
+        """Apply `changes` as one commit, under the write lease.
+
+        All or nothing: a failure part-way through leaves the working copy
+        exactly as it was found, because a half-applied plan is a corpus nobody
+        can reason about.
+        """
+        if not changes:
+            return ApplyResult()
+        for change in changes:
+            self._resolve(change.path)  # rejects traversal before the lease is taken
+
+        lease = self.lease()
+        await lease.acquire(job=meta.job)
+        try:
+            # Git is fast, but it is blocking, and the caller may be a chat turn.
+            return await asyncio.to_thread(self._apply, changes, meta)
+        finally:
+            await lease.release()
+
+    def recover(self) -> bool:
+        """Park anything uncommitted, so the next write starts from a clean tree.
+
+        Returns whether there was something to park. Stash rather than reset:
+        the leftovers may be a crashed job's half-write, or they may be an edit
+        somebody made by hand, and from here the two are indistinguishable.
+        """
+        if not self._repo.is_dirty():
+            return False
+        log.warning(
+            "the memory repo at %s has uncommitted changes; stashing them before writing",
+            self._repo.path,
+        )
+        return self._repo.stash("kasa: recovered from an interrupted write")
+
+    # -- internals -----------------------------------------------------------
+
+    def _apply(self, changes: Sequence[Change], meta: CommitMeta) -> ApplyResult:
+        result = ApplyResult(stashed=self.recover())
+        self._sync_with_remote()
+
+        created = [c.path for c in changes if isinstance(c, Write) and not self._exists(c.path)]
+        try:
+            touched = [self._write_one(change) for change in changes]
+            touched.append(self._rewrite_manifest())
+        except Exception:
+            self._roll_back(created)
+            raise
+
+        result.changed = sorted(set(touched))
+        result.sha = self._repo.commit(meta.message(), paths=result.changed)
+        if result.sha and self._push:
+            result.pushed = self._push_with_rebase()
+        return result
+
+    def _write_one(self, change: Change) -> str:
+        target = self._resolve(change.path)
+        if isinstance(change, Write):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(change.content)
+            return change.path
+
+        if not target.exists():
+            raise MemoryStoreError(f"cannot remove {change.path}: it does not exist")
+        if self._repo.tracked(change.path):
+            self._repo.rm(change.path)
+        else:
+            target.unlink()
+        return change.path
+
+    def _rewrite_manifest(self) -> str:
+        manifest, problems = Manifest.rebuild(self._repo.path)
+        for problem in problems:
+            # Not fatal: one file somebody broke by hand must not block every
+            # later write to the repo. It is loud, and `kasa doctor` sees it too.
+            log.warning("manifest: %s — %s", problem.path, problem.reason)
+        manifest.save(self._repo.path)
+        return MANIFEST_PATH
+
+    def _sync_with_remote(self) -> None:
+        if not self._push:
+            return
+        try:
+            self._repo.fetch()
+            self._repo.rebase_onto(self._branch)
+        except GitError as exc:
+            # Offline is survivable: commit locally and push on the next write.
+            log.warning("could not sync with the remote before writing: %s", exc)
+
+    def _push_with_rebase(self) -> bool:
+        for attempt in range(PUSH_ATTEMPTS):
+            try:
+                self._repo.push(self._branch, set_upstream=True)
+                return True
+            except GitError as exc:
+                if not _is_rejection(exc) or attempt == PUSH_ATTEMPTS - 1:
+                    log.warning("could not push memory: %s", exc)
+                    return False
+                # Someone else got there first. Rebase on top of them and try
+                # again — never force, which would delete their commit.
+                delay = PUSH_BASE_DELAY * (2**attempt) * (1 + random.random() * 0.25)
+                log.info("push rejected, rebasing and retrying in %.1fs", delay)
+                time.sleep(delay)
+                try:
+                    self._repo.fetch()
+                    self._repo.rebase_onto(self._branch)
+                except GitError as rebase_error:
+                    log.warning("could not rebase onto the remote: %s", rebase_error)
+                    return False
+        return False
+
+    def _roll_back(self, created: Sequence[str]) -> None:
+        """Undo a partially applied plan. The tree was clean when we started."""
+        for path in created:
+            (self._repo.path / path).unlink(missing_ok=True)
+        if self._repo.has_commits():
+            self._repo.reset_hard()
+
+    def _exists(self, relative_path: str) -> bool:
+        return self._resolve(relative_path).exists()
+
+    def _resolve(self, relative_path: str) -> Path:
+        """Map a repo-relative path to disk, refusing anything outside it.
+
+        The last line of defence rather than the first — #13's validator rejects
+        these long before they get here — but this is the function that actually
+        touches the filesystem, so it checks too.
+        """
+        if not is_memory_path(relative_path) and relative_path != MANIFEST_PATH:
+            raise MemoryStoreError(f"{relative_path!r} is not a writable memory path")
+        target = (self._repo.path / relative_path).resolve()
+        root = self._repo.path.resolve()
+        if not target.is_relative_to(root):
+            raise MemoryStoreError(f"{relative_path!r} resolves outside the memory repo")
+        return target
+
+
+def _is_rejection(exc: GitError) -> bool:
+    text = f"{exc}".lower()
+    return any(marker in text for marker in _REJECTED)

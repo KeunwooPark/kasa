@@ -20,6 +20,7 @@ from kasa.errors import ConfigError, GitHubError, KasaError
 from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
 from kasa.memory.gitcmd import GitRepo, git_available
+from kasa.memory.lease import LEASE_NAME, LOCK_FILENAME, stale_lease
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def diagnose(
     checks = [_config_file(path or config_path()), _git_binary()]
     checks += _models(cfg)
     checks += await _memory_repo(cfg, github=github)
-    checks.append(await _database(cfg))
+    checks += await _store_checks(cfg)
     checks += _not_yet()
     return Report(tuple(checks))
 
@@ -193,22 +194,46 @@ def _clone(cfg: Config) -> Check:
     return Check("clone", Status.OK, ", ".join(notes))
 
 
-async def _database(cfg: Config) -> Check:
+async def _store_checks(cfg: Config) -> list[Check]:
+    """Database health and lease state, on one connection."""
     path = cfg.store.resolved()
     try:
         async with await Store.open(path) as store:
             rows = await store.raw("SELECT name FROM schema_version ORDER BY name")
+            lease = await _lease(cfg, store)
     except KasaError as exc:
-        return Check("database", Status.FAIL, f"{path}: {exc}")
-    return Check("database", Status.OK, f"{path}, {len(rows)} migration(s) applied")
+        return [Check("database", Status.FAIL, f"{path}: {exc}")]
+    return [
+        Check("database", Status.OK, f"{path}, {len(rows)} migration(s) applied"),
+        lease,
+    ]
+
+
+async def _lease(cfg: Config, store: Store) -> Check:
+    if not cfg.ltm.configured:
+        return Check("write lease", Status.SKIP, "no memory repo to write to")
+
+    lock = cfg.ltm.resolved_clone_path() / ".git" / LOCK_FILENAME
+    row = await store.get_lease(LEASE_NAME)
+    if row is None:
+        return Check("write lease", Status.OK, "free")
+    if await stale_lease(store, lock) is not None:
+        # A row whose holder is gone. Harmless — the next write takes it over —
+        # but it means the previous run stopped in the middle of writing.
+        return Check(
+            "write lease",
+            Status.WARN,
+            f"left behind by {row['holder']} (job {row['job'] or 'unknown'}, "
+            f"since {row['acquired_at']}); the next write will take it over",
+        )
+    return Check(
+        "write lease", Status.OK, f"held by {row['holder']} for job {row['job'] or 'unknown'}"
+    )
 
 
 def _not_yet() -> list[Check]:
     """Checks whose subjects do not exist yet, listed so they are not forgotten."""
-    return [
-        Check("write lease", Status.SKIP, "arrives with the git write path (#11)"),
-        Check("index freshness", Status.SKIP, "arrives with the FTS index (#14)"),
-    ]
+    return [Check("index freshness", Status.SKIP, "arrives with the FTS index (#14)")]
 
 
 async def _lookup(cfg: Config, *, github: GitHubClient | None) -> RepoInfo | None:

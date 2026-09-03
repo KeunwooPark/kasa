@@ -12,6 +12,7 @@ from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.gitcmd import GitRepo
+from kasa.store import Store
 from tests.conftest import mock_client
 
 REPO = {
@@ -182,8 +183,23 @@ async def test_a_world_readable_config_warns(tmp_path: Path) -> None:
 async def test_checks_that_do_not_exist_yet_are_listed_as_skipped(tmp_path: Path) -> None:
     """Named rather than absent, so they are not quietly forgotten."""
     report = await diagnose(config_for(tmp_path), github=github())
-    assert status_of(report, "write lease") is Status.SKIP
     assert status_of(report, "index freshness") is Status.SKIP
+
+
+async def test_a_free_lease_reports_ok(tmp_path: Path, clone: Path) -> None:
+    report = await diagnose(config_for(tmp_path), github=github())
+    assert status_of(report, "write lease") is Status.OK
+    assert detail_of(report, "write lease") == "free"
+
+
+async def test_a_lease_left_by_a_crashed_run_warns(tmp_path: Path, clone: Path) -> None:
+    cfg = config_for(tmp_path)
+    async with await Store.open(cfg.store.resolved()) as store:
+        await store.take_lease("ltm", holder="somehost:999", job="promote", ttl_seconds=900)
+
+    report = await diagnose(cfg, github=github())
+    assert status_of(report, "write lease") is Status.WARN
+    assert "somehost:999" in detail_of(report, "write lease")
 
 
 # -- the startup re-check ----------------------------------------------------

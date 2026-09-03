@@ -1,0 +1,168 @@
+"""The single-writer lease over the long-term memory repo.
+
+Two halves, and both are load-bearing.
+
+The **flock** is the enforcement. It is held by the kernel against an open file
+description, so it is released the instant the holder dies — including when the
+holder is killed mid-write, which is exactly the case a lock built out of a
+database row gets wrong.
+
+The **database row** is the explanation. A flock tells you the lock is taken; it
+does not tell you by whom, since when, or for what job, and that is what someone
+staring at a stuck daemon actually needs.
+
+Consequently: taking the flock is the decision, the row is written after, and a
+row without a live flock is a leftover from a crash rather than a live holder.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+import socket
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
+
+from kasa.errors import KasaError
+from kasa.store import Store
+
+log = logging.getLogger(__name__)
+
+LEASE_NAME = "ltm"
+LOCK_FILENAME = "kasa-writer.lock"
+DEFAULT_TTL = 900.0
+
+
+class LeaseError(KasaError):
+    """Someone else is writing to the memory repo."""
+
+
+def holder_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+# Synchronous on purpose: these are local stat and flock calls measured in
+# microseconds. Wrapping them in async machinery would buy nothing and hide
+# that the decision they make is atomic.
+
+
+def _try_lock(path: Path) -> int | None:
+    """Take the flock, returning the fd, or None when someone else holds it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _unlock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def _is_holder_alive(path: Path) -> bool:
+    """True when the flock is currently held by a live process."""
+    if not path.exists():
+        return False
+    fd = _try_lock(path)
+    if fd is None:
+        return True
+    _unlock(fd)
+    return False
+
+
+class Lease:
+    """Async context manager around the write lease."""
+
+    def __init__(
+        self,
+        store: Store,
+        lock_path: Path,
+        *,
+        name: str = LEASE_NAME,
+        ttl: float = DEFAULT_TTL,
+    ) -> None:
+        self._store = store
+        self._path = lock_path
+        self._name = name
+        self._ttl = ttl
+        self._fd: int | None = None
+
+    async def acquire(self, *, job: str | None = None) -> Self:
+        if self._fd is not None:
+            raise LeaseError("this process already holds the memory write lease")
+
+        fd = _try_lock(self._path)
+        if fd is None:
+            raise LeaseError(await self._describe_holder())
+
+        # The flock is ours, so any row still sitting here belongs to a process
+        # that died holding it.
+        if (stale := await self._store.get_lease(self._name)) is not None:
+            log.warning(
+                "took over the memory write lease from %s (job %s, since %s), "
+                "which did not release it",
+                stale["holder"],
+                stale["job"] or "unknown",
+                stale["acquired_at"],
+            )
+
+        self._fd = fd
+        await self._store.take_lease(self._name, holder=holder_id(), job=job, ttl_seconds=self._ttl)
+        return self
+
+    async def release(self) -> None:
+        if self._fd is None:
+            return
+        await self._store.release_lease(self._name)
+        # Row first, then the lock: releasing the lock first would let another
+        # process take it, see our row, and report a takeover that never happened.
+        _unlock(self._fd)
+        self._fd = None
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    async def __aenter__(self) -> Self:
+        return await self.acquire()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.release()
+
+    async def _describe_holder(self) -> str:
+        row = await self._store.get_lease(self._name)
+        if row is None:
+            return (
+                "another process holds the memory write lease "
+                f"(lock file {self._path}), but did not record who"
+            )
+        return (
+            f"{row['holder']} holds the memory write lease for job "
+            f"{row['job'] or 'unknown'}, taken at {row['acquired_at']}"
+        )
+
+
+async def stale_lease(
+    store: Store, lock_path: Path, *, name: str = LEASE_NAME
+) -> dict[str, Any] | None:
+    """A lease row whose holder is gone, or None.
+
+    Called at startup. A row that survives a crash is harmless on its own — the
+    next `acquire` takes over — but it is worth reporting, because it means the
+    previous run stopped in the middle of writing to the repo.
+    """
+    row = await store.get_lease(name)
+    if row is None or _is_holder_alive(lock_path):
+        return None
+    return row
