@@ -311,3 +311,14 @@ def test_inbox_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
     assert (
         "no dead letters" in runner.invoke(app, ["inbox", "retry", "--config", str(config)]).output
     )
+
+
+def test_run_slack_without_tokens_says_so(tmp_path: Path) -> None:
+    """It fails here, before the store is opened, rather than inside a socket
+    library minutes into a deploy."""
+    config = config_for(tmp_path / "kasa.db")
+
+    result = runner.invoke(app, ["run", "--slack", "--config", str(config)])
+
+    assert result.exit_code == 1, result.output
+    assert "no Slack tokens configured" in result.output

@@ -579,9 +579,17 @@ Socket Mode, so a self-hosted daemon needs no public ingress.
 Details that bite, in rough order of how quickly they will bite:
 
 - **Ack in under 3 seconds.** Enqueue and return; never await the agent loop.
-- **Dedupe on the Slack event id.** Slack retries aggressively, and a retried
-  event that reaches the agent twice produces two answers.
+- **Dedupe on the message, not the delivery.** Slack retries aggressively, and
+  a retried event that reaches the agent twice produces two answers — but its
+  `event_id` covers only that case. A mention in a channel Kasa can read
+  arrives *twice*, once as `app_mention` and once as `message`, under two
+  different event ids and one `ts`. `slack:<team>:<channel>:<ts>` covers both,
+  and covers them without knowing which subscriptions an install was granted.
 - **Session key** = `thread_ts or ts`. Always reply in-thread.
+- **Nothing from Slack is `workspace`.** A DM is `private:<user>`, anything else
+  is `channel:<channel>`. `workspace` is the widest scope there is; widening one
+  is a decision with a person in it, not a default every public channel picks
+  up on the way in.
 - **Streaming** = post a placeholder, then `chat.update` at roughly 1/sec. Never
   per-token; you will hit rate limits and the UI flickers.
 - **Identity mapping.** Slack user id → `people/<slug>.md`, so the same person is

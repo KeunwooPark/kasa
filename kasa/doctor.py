@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -69,6 +70,7 @@ async def diagnose(
     checks = [_config_file(path or config_path()), _git_binary()]
     checks += _models(cfg)
     checks += await _memory_repo(cfg, github=github)
+    checks += _slack(cfg)
     checks += await _store_checks(cfg)
     checks.append(_manifest(cfg))
     checks += _not_yet()
@@ -323,6 +325,30 @@ async def _lease(cfg: Config, store: Store) -> Check:
     return Check(
         "write lease", Status.OK, f"held by {row['holder']} for job {row['job'] or 'unknown'}"
     )
+
+
+def _slack(cfg: Config) -> list[Check]:
+    """Both tokens, before the daemon needs them.
+
+    A Socket Mode daemon with one of the two tokens missing does not fail at
+    startup in any way a person reads as "the token is missing" — it fails on
+    connect, in a library, minutes into a deploy.
+    """
+    if not cfg.slack.configured:
+        return [Check("slack", Status.SKIP, "not configured; `kasa run` serves the terminal")]
+    missing = [
+        env
+        for env in (cfg.slack.app_token_env, cfg.slack.bot_token_env)
+        if env and not os.environ.get(env)
+    ]
+    if missing:
+        return [Check("slack", Status.FAIL, f"{', '.join(missing)} not set")]
+    where = (
+        ", ".join(sorted(cfg.slack.allowed_channels))
+        if cfg.slack.allowed_channels
+        else "every channel Kasa is invited to"
+    )
+    return [Check("slack", Status.OK, f"socket mode; {where}")]
 
 
 def _not_yet() -> list[Check]:

@@ -6,8 +6,8 @@ from typing import Any
 import httpx
 import pytest
 
-from kasa.config import Config, write_config
-from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
+from kasa.config import Config, SlackSettings, write_config
+from kasa.doctor import Check, Report, Status, _slack, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
@@ -383,3 +383,42 @@ async def test_a_clone_with_no_upstream_is_not_called_unpushed(tmp_path: Path, c
 
     assert status_of(report, "clone") is Status.OK
     assert "not pushed" not in detail_of(report, "clone")
+
+
+def slack_config(**settings: object) -> Config:
+    return Config(slack=SlackSettings(**settings))  # type: ignore[arg-type]
+
+
+async def test_slack_is_skipped_when_it_is_not_configured() -> None:
+    assert _slack(slack_config()) == [
+        Check("slack", Status.SKIP, "not configured; `kasa run` serves the terminal")
+    ]
+
+
+async def test_a_missing_slack_token_fails_before_the_daemon_needs_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Socket Mode daemon with one of the two tokens missing fails on
+    connect, in a library, minutes into a deploy."""
+    monkeypatch.setenv("KASA_SLACK_BOT", "xoxb-1")
+    monkeypatch.delenv("KASA_SLACK_APP", raising=False)
+    cfg = slack_config(bot_token_env="KASA_SLACK_BOT", app_token_env="KASA_SLACK_APP")
+
+    check = _slack(cfg)[0]
+
+    assert check.status is Status.FAIL
+    assert check.detail == "KASA_SLACK_APP not set"
+
+
+async def test_a_configured_slack_says_where_it_will_listen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KASA_SLACK_BOT", "xoxb-1")
+    monkeypatch.setenv("KASA_SLACK_APP", "xapp-1")
+    cfg = slack_config(
+        bot_token_env="KASA_SLACK_BOT",
+        app_token_env="KASA_SLACK_APP",
+        allowed_channels=["C0DEPLOY", "C0GENERAL"],
+    )
+
+    assert _slack(cfg)[0] == Check("slack", Status.OK, "socket mode; C0DEPLOY, C0GENERAL")

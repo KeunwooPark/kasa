@@ -1,0 +1,151 @@
+"""Deciding what a Slack event means, with nothing else in the way.
+
+No `slack_bolt` import, no network, no database of its own. Every judgement
+that decides whether a message is for Kasa and what it may be remembered under
+lives in this module, because those are the judgements that leak a private
+conversation when they are wrong — and they should be testable without a
+socket.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
+
+from kasa.core.events import InboundEvent
+
+SOURCE = "slack"
+
+#: `<@U123>` and `<@U123|display-name>`, which is how Slack writes a mention.
+_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+#: Slack's own name for a one-to-one conversation with the bot.
+_DM = "im"
+
+
+@dataclass(frozen=True, slots=True)
+class SlackContext:
+    """What the adapter knows that a single event does not carry."""
+
+    bot_user_id: str
+    team_id: str
+    #: Empty means every channel Kasa has been invited to. Inviting a bot to a
+    #: channel is already a deliberate act by a person, so an empty list is
+    #: "no *further* restriction" rather than "no restriction at all". Set it
+    #: when Kasa is in channels it should read and channels it should not.
+    allowed_channels: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class Accepted:
+    event: InboundEvent
+
+
+@dataclass(frozen=True, slots=True)
+class Ignored:
+    reason: str
+
+
+Decision = Accepted | Ignored
+
+#: Whether Kasa already has a conversation under this session id — which is how
+#: a reply in a thread it is part of is told from chatter it should stay out of.
+KnownSession = Callable[[str], Awaitable[bool]]
+
+
+def session_id(team: str, channel: str, thread: str) -> str:
+    """The actor key: one Slack thread, one serialized conversation."""
+    return f"{SOURCE}:{team}:{channel}:{thread}"
+
+
+def message_id(team: str, channel: str, ts: str) -> str:
+    """The dedupe key: the message itself, not the delivery.
+
+    Slack's own `event_id` would dedupe its retries, and only those. A mention
+    in a channel Kasa can read arrives *twice* — once as `app_mention`, once as
+    `message` — under two different event ids and one `ts`. Keying on the
+    message covers both, and covers them without knowing which subscriptions a
+    given installation was granted.
+    """
+    return f"{SOURCE}:{team}:{channel}:{ts}"
+
+
+async def normalize(
+    event: dict[str, Any], *, context: SlackContext, known_session: KnownSession
+) -> Decision:
+    """Turn one Slack event into something to answer, or say why not."""
+    if subtype := event.get("subtype"):
+        # `message_changed` and `message_deleted` are real signals, and #25 is
+        # where they get handled. Until then, editing a message must not read
+        # as sending a new one.
+        return Ignored(f"message subtype {subtype!r}")
+    if event.get("bot_id"):
+        return Ignored("posted by a bot")
+
+    author = str(event.get("user") or "")
+    if not author:
+        return Ignored("no author")
+    if author == context.bot_user_id:
+        return Ignored("posted by Kasa")
+
+    channel = str(event.get("channel") or "")
+    ts = str(event.get("ts") or "")
+    if not channel or not ts:
+        return Ignored("no channel or timestamp")
+
+    text = str(event.get("text") or "")
+    is_dm = event.get("channel_type") == _DM
+    thread = str(event.get("thread_ts") or ts)
+    session = session_id(context.team_id, channel, thread)
+
+    if not is_dm:
+        if context.allowed_channels and channel not in context.allowed_channels:
+            return Ignored(f"channel {channel} is not on the allowlist")
+        # In a channel, silence is the default. Kasa answers when it is spoken
+        # to, and thereafter in that thread — which is a question about a
+        # conversation that already exists, not about this message.
+        if not _mentions(text, context.bot_user_id) and not await known_session(session):
+            return Ignored("not addressed to Kasa")
+
+    return Accepted(
+        InboundEvent(
+            source=SOURCE,
+            external_id=message_id(context.team_id, channel, ts),
+            session_id=session,
+            text=_strip_mention(text, context.bot_user_id),
+            scope=scope_for(channel, author, is_dm=is_dm),
+            author=author,
+            channel=channel,
+            # Always in-thread, and a top-level message starts one. Answering a
+            # busy channel at top level is how a bot becomes something people
+            # mute.
+            reply_to=thread,
+        )
+    )
+
+
+def scope_for(channel: str, author: str, *, is_dm: bool) -> str:
+    """What a session here is allowed to have remembered about it.
+
+    A DM belongs to the person in it; anything else belongs to its channel.
+    Nothing from Slack is `workspace` — that is the widest scope there is, and
+    widening one is a decision for #24 with a person in the loop, not a default
+    that every public channel picks up on the way in.
+    """
+    return f"private:{author}" if is_dm else f"channel:{channel}"
+
+
+def _mentions(text: str, bot_user_id: str) -> bool:
+    return any(match.group(1) == bot_user_id for match in _MENTION.finditer(text))
+
+
+def _strip_mention(text: str, bot_user_id: str) -> str:
+    """Drop Kasa's own @-mention; leave everyone else's alone.
+
+    The mention is addressing, not content, and leaving it in means every turn
+    opens with a user id the model has to decide what to do with.
+    """
+    without = _MENTION.sub(lambda m: "" if m.group(1) == bot_user_id else m.group(0), text)
+    return " ".join(without.split())
