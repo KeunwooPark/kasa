@@ -34,6 +34,8 @@ def test_short_values_are_left_alone() -> None:
         "github_pat_AAAAAAAAAAAAAAAAAAAAAAAA",
         "xoxb-1234567890-abcdefghij",
         "xapp-1-A0123456789-abcdef",
+        "AKIAIOSFODNN7EXAMPLE",
+        "ASIAY34FZKBOKMSXQWER",
     ],
 )
 def test_token_shapes_are_caught_even_when_unknown(text: str) -> None:
@@ -47,6 +49,53 @@ def test_credentials_in_a_url_are_stripped() -> None:
     scrubbed = Redactor().scrub("remote https://user:ghp_tokenvalue@github.com/a/b.git failed")
     assert "ghp_tokenvalue" not in scrubbed
     assert "github.com/a/b.git" in scrubbed, "the useful half of the message survives"
+
+
+def test_iam_principal_ids_are_left_alone() -> None:
+    """They share the AWS key shape but are identifiers, not credentials — and
+    they are the thing an IAM question is about."""
+    text = "role AROAEXAMPLEID1234567 denied s3:GetObject to user AIDAEXAMPLEID1234567"
+    assert Redactor().scrub(text) == text
+
+
+PEM = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "MIIEpAIBAAKCAQEA1n2Xa9wZk3v4Qb8sT0pLmNoPqRsTuVwXyZ0123456789abcd\n"
+    "efGHIJKLmnopQRSTuvwxYZ0123456789+/abcdefghijklmnopqrstuvwxyz012=\n"
+    "-----END RSA PRIVATE KEY-----"
+)
+
+
+def test_a_private_key_block_is_replaced_whole() -> None:
+    """The only multi-line pattern: the secret is the body, not the header."""
+    scrubbed = Redactor().scrub(f"the deploy key is\n{PEM}\nput it on the runner")
+
+    assert "MIIEpAIB" not in scrubbed
+    assert "PRIVATE KEY" not in scrubbed
+    assert scrubbed == "the deploy key is\n[redacted]\nput it on the runner"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    ],
+)
+def test_every_pem_flavour_is_covered(header: str) -> None:
+    end = header.replace("BEGIN", "END")
+    assert Redactor().scrub(f"{header}\nMIIEpAIBAAKCAQEA\n{end}") == "[redacted]"
+
+
+def test_a_key_whose_end_marker_was_cut_off_is_still_replaced() -> None:
+    """A log truncation or a partial paste leaves the body just as exposed."""
+    scrubbed = Redactor().scrub(f"log tail:\n{PEM.split('-----END')[0]}(output truncated)")
+
+    assert "MIIEpAIB" not in scrubbed
+    assert "PRIVATE KEY" not in scrubbed
+    assert scrubbed.endswith("(output truncated)"), "the rest of the log survives"
 
 
 def test_ordinary_text_is_untouched() -> None:
