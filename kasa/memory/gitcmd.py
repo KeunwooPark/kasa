@@ -30,6 +30,18 @@ _NO_PROMPT = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
 
 _ASKPASS = "#!/bin/sh\nprintf '%s' \"$KASA_GIT_TOKEN\"\n"
 
+#: Kasa's identity, applied to every git invocation rather than to `commit`
+#: alone. `rebase` and `stash` write commits too, and on a machine with no
+#: global `user.name` — a fresh server, a container, a CI runner — they fail
+#: outright without one. Environment variables rather than `git config` because
+#: Kasa is borrowing someone's working copy, not configuring it.
+_IDENTITY = {
+    "GIT_AUTHOR_NAME": "Kasa",
+    "GIT_AUTHOR_EMAIL": "kasa@localhost",
+    "GIT_COMMITTER_NAME": "Kasa",
+    "GIT_COMMITTER_EMAIL": "kasa@localhost",
+}
+
 
 def git_available() -> bool:
     return shutil.which("git") is not None
@@ -46,7 +58,7 @@ def run_git(
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
-        env={**os.environ, **_NO_PROMPT, **(env or {})},
+        env={**os.environ, **_NO_PROMPT, **_IDENTITY, **(env or {})},
         capture_output=True,
         text=True,
     )
@@ -185,18 +197,7 @@ class GitRepo:
             self.run("add", "--", *targets)
         if not self.run("diff", "--cached", "--name-only"):
             return None
-        # `-c` rather than `git config`: identity belongs to this commit, not to
-        # a user's working copy that Kasa happens to be borrowing.
-        self.run(
-            "-c",
-            "user.name=Kasa",
-            "-c",
-            "user.email=kasa@localhost",
-            "commit",
-            "--quiet",
-            "--message",
-            message,
-        )
+        self.run("commit", "--quiet", "--message", message)
         return self.head()
 
     def push(self, branch: str, *, set_upstream: bool = False) -> None:

@@ -31,14 +31,73 @@ def test_commit_stages_only_the_paths_it_was_given(repo: GitRepo) -> None:
     assert "yours.txt" in repo.run("status", "--porcelain")
 
 
-def test_commit_does_not_need_a_configured_git_identity(repo: GitRepo, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+@pytest.fixture
+def no_git_identity(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A machine with no `user.name` — a fresh server, a container, a CI runner."""
+    missing = str(repo.path / "nonexistent-gitconfig")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", missing)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", missing)
+    for name in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_commit_does_not_need_a_configured_git_identity(
+    repo: GitRepo, no_git_identity: None
+) -> None:
     """Kasa borrows the user's machine; it must not depend on their git config."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(repo.path / "nonexistent-gitconfig"))
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(repo.path / "nonexistent-gitconfig"))
     (repo.path / "a.txt").write_text("a")
 
     assert repo.commit("add a")
     assert "Kasa" in repo.run("log", "-1", "--format=%an")
+
+
+def test_rebase_does_not_need_a_configured_git_identity(
+    repo: GitRepo, no_git_identity: None, tmp_path: Path
+) -> None:
+    """Rebase writes commits too, and CI found this the hard way.
+
+    Without an identity `git rebase` aborts with "empty ident name", which meant
+    every push that lost a race failed on any machine without a global
+    `user.name` — including every container Kasa is likely to run in.
+    """
+    bare = tmp_path / "remote.git"
+    run_git("init", "--bare", "--initial-branch", "main", str(bare))
+    (repo.path / "base.txt").write_text("base")
+    repo.commit("base")
+    repo.set_remote(str(bare))
+    repo.push("main", set_upstream=True)
+
+    # Another clone gets a commit in first.
+    other = GitRepo.clone(str(bare), tmp_path / "other", branch="main")
+    (other.path / "theirs.txt").write_text("theirs")
+    other.commit("theirs")
+    other.push("main")
+
+    # Ours lands on top rather than failing.
+    (repo.path / "ours.txt").write_text("ours")
+    repo.commit("ours")
+    repo.fetch()
+
+    assert repo.rebase_onto("main") is True
+    log = repo.run("log", "--format=%s")
+    assert log.splitlines() == ["ours", "theirs", "base"]
+
+
+def test_stash_does_not_need_a_configured_git_identity(
+    repo: GitRepo, no_git_identity: None
+) -> None:
+    """Stash writes commits too, and it is the crash-recovery path."""
+    (repo.path / "a.txt").write_text("a")
+    repo.commit("a")
+    (repo.path / "b.txt").write_text("left behind by a crashed run")
+
+    assert repo.stash("kasa: recovered") is True
+    assert not repo.is_dirty()
 
 
 def test_failures_carry_gits_own_diagnostics(repo: GitRepo) -> None:
