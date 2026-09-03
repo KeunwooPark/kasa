@@ -60,6 +60,32 @@ def test_only_one_of_them_restricted_is_not_either() -> None:
     assert fires("0 0 4 * *") == datetime(2026, 9, 4, 0, 0, tzinfo=UTC)
 
 
+def test_a_stepped_day_field_is_unrestricted_and_keeps_the_relation_and() -> None:
+    """Vixie sets its star flags on any field *beginning* with `*`, so `*/2` in
+    day-of-month does not flip the relation. Reading it as restricted turns
+    "every other day that is a Monday" into "every other day, or any Monday",
+    which is a much larger set."""
+    stepped = Cron.parse("0 0 */2 * 1")
+
+    assert stepped.either_day is False
+    # Mondays in September 2026 are the 7th, 14th, 21st and 28th. Only the odd
+    # ones survive `*/2`.
+    assert stepped.next_after(NOW) == datetime(2026, 9, 7, 0, 0, tzinfo=UTC)
+    assert not stepped.matches(datetime(2026, 9, 14, 0, 0, tzinfo=UTC)), "a Monday, even day"
+    assert not stepped.matches(datetime(2026, 9, 5, 0, 0, tzinfo=UTC)), "an odd day, Saturday"
+    assert stepped.matches(datetime(2026, 9, 21, 0, 0, tzinfo=UTC)), "a Monday, odd day"
+
+
+def test_a_stepped_weekday_is_unrestricted_too() -> None:
+    """The same rule on the other side of the relation."""
+    assert Cron.parse("0 0 1 * */2").either_day is False
+
+
+def test_a_range_on_a_day_field_is_still_restricted() -> None:
+    """Only a leading `*` is a star. `1-7` narrows, and the relation flips."""
+    assert Cron.parse("0 0 1-7 * 1").either_day is True
+
+
 def test_a_step_inside_a_range() -> None:
     assert Cron.parse("0-30/10 * * * *").minutes == frozenset({0, 10, 20, 30})
 
