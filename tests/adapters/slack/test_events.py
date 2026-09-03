@@ -6,6 +6,9 @@ conversation is in `events.py`, and none of it needs a socket to test.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 from typing import Any
 
 import pytest
@@ -254,3 +257,75 @@ async def test_nothing_from_slack_is_scoped_workspace(body: dict[str, Any], expe
     event = accepted(await normalize(body, context=context(), known_session=always)).event
 
     assert event.scope == expected != "workspace"
+
+
+# -- and the import costs nothing either --------------------------------------
+
+
+def test_the_judgements_import_without_the_slack_extra() -> None:
+    """The docstring above claims no `slack_bolt`, and that was true of every
+    line in this file except the first: importing `events` runs the package
+    `__init__`, which imported the adapter, which imports `slack_bolt`. On a
+    `uv sync --dev` that is a collection *error*, not a skip, and pytest aborts
+    the whole run — zero of 600-odd tests, which reads a lot like a pass.
+    """
+    program = textwrap.dedent(
+        """
+        import sys
+
+        class Absent:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "slack_bolt":
+                    raise ModuleNotFoundError("No module named 'slack_bolt'")
+                return None
+
+        sys.meta_path.insert(0, Absent())
+
+        import kasa.adapters.slack as package
+        from kasa.adapters.slack.events import normalize, scope_for
+
+        assert "slack_bolt" not in sys.modules, "something imported it anyway"
+        assert package.scope_for is scope_for
+        """
+    )
+
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_asking_for_the_adapter_is_what_needs_the_extra() -> None:
+    """Lazy, not gone. The name still resolves where it always did."""
+    program = textwrap.dedent(
+        """
+        import sys
+
+        class Absent:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "slack_bolt":
+                    raise ModuleNotFoundError("No module named 'slack_bolt'")
+                return None
+
+        sys.meta_path.insert(0, Absent())
+
+        import kasa.adapters.slack as package
+
+        try:
+            package.SlackAdapter
+        except ModuleNotFoundError as exc:
+            assert "slack_bolt" in str(exc)
+        else:
+            raise AssertionError("the adapter resolved without its extra")
+
+        try:
+            package.NotAThing
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("an unknown attribute resolved")
+        """
+    )
+
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
