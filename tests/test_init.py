@@ -348,3 +348,23 @@ async def test_unset_key_env_is_warned_about_not_fatal(tmp_path: Path, remote: s
     prompter, config, _ = await do_init(tmp_path, remote)
     assert any("ANTHROPIC_API_KEY is not set" in w for w in prompter.warned)
     assert config.exists()
+
+
+async def test_a_relative_clone_answer_is_stored_absolutely(
+    tmp_path: Path, remote: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#88. `init` accepted a relative answer verbatim, created the clone next
+    to wherever it was run, and wrote a path that later resolved somewhere
+    else. Both halves have to agree, and the config file is the anchor."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    prompter = ScriptedPrompter({"memory repo": "someone/kasa-memory", "clone path": "ltm-here"})
+    _, config, _ = await do_init(tmp_path, remote, prompter=prompter)
+
+    cfg = load_config(config)
+    assert Path(cfg.ltm.clone_path or "").is_absolute()
+    assert cfg.ltm.resolved_clone_path() == tmp_path / "ltm-here"
+    assert (tmp_path / "ltm-here" / SCHEMA_PATH).exists(), "and that is where it cloned"
+    assert not (elsewhere / "ltm-here").exists(), "not next to the shell it was run from"
