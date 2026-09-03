@@ -8,32 +8,15 @@ must never do is overwrite a corpus that has been accumulating for months.
 
 from __future__ import annotations
 
-import json
-from datetime import UTC, datetime
 from pathlib import Path
 
 from kasa.memory.layout import ARCHIVE_DIR, INDEX_PATH, MANIFEST_PATH, SCHEMA_PATH, TYPE_DIRS
-from kasa.memory.schema import (
-    SCHEMA_VERSION,
-    render_memory_index,
-    render_repo_readme,
-    render_schema_md,
-)
-
-MANIFEST_VERSION = 1
+from kasa.memory.manifest import Manifest
+from kasa.memory.schema import render_memory_index, render_repo_readme, render_schema_md
 
 _GITIGNORE = """# Kasa keeps nothing derived in here; the index lives in SQLite.
 .DS_Store
 """
-
-
-def empty_manifest() -> dict[str, object]:
-    return {
-        "version": MANIFEST_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        "generated": datetime.now(UTC).isoformat(timespec="seconds"),
-        "memories": {},
-    }
 
 
 def bootstrap(root: Path) -> list[str]:
@@ -51,7 +34,9 @@ def bootstrap(root: Path) -> list[str]:
     written += _write(root, ".gitignore", _GITIGNORE)
     written += _write(root, INDEX_PATH, render_memory_index())
     written += _write(root, SCHEMA_PATH, render_schema_md())
-    written += _write(root, MANIFEST_PATH, json.dumps(empty_manifest(), indent=2) + "\n")
+    if not (root / MANIFEST_PATH).exists():
+        Manifest().save(root)
+        written.append(MANIFEST_PATH)
     return written
 
 
