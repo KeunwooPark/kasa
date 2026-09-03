@@ -61,6 +61,33 @@ class AgentResult:
     stop_reason: str = "end_turn"
     trace: PackTrace | None = None
 
+    @property
+    def note(self) -> str | None:
+        """What to tell the user when the turn did not simply end.
+
+        The loop already handles these correctly; #46 was that nobody read the
+        result. A turn that ran out of tool iterations printed an empty line and
+        a new prompt — no answer, no reason, nothing to act on. It lives here
+        rather than in the REPL because every surface needs the same sentence,
+        and a silent turn on Slack will be no more debuggable than on a tty.
+        """
+        match self.stop_reason:
+            case "max_iterations":
+                return (
+                    f"stopped after {self.tool_calls} tool call(s) without an answer — "
+                    "the model kept asking for tools. Try a narrower question."
+                )
+            case "max_tokens":
+                return "the reply hit the model's output limit and was cut off."
+            case "content_filter":
+                return "the provider stopped this reply before it finished."
+            case "tool_use":
+                return "the model asked for a tool that was never run."
+            case _ if not self.text.strip():
+                return "the model returned nothing."
+            case _:
+                return None
+
 
 class Agent:
     def __init__(

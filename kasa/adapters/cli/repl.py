@@ -88,6 +88,8 @@ class Repl:
 
         self.console.print()
         result = self.last_result
+        if (note := result.note) is not None:
+            self.console.print(f"[yellow]…[/yellow] {note}")
         if result.tool_calls:
             self.console.print(
                 f"[dim]{result.tool_calls} tool call(s), {result.iterations} iteration(s)[/dim]"

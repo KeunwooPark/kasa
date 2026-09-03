@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from kasa.core.agent import Agent, AgentConfig
+from kasa.core.agent import Agent, AgentConfig, AgentResult
 from kasa.core.context import ContextPacker
 from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.registry import ModelRole, ProviderRegistry
@@ -289,3 +289,51 @@ async def test_system_prompt_is_identical_across_turns(store: Store, tokenizer: 
     await agent.respond("s1", "second")
 
     assert provider.requests[0].system == provider.requests[1].system
+
+
+# -- what the user is told when a turn does not simply end -------------------
+
+
+async def test_hitting_the_iteration_limit_leaves_something_to_show_the_user(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """#46: the loop handled the cap correctly and nobody read the result.
+
+    A model that only ever calls tools produced an empty reply, a dim tool-count
+    line, and a fresh prompt — no answer and no reason for its absence.
+    """
+    agent, _ = build(
+        store,
+        tokenizer,
+        [calls("weather") for _ in range(5)],
+        config=AgentConfig(max_tool_iterations=2),
+    )
+    result = await agent.respond("s1", "loop forever")
+
+    assert result.text == ""
+    assert result.note is not None
+    assert "tool call" in result.note
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [
+        ("max_iterations", "without an answer"),
+        ("max_tokens", "cut off"),
+        ("content_filter", "stopped this reply"),
+        ("tool_use", "never run"),
+    ],
+)
+def test_every_way_a_turn_can_end_badly_has_something_to_say(
+    stop_reason: str, expected: str
+) -> None:
+    assert expected in (AgentResult(text="", stop_reason=stop_reason).note or "")
+
+
+def test_an_ordinary_answer_says_nothing_extra() -> None:
+    assert AgentResult(text="Jane owns it.").note is None
+
+
+def test_an_empty_reply_that_ended_normally_is_still_worth_naming() -> None:
+    """Same symptom from the user's side: a prompt that answered nothing."""
+    assert AgentResult(text="   ").note == "the model returned nothing."
