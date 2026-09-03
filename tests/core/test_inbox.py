@@ -8,6 +8,7 @@ import sys
 import textwrap
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
@@ -260,6 +261,29 @@ async def test_an_expired_lease_is_not_handed_back_to_the_drainer_still_running_
     assert await inbox.counts() == {"done": 1}
 
 
+async def test_a_lease_we_hand_ourselves_does_not_spend_an_attempt(store: Store) -> None:
+    """The same row, one delivery, and the count that decides how many more it
+    gets. `attempts` counts leases so that a message which kills its process
+    still counts as tried; a lease taken from ourselves while we are still
+    answering the message is neither a kill nor a try."""
+    inbox = Inbox(store, lease_ttl=0.0)  # every lease is expired the moment it is taken
+    gate = asyncio.Event()
+
+    async def handler(inbound: InboundEvent) -> None:
+        await gate.wait()
+
+    dispatcher = Dispatcher(inbox, handler, concurrency=4, poll_interval=0.01)
+    await inbox.enqueue(event("E1"))
+    task = await running(dispatcher)
+    await until(lambda: dispatcher.in_flight == 1)
+    await asyncio.sleep(0.2)  # twenty polls, each of which re-leased the running row
+
+    attempts = [row["attempts"] for row in await store.raw("SELECT attempts FROM inbox")]
+    assert attempts == [1], f"one delivery, and the row was charged {attempts[0]} attempt(s)"
+    gate.set()
+    await stop(dispatcher, task)
+
+
 async def test_a_batch_of_only_our_own_rows_polls_rather_than_spins(store: Store) -> None:
     """A non-zero `_start_batch` tells `run` there was work and to look again at
     once. Counting rows it skipped is a busy loop rather than a poll."""
@@ -268,10 +292,10 @@ async def test_a_batch_of_only_our_own_rows_polls_rather_than_spins(store: Store
     leases = 0
     taken = inbox.lease
 
-    async def counted(*, limit: int = 1) -> list[LeasedEvent]:
+    async def counted(*, limit: int = 1, exclude: Sequence[Any] = ()) -> list[LeasedEvent]:
         nonlocal leases
         leases += 1
-        return await taken(limit=limit)
+        return await taken(limit=limit, exclude=exclude)
 
     inbox.lease = counted  # type: ignore[method-assign]
 
