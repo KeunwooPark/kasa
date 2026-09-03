@@ -37,6 +37,11 @@ def config_for(clone: Path) -> Config:
     return Config(ltm=LTMSettings(repo=str(clone), clone_path=str(clone), branch="main"))
 
 
+#: The states a job row cannot leave again. `leased` is not one of them, which
+#: is what made the wait below break while both jobs were still running.
+TERMINAL = frozenset({"done", "failed"})
+
+
 def only_spec(cfg: Config, store: Store) -> JobSpec:
     specs = default_specs(cfg, store)
     assert [spec.kind for spec in specs] == ["reindex"]
@@ -62,22 +67,30 @@ async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
     clone: Path, store: Store
 ) -> None:
     """The default `concurrency=2` and one registered kind is all it takes:
-    any two runnable rows are two concurrent passes."""
+    any two runnable rows are two concurrent passes.
+
+    Read after `stop()`, not before it. The wait above says the work reached a
+    state it cannot leave, and shutdown is where the drainer settles anything
+    still in flight — so a snapshot taken inside the poll is a guess about the
+    state under test, and this test used to assert on one.
+    """
     cfg = config_for(clone)
     scheduler = Scheduler(store, default_specs(cfg, store), concurrency=2, poll_interval=0.01)
     await scheduler.queue.enqueue("reindex")
     await scheduler.queue.enqueue("reindex")
 
     task = asyncio.create_task(scheduler.run())
-    rows: list[dict[str, object]] = []
-    for _ in range(500):
-        rows = await store.raw("SELECT state, last_error FROM jobs")
-        if all(row["state"] != "pending" for row in rows):
-            break
-        await asyncio.sleep(0.01)
-    scheduler.stop()
-    await asyncio.wait_for(task, timeout=5.0)
+    try:
+        for _ in range(2000):
+            states = [row["state"] for row in await store.raw("SELECT state FROM jobs")]
+            if all(state in TERMINAL for state in states):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        scheduler.stop()
+        await asyncio.wait_for(task, timeout=10.0)
 
+    rows = await store.raw("SELECT state, last_error FROM jobs")
     assert [row["state"] for row in rows] == ["done", "done"]
     assert [row["last_error"] for row in rows] == [None, None]
 
