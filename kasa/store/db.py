@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,7 @@ import aiosqlite
 from pydantic import TypeAdapter
 from ulid import ULID
 
-from kasa.errors import KasaError
+from kasa.errors import KasaError, StoreError
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import ContentBlock, Message
 
@@ -34,20 +35,45 @@ class Store:
 
     @classmethod
     async def open(cls, path: str | Path) -> Self:
+        """Open the database, or raise `StoreError` having closed it again.
+
+        The close is not tidiness. `aiosqlite.connect` starts a worker thread
+        that is not a daemon, and opening the file is lazy, so the first
+        statement is where a corrupt database announces itself — by which point
+        the thread exists. Leaking it left the process alive at interpreter
+        shutdown after the error had already been printed, so `kasa doctor` on
+        a truncated database hung instead of failing (#87). `cli.py` guards the
+        same hazard around the registry; this is the layer it starts at.
+
+        The connect itself is inside the guard as well. It cleans up its own
+        thread, but it can still fail — a directory where the file should be —
+        and that failure should read like the other one rather than like a
+        traceback. `close()` on a connection that never connected is a no-op.
+        """
         target = str(path)
         if target != ":memory:":
             Path(target).parent.mkdir(parents=True, exist_ok=True)
-        conn = await aiosqlite.connect(target)
-        conn.row_factory = aiosqlite.Row
-        if target != ":memory:":
-            # WAL is what lets the scheduler read while a turn is writing.
-            await conn.execute("PRAGMA journal_mode = WAL")
-        await conn.execute("PRAGMA synchronous = NORMAL")
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await conn.execute("PRAGMA busy_timeout = 5000")
-        await conn.commit()
-        store = cls(conn, target)
-        await store.migrate()
+        conn = aiosqlite.connect(target)
+        try:
+            await conn
+            conn.row_factory = aiosqlite.Row
+            if target != ":memory:":
+                # WAL is what lets the scheduler read while a turn is writing.
+                await conn.execute("PRAGMA journal_mode = WAL")
+            await conn.execute("PRAGMA synchronous = NORMAL")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("PRAGMA busy_timeout = 5000")
+            await conn.commit()
+            store = cls(conn, target)
+            await store.migrate()
+        except BaseException as exc:
+            await conn.close()
+            if isinstance(exc, sqlite3.Error):
+                raise StoreError(
+                    f"{target} is not a usable database ({exc}). It is derived from the "
+                    "memory repo — delete it and run `kasa reindex` to rebuild it."
+                ) from exc
+            raise
         return store
 
     async def close(self) -> None:

@@ -90,6 +90,16 @@ class ToolError(KasaError):
     """A tool could not be dispatched, or failed in a way the agent should see."""
 
 
+class StoreError(KasaError):
+    """The database could not be opened or read.
+
+    Almost always a file that is not a database, or one truncated by a full
+    disk or a kill mid-write. The database is derived — the memory repo is the
+    source of truth — so the message says so, because the recovery is to delete
+    it and reindex rather than to try to repair anything.
+    """
+
+
 class GitError(KasaError):
     """A git command failed.
 
