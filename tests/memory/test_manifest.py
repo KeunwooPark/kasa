@@ -237,3 +237,17 @@ def test_a_markdown_file_that_is_not_text_is_a_problem_not_a_crash(tmp_path: Pat
 
     assert manifest.resolve(doc.id) is not None
     assert [p.path for p in problems] == ["memory/facts/binary.md"]
+
+
+def test_a_problem_names_the_file_once(tmp_path: Path) -> None:
+    """#70. The reason is bare; the path is the other field. Every caller
+    prefixes it, so a reason that repeated it rendered the path twice."""
+    bootstrap(tmp_path)
+    (tmp_path / "memory" / "facts" / "broken.md").write_text("no frontmatter here at all")
+
+    _, problems = Manifest.rebuild(tmp_path)
+
+    assert [p.path for p in problems] == ["memory/facts/broken.md"]
+    assert problems[0].reason == "no YAML frontmatter (a file must open with `---`)"
+    rendered = f"{problems[0].path}: {problems[0].reason}"
+    assert rendered.count("memory/facts/broken.md") == 1

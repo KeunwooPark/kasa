@@ -228,3 +228,19 @@ def test_the_schema_table_is_not_broken_by_a_pipe_in_a_description() -> None:
 
 def test_the_schema_names_no_undefined_defaults() -> None:
     assert "PydanticUndefined" not in render_schema_md()
+
+
+def test_a_parse_error_keeps_the_reason_apart_from_the_file() -> None:
+    """Read on its own, the message has to name the file. Rendered by a caller
+    that already knows the path, the path must not appear twice (#70)."""
+    with pytest.raises(MemoryError_) as caught:
+        MemoryDoc.parse("no frontmatter here at all", source="memory/facts/broken.md")
+
+    exc = caught.value
+    assert str(exc) == ("memory/facts/broken.md: no YAML frontmatter (a file must open with `---`)")
+    assert exc.source == "memory/facts/broken.md"
+    assert exc.reason == "no YAML frontmatter (a file must open with `---`)"
+
+
+def test_a_parse_error_with_no_file_to_name_is_just_the_reason() -> None:
+    assert str(MemoryError_("frontmatter must be a mapping")) == "frontmatter must be a mapping"

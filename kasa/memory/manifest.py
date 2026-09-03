@@ -48,7 +48,11 @@ class ManifestEntry(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class Problem:
-    """A file the manifest could not account for."""
+    """A file the manifest could not account for.
+
+    `reason` is the bare reason. The path is the other field, and every caller
+    renders the two together in its own shape.
+    """
 
     path: str
     reason: str
@@ -101,7 +105,12 @@ class Manifest(BaseModel):
                 # Decoding explicitly, and counted as a problem rather than
                 # raised: a `.md` that is not text is one broken file, and it
                 # must not cost the manifest for the whole repo.
-                problems.append(Problem(relative, str(exc)))
+                #
+                # `.reason`, not `str(exc)`: a `Problem` already carries the
+                # path, and every caller prefixes it. `str(exc)` named the file
+                # a second time inside the reason (#70).
+                reason = exc.reason if isinstance(exc, MemoryError_) else str(exc)
+                problems.append(Problem(relative, reason))
                 continue
             if (existing := memories.get(doc.id)) is not None:
                 # Two files claiming one id is a merge gone wrong. Neither is

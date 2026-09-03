@@ -12,7 +12,7 @@ rewritten twice.
 
 from __future__ import annotations
 
-from kasa.memory.retrieve import Retrieval, RetrievalTrace
+from kasa.memory.retrieve import Candidate, Retrieval, RetrievalTrace
 
 
 def render_trace(retrieval: Retrieval, *, limit: int = 20) -> str:
@@ -70,9 +70,21 @@ def _denied(trace: RetrievalTrace) -> list[str]:
             "  nothing was excluded by scope",
             "",
         ]
-    lines = ["SCOPE FILTER", f"  {len(trace.denied)} chunk(s) never entered the ranking:"]
+    # One line per memory, not per chunk. Scope is a property of the document,
+    # so a memory with a header chunk and a body chunk printed the same sentence
+    # twice with nothing to tell the two lines apart — and this is the one
+    # command whose whole job is being legible about what happened (#70). The
+    # header still counts chunks, and so does the line when there is more
+    # than one.
+    by_memory: dict[str, list[Candidate]] = {}
     for candidate in trace.denied:
-        lines.append(f"    {candidate.memory_id} {candidate.path} — {candidate.denied}")
+        by_memory.setdefault(candidate.memory_id, []).append(candidate)
+
+    lines = ["SCOPE FILTER", f"  {len(trace.denied)} chunk(s) never entered the ranking:"]
+    for chunks in by_memory.values():
+        first = chunks[0]
+        count = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
+        lines.append(f"    {first.memory_id} {first.path}{count} — {first.denied}")
     return [*lines, ""]
 
 

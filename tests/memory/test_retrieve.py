@@ -870,3 +870,34 @@ async def test_a_retriever_with_no_scrubber_is_unchanged(
     and every caller that builds a prompt passes one."""
     retrieval = await retriever(store, tokenizer).retrieve("staging runner deploy key")
     assert "AKIAIOSFODNN7EXAMPLE" in "\n".join(retrieval.snippets)
+
+
+async def test_the_scope_block_names_each_memory_once(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """#70. A header chunk and a body chunk are two rows in the trace and one
+    fact on the page: the document's scope. Printed per chunk they came out as
+    the same sentence twice, with nothing to tell the two lines apart."""
+    bootstrap(tmp_path)
+    secret = write(
+        tmp_path,
+        MemoryDoc.new(
+            type="topic",
+            title="Deploy incident",
+            body="Deploy went wrong.\n\n## After\n\nThe deploy rota was paged.",
+            visibility="private:U01",
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve(
+        "deploy", scope="workspace", explain=True
+    )
+    assert retrieval.trace is not None
+    assert len(retrieval.trace.denied) > 1, "more than one chunk of one memory was excluded"
+
+    block = render_trace(retrieval).partition("SCOPE FILTER")[2].partition("PACKED")[0]
+    named = [line for line in block.splitlines() if secret.id in line]
+    assert len(named) == 1, f"one line per memory, got:\n{block}"
+    assert f"({len(retrieval.trace.denied)} chunks)" in named[0]
+    assert f"{len(retrieval.trace.denied)} chunk(s) never entered" in block

@@ -52,7 +52,18 @@ Unit = Annotated[float, Field(ge=0.0, le=1.0)]
 
 
 class MemoryError_(KasaError):
-    """A memory document could not be parsed or is invalid."""
+    """A memory document could not be parsed or is invalid.
+
+    Keeps the reason separate from the file it came from. `str(exc)` is still
+    `"<source>: <reason>"`, because an error read on its own has to say which
+    file it is about — but a caller that already knows the path can compose its
+    own line instead of printing the path twice (#70).
+    """
+
+    def __init__(self, reason: str, *, source: str = "") -> None:
+        self.reason = reason
+        self.source = source
+        super().__init__(f"{source}: {reason}" if source else reason)
 
 
 class Frontmatter(BaseModel):
@@ -157,18 +168,18 @@ class MemoryDoc(BaseModel):
     def parse(cls, text: str, *, source: str = "<memory>") -> Self:
         match = _FRONTMATTER.match(text)
         if match is None:
-            raise MemoryError_(f"{source}: no YAML frontmatter (a file must open with `---`)")
+            raise MemoryError_("no YAML frontmatter (a file must open with `---`)", source=source)
         try:
             raw = yaml.safe_load(match.group(1)) or {}
         except yaml.YAMLError as exc:
-            raise MemoryError_(f"{source}: frontmatter is not valid YAML: {exc}") from exc
+            raise MemoryError_(f"frontmatter is not valid YAML: {exc}", source=source) from exc
         if not isinstance(raw, dict):
-            raise MemoryError_(f"{source}: frontmatter must be a mapping")
+            raise MemoryError_("frontmatter must be a mapping", source=source)
 
         try:
             frontmatter = Frontmatter.model_validate(raw)
         except Exception as exc:
-            raise MemoryError_(f"{source}: {_first_line(exc)}") from exc
+            raise MemoryError_(_first_line(exc), source=source) from exc
         return cls(frontmatter=frontmatter, body=text[match.end() :])
 
     def render(self) -> str:
