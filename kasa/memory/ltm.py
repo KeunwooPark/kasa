@@ -25,10 +25,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Self
+from typing import Protocol, Self
 
 from kasa.config import Config
 from kasa.errors import GitError, KasaError
+from kasa.github import GitHubClient, PullRequestInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
 from kasa.memory.document import Problem
 from kasa.memory.gitcmd import GitRepo
@@ -49,6 +50,12 @@ _REJECTED = ("non-fast-forward", "fetch first", "rejected", "behind its remote")
 
 class MemoryStoreError(KasaError):
     """The memory repo could not be written."""
+
+
+class PullRequestOpener(Protocol):
+    async def create_pull_request(
+        self, full_name: str, *, head: str, base: str, title: str, body: str
+    ) -> PullRequestInfo: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +140,8 @@ class ApplyResult:
     pushed: bool = False
     #: Set when a crashed run's leftovers were parked before this one ran.
     stashed: bool = False
+    branch: str | None = None
+    pull_request_url: str | None = None
 
 
 class MemoryStore:
@@ -145,11 +154,19 @@ class MemoryStore:
         *,
         branch: str = "main",
         push: bool = True,
+        supervised: Sequence[str] = (),
+        repo_name: str | None = None,
+        github_token: str | None = None,
+        github: PullRequestOpener | None = None,
     ) -> None:
         self._repo = repo
         self._store = store
         self._branch = branch
         self._push = push
+        self._supervised = frozenset(supervised)
+        self._repo_name = repo_name
+        self._github_token = github_token
+        self._github = github
 
     @classmethod
     async def open(cls, cfg: Config, store: Store) -> Self:
@@ -161,7 +178,15 @@ class MemoryStore:
         if not is_bootstrapped(path):
             raise MemoryStoreError(f"{path} has no memory skeleton; run `kasa init`")
 
-        opened = cls(repo, store, branch=cfg.ltm.branch, push=bool(repo.remote_url()))
+        opened = cls(
+            repo,
+            store,
+            branch=cfg.ltm.branch,
+            push=bool(repo.remote_url()),
+            supervised=cfg.ltm.supervised,
+            repo_name=cfg.ltm.repo if cfg.ltm.repo and is_full_name(cfg.ltm.repo) else None,
+            github_token=cfg.ltm.token(),
+        )
         if (leftover := await stale_lease(store, opened.lock_path)) is not None:
             log.warning(
                 "the previous run held the memory write lease (%s, job %s) and did not "
@@ -267,6 +292,8 @@ class MemoryStore:
         lease = self.lease()
         await lease.acquire(job=meta.job)
         try:
+            if meta.job in self._supervised:
+                return await self._apply_supervised(changes, meta)
             # Git is fast, but it is blocking, and the caller may be a chat turn.
             return await asyncio.to_thread(self._apply, changes, meta)
         finally:
@@ -298,7 +325,79 @@ class MemoryStore:
 
     # -- internals -----------------------------------------------------------
 
-    def _apply(self, changes: Sequence[Change], meta: CommitMeta) -> ApplyResult:
+    async def _apply_supervised(self, changes: Sequence[Change], meta: CommitMeta) -> ApplyResult:
+        if not self._push or not self._repo_name:
+            raise MemoryStoreError("supervised jobs require a GitHub repository remote")
+        if self._github is None and not self._github_token:
+            raise MemoryStoreError("supervised jobs require the configured GitHub token")
+
+        branch = f"kasa/{meta.job}-{datetime.now(UTC).date().isoformat()}"
+        body = self._review_body(changes, meta)
+        result = await asyncio.to_thread(self._commit_review_branch, changes, meta, branch)
+        try:
+            title = f"memory: {meta.summary}"
+            if self._github is not None:
+                pr = await self._github.create_pull_request(
+                    self._repo_name, head=branch, base=self._branch, title=title, body=body
+                )
+            else:
+                async with GitHubClient(self._github_token or "") as github:
+                    pr = await github.create_pull_request(
+                        self._repo_name, head=branch, base=self._branch, title=title, body=body
+                    )
+        except Exception:
+            # The proposal remains safely pushed on its review branch. The
+            # default branch and local working tree still contain no mutation.
+            raise
+        result.branch = branch
+        result.pull_request_url = pr.html_url
+        return result
+
+    def _commit_review_branch(
+        self, changes: Sequence[Change], meta: CommitMeta, branch: str
+    ) -> ApplyResult:
+        stashed = self.recover()
+        self._sync_with_remote()
+        self._repo.checkout(branch)
+        try:
+            result = self._apply(changes, meta, push=False)
+            result.stashed = stashed
+            if result.sha:
+                self._repo.push(branch, set_upstream=True)
+                result.pushed = True
+            return result
+        finally:
+            self._repo.checkout(self._branch)
+            self._repo.reset_hard(f"origin/{self._branch}")
+
+    def _review_body(self, changes: Sequence[Change], meta: CommitMeta) -> str:
+        archived = {
+            change.path
+            for change in changes
+            if isinstance(change, Write) and "/archive/" in change.path
+        }
+        lines = [
+            f"Kasa proposes this **{meta.job}** job for review.",
+            "",
+            f"Why: {meta.summary}",
+            "",
+        ]
+        for change in changes:
+            if isinstance(change, Remove):
+                action = "Archive" if archived and "/archive/" not in change.path else "Delete"
+            elif "/archive/" in change.path:
+                action = "Archive as"
+            elif self._exists(change.path):
+                action = "Update"
+            else:
+                action = "Create"
+            lines.append(f"- **{action}:** `{change.path}`")
+        lines.extend(["", "Merging this pull request makes the changes effective."])
+        return "\n".join(lines)
+
+    def _apply(
+        self, changes: Sequence[Change], meta: CommitMeta, *, push: bool | None = None
+    ) -> ApplyResult:
         result = ApplyResult(stashed=self.recover())
         self._sync_with_remote()
 
@@ -312,7 +411,7 @@ class MemoryStore:
 
         result.changed = sorted(set(touched))
         result.sha = self._repo.commit(meta.message(), paths=result.changed)
-        if result.sha and self._push:
+        if result.sha and (self._push if push is None else push):
             result.pushed = self._push_with_rebase()
         return result
 
@@ -390,6 +489,18 @@ class MemoryStore:
                     log.warning("could not rebase onto the remote: %s", rebase_error)
                     return False
         return False
+
+    def sync_default(self) -> bool:
+        """Fast-forward the clean default branch; report whether HEAD changed."""
+        if not self._push:
+            return False
+        if self._repo.is_dirty():
+            raise MemoryStoreError("cannot sync the memory repo while its working tree is dirty")
+        before = self._repo.head()
+        self._repo.checkout(self._branch)
+        self._repo.fetch()
+        self._repo.rebase_onto(self._branch)
+        return self._repo.head() != before
 
     def _roll_back(self, created: Sequence[str]) -> None:
         """Undo a partially applied plan. The tree was clean when we started."""

@@ -56,6 +56,16 @@ class RepoInfo:
         )
 
 
+@dataclass(frozen=True)
+class PullRequestInfo:
+    number: int
+    html_url: str
+
+    @classmethod
+    def parse(cls, payload: dict[str, Any]) -> PullRequestInfo:
+        return cls(number=int(payload["number"]), html_url=str(payload["html_url"]))
+
+
 class GitHubClient:
     def __init__(
         self,
@@ -107,6 +117,16 @@ class GitHubClient:
         # is a user repo, and the two live at different endpoints.
         path = "/user/repos" if owner == await self.login() else f"/orgs/{owner}/repos"
         return RepoInfo.parse(await self._request("POST", path, json=body))
+
+    async def create_pull_request(
+        self, full_name: str, *, head: str, base: str, title: str, body: str
+    ) -> PullRequestInfo:
+        payload = await self._request(
+            "POST",
+            f"/repos/{full_name}/pulls",
+            json={"head": head, "base": base, "title": title, "body": body},
+        )
+        return PullRequestInfo.parse(payload)
 
     # -- plumbing ------------------------------------------------------------
 
