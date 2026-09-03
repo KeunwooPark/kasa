@@ -85,9 +85,14 @@ def closer_for(store: Store, provider: Scripted, **settings: Any) -> tuple[Episo
     return EpisodeCloser(store, registry, EpisodeSettings(**settings)), provider
 
 
-def talking(*, summary: str = "Jane asked who owns deploys.") -> Scripted:
-    """A provider that summarizes and then extracts the fixture's facts."""
-    return Scripted(summary, json.dumps(EXTRACTION))
+def assessed(summary: str = "Jane handed deploys over.", score: float = 0.9) -> str:
+    """One assessment reply: the summary, and the score the gate reads."""
+    return json.dumps({"summary": summary, "signal_score": score, "reason": "a handover"})
+
+
+def talking(*, summary: str = "Jane asked who owns deploys.", score: float = 0.9) -> Scripted:
+    """A provider that assesses and then extracts the fixture's facts."""
+    return Scripted(assessed(summary, score), json.dumps(EXTRACTION))
 
 
 async def seed(
@@ -212,7 +217,9 @@ async def test_a_sweep_consolidates_at_most_its_bound(store: Store) -> None:
     for n in range(4):
         await seed(store, f"slack:T:C:{n}")
         await make_idle(store, f"slack:T:C:{n}")
-    closer, _ = closer_for(store, Scripted(*(["s", json.dumps(EXTRACTION)] * 4)), max_per_run=2)
+    closer, _ = closer_for(
+        store, Scripted(*([assessed(), json.dumps(EXTRACTION)] * 4)), max_per_run=2
+    )
 
     assert len((await closer.sweep()).closed) == 2
 
@@ -269,7 +276,7 @@ async def test_a_citation_of_a_line_that_does_not_exist_is_dropped(store: Store)
             }
         ]
     }
-    closer, _ = closer_for(store, Scripted("s", json.dumps(invented)))
+    closer, _ = closer_for(store, Scripted(assessed(), json.dumps(invented)))
 
     await closer.sweep()
 
@@ -318,7 +325,9 @@ async def test_the_same_subject_in_two_episodes_gets_one_key(store: Store) -> No
             }
         ]
     }
-    closer, _ = closer_for(store, Scripted("s", json.dumps(EXTRACTION), "s", json.dumps(restated)))
+    closer, _ = closer_for(
+        store, Scripted(assessed(), json.dumps(EXTRACTION), assessed(), json.dumps(restated))
+    )
 
     await closer.sweep()
 
@@ -336,7 +345,7 @@ async def test_more_observations_than_the_cap_are_truncated(store: Store) -> Non
             for n in range(30)
         ]
     }
-    closer, _ = closer_for(store, Scripted("s", json.dumps(flood)), max_observations=5)
+    closer, _ = closer_for(store, Scripted(assessed(), json.dumps(flood)), max_observations=5)
 
     result = await closer.sweep()
 
@@ -347,9 +356,157 @@ async def test_a_claim_with_no_subject_is_not_stored(store: Store) -> None:
     await seed(store)
     await make_idle(store)
     vague = {"observations": [{"subject": "???", "claim": "Something happened.", "kind": "fact"}]}
-    closer, _ = closer_for(store, Scripted("s", json.dumps(vague)))
+    closer, _ = closer_for(store, Scripted(assessed(), json.dumps(vague)))
 
     assert (await closer.sweep()).observations == 0
+
+
+# -- the cost gate (#28) -----------------------------------------------------
+
+
+#: Six lines of nothing. What most closed episodes actually look like.
+SMALL_TALK: tuple[tuple[Role, str | None, str], ...] = (
+    ("user", "jane", "morning!"),
+    ("assistant", None, "Morning."),
+    ("user", "jane", "any plans for the weekend"),
+    ("assistant", None, "I don't have weekends, but thank you for asking."),
+    ("user", "jane", "ha. ok, back to it"),
+)
+
+
+async def test_small_talk_is_gated_out(store: Store) -> None:
+    """Half the acceptance criterion. Nothing happened, so nothing is extracted
+    and the episode never reaches `promote` at all."""
+    await seed(store, turns=SMALL_TALK)
+    await make_idle(store)
+    closer, provider = closer_for(store, Scripted(assessed("They said good morning.", score=0.05)))
+
+    result = await closer.sweep()
+
+    assert [c.gated for c in result.closed] == [True]
+    assert result.observations == 0
+    assert await store.pending_observations() == []
+    assert len(provider.requests) == 1, "the extraction call was never made"
+
+
+async def test_a_conversation_containing_a_decision_is_not_gated(store: Store) -> None:
+    """The other half. The fixture moves the release window, and that is
+    exactly what the gate must not throw away to save a call."""
+    await seed(store)
+    await make_idle(store)
+    closer, provider = closer_for(store, talking(score=0.85))
+
+    result = await closer.sweep()
+
+    assert [c.gated for c in result.closed] == [False]
+    assert result.observations == 2
+    assert len(provider.requests) == 2
+
+
+async def test_a_gated_episode_still_closes_with_its_summary(store: Store) -> None:
+    """ "Closes with a summary and never reaches promote" — both halves. The
+    summary is what a later conversation reads; the observations are what
+    `promote` would have paid for."""
+    await seed(store, turns=SMALL_TALK)
+    await make_idle(store)
+    closer, _ = closer_for(store, Scripted(assessed("They said good morning.", score=0.05)))
+
+    result = await closer.sweep()
+
+    episode = await store.episode(result.closed[0].episode_id)
+    assert episode is not None
+    assert episode["state"] == "closed"
+    assert episode["summary"] == "They said good morning."
+
+
+async def test_the_score_is_recorded_whether_or_not_it_gated(store: Store) -> None:
+    """A threshold can only be tuned against the scores it did *not* act on as
+    well as the ones it did."""
+    await seed(store, "slack:T:C:1")
+    await make_idle(store, "slack:T:C:1")
+    await seed(store, "slack:T:C:2", turns=SMALL_TALK)
+    await make_idle(store, "slack:T:C:2")
+    closer, _ = closer_for(
+        store, Scripted(assessed(score=0.9), json.dumps(EXTRACTION), assessed(score=0.05))
+    )
+
+    await closer.sweep()
+
+    scores = [row["signal_score"] for row in await store.raw("SELECT signal_score FROM episodes")]
+    assert sorted(scores) == [0.05, 0.9]
+
+
+async def test_the_threshold_is_configurable(store: Store) -> None:
+    await seed(store)
+    await make_idle(store)
+    closer, _ = closer_for(store, talking(score=0.5), signal_threshold=0.8)
+
+    assert (await closer.sweep()).closed[0].gated is True
+
+
+async def test_a_threshold_of_zero_gates_nothing(store: Store) -> None:
+    """The off switch. Somebody who wants every conversation consolidated
+    should not have to read the source to find out how."""
+    await seed(store, turns=SMALL_TALK)
+    await make_idle(store)
+    closer, _ = closer_for(
+        store,
+        Scripted(assessed(score=0.0), json.dumps(EXTRACTION)),
+        signal_threshold=0.0,
+    )
+
+    assert (await closer.sweep()).closed[0].gated is False
+
+
+async def test_an_episode_that_could_not_be_scored_is_not_treated_as_low_signal(
+    store: Store,
+) -> None:
+    """The failure path is not a low score. Reading "no score" as "nothing
+    happened" would discard a conversation because a request failed, and cost
+    is the cheaper thing to lose under uncertainty."""
+    await seed(store)
+    await make_idle(store)
+    closer, _ = closer_for(store, Scripted("no", "still no", json.dumps(EXTRACTION)))
+
+    result = await closer.sweep()
+
+    assert [c.gated for c in result.closed] == [False]
+    assert result.observations == 2
+
+
+async def test_the_gate_says_why_out_loud(store: Store, caplog: Any) -> None:
+    """The score goes on the row; the sentence behind it does not, and it is
+    what somebody tuning the threshold actually reads."""
+    await seed(store, turns=SMALL_TALK)
+    await make_idle(store)
+    closer, _ = closer_for(store, Scripted(assessed(score=0.05)))
+
+    with caplog.at_level("INFO", logger="kasa.runner.episodes"):
+        await closer.sweep()
+
+    assert "gated at 0.05" in caplog.text
+    assert "a handover" in caplog.text, "the model's reason, not just the number"
+
+
+async def test_a_deliberate_memory_write_is_never_gated(store: Store) -> None:
+    """`memory_write` is somebody already deciding. The gate is about what to
+    spend *guessing*, and an observation the agent chose to record is not a
+    guess — it is pending before the episode is ever scored."""
+    await seed(store, turns=SMALL_TALK)
+    await store.add_observation(
+        subject="Jane Doe",
+        claim="Jane Doe prefers async standups.",
+        kind="preference",
+        scope="workspace",
+        session_id="slack:T:C:1",
+    )
+    await make_idle(store)
+    closer, _ = closer_for(store, Scripted(assessed(score=0.05)))
+
+    result = await closer.sweep()
+
+    assert result.closed[0].gated is True
+    assert len(await store.pending_observations()) == 1
 
 
 # -- the transcript that reaches the model -----------------------------------
@@ -400,7 +557,7 @@ async def test_an_episode_the_model_cannot_extract_from_is_still_closed(store: S
     on again — five minutes apart, forever."""
     await seed(store)
     await make_idle(store)
-    closer, _ = closer_for(store, Scripted("a summary", "not json", "still not json"))
+    closer, _ = closer_for(store, Scripted(assessed("a summary"), "not json", "still not json"))
 
     result = await closer.sweep()
 
@@ -421,7 +578,7 @@ async def test_a_refused_episode_does_not_take_the_sweep_down_with_it(store: Sto
         Scripted(
             ContentFilterError("no", provider="scripted"),
             ContentFilterError("no", provider="scripted"),
-            "a summary",
+            assessed("a summary"),
             json.dumps(EXTRACTION),
         ),
     )

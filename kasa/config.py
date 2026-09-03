@@ -175,6 +175,12 @@ class EpisodeSettings(BaseModel):
     #: More candidate facts than this out of one conversation is a model
     #: narrating the transcript rather than distilling it.
     max_observations: int = 12
+    #: The cost gate (`docs/DESIGN.md` §6.1). An episode scored below this
+    #: closes with its summary and is never extracted from, so it never
+    #: reaches `promote`. Low, because the thing being traded is tokens
+    #: against knowledge, and only one of those can be got back later. `0.0`
+    #: turns the gate off — every score clears it.
+    signal_threshold: float = 0.3
 
 
 class AgentSettings(BaseModel):

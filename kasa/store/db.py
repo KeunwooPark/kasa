@@ -448,6 +448,7 @@ class Store:
         episode_id: str,
         *,
         summary: str | None = None,
+        signal_score: float | None = None,
         observations: Sequence[ObservationDraft] = (),
     ) -> list[str] | None:
         """Close an episode and record what was extracted from it, atomically.
@@ -457,6 +458,11 @@ class Store:
         one episode produce one close and one None rather than two summaries
         and two sets of the same facts.
 
+        `signal_score` is written whether or not the episode was gated on it.
+        Only the scores of episodes that *were* gated would ever be surprising,
+        and a threshold can only be tuned against the distribution it did not
+        act on as well as the one it did.
+
         One transaction, because the two halves are only correct together. A
         close that commits without its observations discards what the episode
         was consolidated *for* and can never be retried — the episode is no
@@ -465,8 +471,9 @@ class Store:
         async with self._serial:
             cur = await self._conn.execute(
                 "UPDATE episodes SET state = 'closed', ended_at = ?,"
-                " summary = COALESCE(?, summary) WHERE id = ? AND state = 'open'",
-                (_now(), summary, episode_id),
+                " summary = COALESCE(?, summary), signal_score = COALESCE(?, signal_score)"
+                " WHERE id = ? AND state = 'open'",
+                (_now(), summary, signal_score, episode_id),
             )
             if cur.rowcount != 1:
                 await self._conn.rollback()
