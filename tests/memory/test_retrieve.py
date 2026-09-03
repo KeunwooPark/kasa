@@ -613,6 +613,42 @@ async def test_a_pinned_memory_arrives_as_its_body(
     assert "Always answer in metric units" in "\n".join(retrieval.pinned)
 
 
+async def test_pinned_memories_can_be_left_out_of_the_pool(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """#57. `memory_search` answers a question, so it does not want them unasked."""
+    bootstrap(tmp_path)
+    write(
+        tmp_path,
+        MemoryDoc.new(
+            type="fact",
+            title="Standing instruction",
+            body="Always answer in metric units, and never round a currency amount.",
+            pinned=True,
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+    search = retriever(store, tokenizer)
+
+    unasked = await search.retrieve("a question about nothing in particular", include_pinned=False)
+    assert unasked.kept == []
+
+    # Still findable, and still ranked as pinned, when the query is about it.
+    asked = await search.retrieve("metric units currency", include_pinned=False)
+    assert "Always answer in metric units" in "\n".join(asked.pinned)
+    assert asked.kept[0].pinned
+
+
+async def test_kept_reports_every_packed_memory_in_rank_order(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    retrieval = await retriever(store, tokenizer).retrieve("Who owns the deploy pipeline?")
+
+    scores = [c.final for c in retrieval.kept]
+    assert scores == sorted(scores, reverse=True)
+    assert len(retrieval.kept) == len(retrieval.snippets) + len(retrieval.pinned)
+
+
 async def test_a_memory_with_no_body_falls_back_to_its_header(
     tmp_path: Path, store: Store, tokenizer: Tokenizer
 ) -> None:

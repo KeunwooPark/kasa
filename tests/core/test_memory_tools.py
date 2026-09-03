@@ -155,6 +155,58 @@ async def test_the_search_limit_is_capped(memory: Memory) -> None:
     assert result  # the schema caps it; the handler clamps it too
 
 
+async def pin(memory: Memory, **fields: Any) -> str:
+    """Add a pinned memory to the corpus and reindex, returning its id."""
+    doc = MemoryDoc.new(pinned=True, **fields)
+    target = memory.root / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+    await MemoryIndex(memory.store, memory.root).reindex()
+    return doc.id
+
+
+async def test_search_does_not_lead_with_an_unrelated_pinned_memory(memory: Memory) -> None:
+    """#57. The tool promises ranked snippets, so the top hit must be the best one."""
+    standing = await pin(
+        memory,
+        type="fact",
+        title="House style",
+        body="Answer in British English and keep replies under four sentences.",
+    )
+
+    result = await memory.call("memory_search", {"query": "who owns the deploy pipeline"})
+
+    assert result.startswith(f"[[{id_of(memory, 'memory/people/jane-okafor.md')}]]")
+    assert standing not in result
+
+
+async def test_a_pinned_memory_still_ranks_when_it_matches(memory: Memory) -> None:
+    """Excluded from the pool, not from the results: the query can still find it."""
+    standing = await pin(
+        memory,
+        type="fact",
+        title="Deploy freeze",
+        body="No deploys go out between the 20th of December and the 2nd of January.",
+    )
+
+    result = await memory.call("memory_search", {"query": "deploy freeze over christmas"})
+    assert standing in result
+
+
+async def test_pinned_memories_do_not_crowd_out_the_answer(memory: Memory) -> None:
+    """Five standing instructions used to fill the default limit exactly."""
+    for n in range(5):
+        await pin(
+            memory,
+            type="fact",
+            title=f"House style {n}",
+            body=f"Standing instruction number {n}, about nothing in particular.",
+        )
+
+    result = await memory.call("memory_search", {"query": "who owns the deploy pipeline"})
+    assert "Jane" in result
+
+
 # -- memory_read -------------------------------------------------------------
 
 
