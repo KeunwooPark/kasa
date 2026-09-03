@@ -15,6 +15,7 @@ pytest.importorskip("slack_bolt", reason="the `slack` extra")
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
+from kasa.adapters import slack as package
 from kasa.adapters.slack.app import NO_HTTP_VERIFICATION, SlackAdapter
 from kasa.adapters.slack.events import SlackContext, normalize
 from kasa.core.agent import Agent
@@ -316,3 +317,40 @@ async def test_a_dm_is_scoped_to_the_person_in_it(store: Store, tokenizer: Token
     session = await store.get_session(f"slack:{TEAM}:D0PRIVATE:1700000000.000100")
     assert session is not None
     assert session["scope"] == f"private:{HUMAN}"
+
+
+# -- the package --------------------------------------------------------------
+
+
+def test_the_adapter_resolves_through_the_lazy_import() -> None:
+    """#119 put `SlackAdapter` behind a module `__getattr__` so that
+    `kasa.adapters.slack.events` imports on an install that never asked for the
+    `slack` extra. The two tests that cover *that* half run in subprocesses,
+    because making `slack_bolt` unimportable inside an environment that has it
+    is the only way to reproduce a missing extra — and a subprocess is
+    something coverage cannot see, so the lazy path read as dead code.
+
+    This is the half that runs here: with the extra installed, the name
+    resolves to the class. It is also the assertion that fails if the name is
+    dropped from `__all__` or misspelled inside `__getattr__`, neither of which
+    the subprocess pair would notice — both assert on the failure path.
+    """
+    assert "SlackAdapter" in package.__all__
+    assert package.SlackAdapter is SlackAdapter
+
+
+def test_every_name_the_package_exports_can_be_reached() -> None:
+    """`__all__` is what `from ... import *` and a reader both go by, so a name
+    on it that resolves to nothing is a promise the package does not keep."""
+    for name in package.__all__:
+        assert getattr(package, name) is not None, name
+
+
+def test_the_package_says_no_to_a_name_it_does_not_have() -> None:
+    """A `__getattr__` that falls off the end returns `None` instead of
+    raising, which makes `hasattr` true for everything and turns a typo into a
+    silent `None` at the call site rather than an import error."""
+    missing = "Nonexistent"
+
+    with pytest.raises(AttributeError, match="has no attribute 'Nonexistent'"):
+        getattr(package, missing)
