@@ -168,9 +168,19 @@ def _write_tool(store: Store) -> Tool:
         if kind not in OBSERVATION_KINDS:
             return f"kind must be one of {', '.join(OBSERVATION_KINDS)}."
 
+        subject = str(args["subject"]).strip()
+        claim = str(args["claim"]).strip()
+        # `minLength` in the schema rejects the empty string upstream, the way
+        # the `kind` enum does; it cannot see a string of spaces. Both used to
+        # get through, and the observation sat `pending` forever with nothing
+        # in it — after the model had been told the write succeeded, which is
+        # the one answer a write tool must not give for a no-op (#79).
+        if not subject or not claim:
+            return "subject and claim must each say something; nothing was recorded."
+
         await store.add_observation(
-            subject=str(args["subject"]).strip(),
-            claim=str(args["claim"]).strip(),
+            subject=subject,
+            claim=claim,
             kind=kind,
             # Inherited, never supplied: an observation from a DM stays private
             # even if the model would rather it were general knowledge.
@@ -193,10 +203,12 @@ def _write_tool(store: Store) -> Tool:
                 "kind": {"type": "string", "enum": list(OBSERVATION_KINDS)},
                 "subject": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "Who or what this is about, e.g. a person or project name.",
                 },
                 "claim": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The thing to remember, as one self-contained sentence.",
                 },
             },

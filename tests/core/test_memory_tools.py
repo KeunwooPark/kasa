@@ -508,3 +508,39 @@ async def test_pre_injection_respects_the_session_scope(
     await agent.respond("cli:4", "what was the salary band outcome?")
     injected = provider.contexts[0] or ""
     assert id_of(memory, "memory/facts/salary-review-outcome.md") not in injected
+
+
+# -- a write tool must not confirm a no-op (#79) ------------------------------
+
+
+async def test_whitespace_is_not_a_claim(memory: Memory, store: Store) -> None:
+    """#79. Both fields were stripped and written, and the model was told the
+    write had succeeded — leaving an observation with nothing in it `pending`
+    for the promote job to deal with.
+
+    `minLength` in the schema catches the empty string upstream; it cannot see
+    a string of spaces, so the handler checks the stripped value too."""
+    result = await memory.call("memory_write", {"kind": "fact", "subject": " ", "claim": "\t\n"})
+
+    assert "must each say something" in result
+    assert "queued" not in result
+    assert await store.pending_observations() == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"kind": "fact", "subject": "", "claim": ""},
+        {"kind": "fact", "subject": "Jane", "claim": ""},
+        {"kind": "fact", "subject": "", "claim": "Jane owns deploys."},
+    ],
+)
+async def test_an_empty_field_is_refused_by_the_schema(
+    memory: Memory, store: Store, args: dict[str, Any]
+) -> None:
+    """Upstream, the way the `kind` enum is — so it arrives as an error rather
+    than as an answer."""
+    result = await memory.call("memory_write", args)
+
+    assert "invalid arguments" in result
+    assert await store.pending_observations() == []
