@@ -12,7 +12,7 @@ from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
-from kasa.memory.gitcmd import GitRepo
+from kasa.memory.gitcmd import GitRepo, run_git
 from kasa.memory.index import MemoryIndex
 from kasa.memory.manifest import Manifest
 from kasa.store import Store
@@ -336,3 +336,50 @@ async def test_a_clone_with_nothing_parked_is_ok(tmp_path: Path, clone: Path) ->
 
     assert status_of(report, "clone") is Status.OK
     assert "stashed" not in detail_of(report, "clone")
+
+
+async def test_memory_that_could_not_be_pushed_is_reported(tmp_path: Path, clone: Path) -> None:
+    """#91. A failed push keeps its local commit, which is right — and nothing
+    said so. `ApplyResult.pushed` was read by nobody and the log record goes
+    nowhere without a handler."""
+    remote = tmp_path / "remote.git"
+    run_git("init", "--bare", "--initial-branch", "main", str(remote))
+    repo = GitRepo.at(clone)
+    repo.set_remote(str(remote))
+    repo.push("main", set_upstream=True)
+
+    doc = MemoryDoc.new(type="fact", title="Written offline", body="Never left this disk.")
+    target = clone / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+    repo.commit("memory: written offline")
+
+    report = await diagnose(config_for(tmp_path), github=github())
+    detail = detail_of(report, "clone")
+
+    assert status_of(report, "clone") is Status.WARN
+    assert "1 commit(s) not pushed" in detail
+    assert "only on this disk" in detail
+
+
+async def test_a_clone_in_step_with_its_remote_is_ok(tmp_path: Path, clone: Path) -> None:
+    remote = tmp_path / "remote.git"
+    run_git("init", "--bare", "--initial-branch", "main", str(remote))
+    repo = GitRepo.at(clone)
+    repo.set_remote(str(remote))
+    repo.push("main", set_upstream=True)
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "clone") is Status.OK
+    assert "not pushed" not in detail_of(report, "clone")
+
+
+async def test_a_clone_with_no_upstream_is_not_called_unpushed(tmp_path: Path, clone: Path) -> None:
+    """Never pushed, or deliberately local. A configuration, not a failure."""
+    assert GitRepo.at(clone).ahead_of_upstream() is None
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "clone") is Status.OK
+    assert "not pushed" not in detail_of(report, "clone")

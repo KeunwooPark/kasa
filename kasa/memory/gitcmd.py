@@ -242,6 +242,24 @@ class GitRepo:
         self.run("stash", "push", "--include-untracked", "--message", message)
         return True
 
+    def ahead_of_upstream(self) -> int | None:
+        """Commits on this branch that its upstream does not have.
+
+        `None` when there is no upstream to compare against — never pushed, or
+        a clone deliberately kept local. That is a configuration, not a
+        failure, and it must not read as one.
+
+        Compared against the remote-tracking ref as it stands, without
+        fetching. That is the right comparison for the question being asked:
+        a push that failed did not move `origin/main`, so the count is exactly
+        what could not be sent. It also keeps the caller — `kasa doctor` — from
+        doing network I/O in a local check.
+        """
+        result = run_git("rev-list", "--count", "@{u}..HEAD", cwd=self.path, check=False)
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip() or 0)
+
     def stashes(self) -> list[str]:
         """Every stash entry, newest first. Empty when there are none."""
         return [line for line in self.run("stash", "list").splitlines() if line]

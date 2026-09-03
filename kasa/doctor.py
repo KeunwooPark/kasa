@@ -196,6 +196,14 @@ def _clone(cfg: Config) -> Check:
         # next `apply` has to stash it before it can do anything.
         notes.append("uncommitted changes present")
         warn = True
+    if ahead := repo.ahead_of_upstream():
+        # A write whose push failed keeps its local commit, which is right —
+        # history is the undo buffer, and losing the write would be worse. But
+        # an undo buffer on one disk is not one, and until #91 nothing said so:
+        # `ApplyResult.pushed` was read by nobody and the log record goes
+        # nowhere without a handler. This is the only place anybody looks.
+        notes.append(f"{ahead} commit(s) not pushed — memory written here exists only on this disk")
+        warn = True
     if stashes := repo.stashes():
         # The one place anybody would think to look. A write over uncommitted
         # work parks it in a stash and says so in a log record nothing prints
