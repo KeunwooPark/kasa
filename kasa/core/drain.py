@@ -131,12 +131,29 @@ class Drainer[ItemT: Leased]:
         free = self._concurrency - len(self._in_flight)
         if free <= 0:
             return 0
-        items = await self._queue.lease(limit=free)
-        for item in items:
+        started = 0
+        for item in await self._queue.lease(limit=free):
+            if item.id in self._in_flight:
+                # Our own lease, expired under us while the work is still
+                # running: both queues' lease SQL matches `lease_until <= now`
+                # on a leased row, which is what replays a dead process's work
+                # and cannot tell that process from this one. Running it again
+                # would answer the same message twice, and the second task
+                # would evict the first from `_in_flight` — leaving it
+                # unrenewed, unsettled at shutdown and uncancellable.
+                #
+                # Skipping is also the renewal that did not happen: the lease
+                # just taken has already pushed `lease_until` out by a TTL.
+                log.warning("re-leased %s while still running it; skipping", item.id)
+                continue
             task = asyncio.create_task(self._deliver(item), name=f"work-{item.id}")
             self._in_flight[item.id] = task
             task.add_done_callback(functools.partial(self._forget, item.id))
-        return len(items)
+            started += 1
+        # Skipped rows are deliberately not counted: `run` reads a non-zero
+        # return as "there was work", and a batch of nothing but our own
+        # in-flight rows would then loop without ever reaching `_idle`.
+        return started
 
     def _forget(self, item_id: Any, task: asyncio.Task[None]) -> None:
         self._in_flight.pop(item_id, None)

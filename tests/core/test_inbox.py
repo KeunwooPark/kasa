@@ -10,7 +10,7 @@ from pathlib import Path
 
 from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
-from kasa.core.inbox import Dispatcher, Inbox
+from kasa.core.inbox import Dispatcher, Inbox, LeasedEvent
 from kasa.store import Store
 from tests.conftest import until
 
@@ -229,6 +229,62 @@ async def test_a_long_delivery_keeps_its_lease(store: Store) -> None:
     gate.set()
     await stop(dispatcher, task)
     assert await inbox.counts() == {"done": 1}
+
+
+async def test_an_expired_lease_is_not_handed_back_to_the_drainer_still_running_it(
+    store: Store,
+) -> None:
+    """`lease_until <= now` on a leased row is how a dead process's work replays,
+    and it cannot tell that process from this one. Answering twice is the exact
+    duplicate `UNIQUE (source, external_id)` exists to prevent."""
+    inbox = Inbox(store, lease_ttl=0.0)  # every lease is expired the moment it is taken
+    gate = asyncio.Event()
+    calls = 0
+
+    async def handler(inbound: InboundEvent) -> None:
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+
+    dispatcher = Dispatcher(inbox, handler, concurrency=4, poll_interval=0.01)
+    await inbox.enqueue(event("E1"))
+    task = await running(dispatcher)
+    await until(lambda: calls >= 1)
+    await asyncio.sleep(0.1)  # ten polls, each of which re-leases the running row
+
+    assert calls == 1, f"one message delivered {calls} time(s)"
+    gate.set()
+    await stop(dispatcher, task)
+    assert await inbox.counts() == {"done": 1}
+
+
+async def test_a_batch_of_only_our_own_rows_polls_rather_than_spins(store: Store) -> None:
+    """A non-zero `_start_batch` tells `run` there was work and to look again at
+    once. Counting rows it skipped is a busy loop rather than a poll."""
+    inbox = Inbox(store, lease_ttl=0.0)
+    gate = asyncio.Event()
+    leases = 0
+    taken = inbox.lease
+
+    async def counted(*, limit: int = 1) -> list[LeasedEvent]:
+        nonlocal leases
+        leases += 1
+        return await taken(limit=limit)
+
+    inbox.lease = counted  # type: ignore[method-assign]
+
+    async def handler(inbound: InboundEvent) -> None:
+        await gate.wait()
+
+    dispatcher = Dispatcher(inbox, handler, concurrency=4, poll_interval=0.02)
+    await inbox.enqueue(event("E1"))
+    task = await running(dispatcher)
+    await until(lambda: dispatcher.in_flight == 1)
+    await asyncio.sleep(0.2)  # ten polls' worth
+
+    assert leases < 40, f"{leases} leases in 0.2s is a spin, not a poll"
+    gate.set()
+    await stop(dispatcher, task)
 
 
 async def test_shutdown_hands_back_unfinished_work_without_burning_an_attempt(
