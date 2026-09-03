@@ -29,10 +29,11 @@ from typing import Self
 from kasa.config import Config
 from kasa.errors import GitError, KasaError
 from kasa.memory.bootstrap import is_bootstrapped
+from kasa.memory.document import Problem
 from kasa.memory.gitcmd import GitRepo
 from kasa.memory.layout import MANIFEST_PATH, is_memory_path
 from kasa.memory.lease import LOCK_FILENAME, Lease, stale_lease
-from kasa.memory.manifest import Manifest, Problem
+from kasa.memory.manifest import Manifest
 from kasa.store import Store
 
 log = logging.getLogger(__name__)

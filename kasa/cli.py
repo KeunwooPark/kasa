@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
+from itertools import chain
 from pathlib import Path
 from typing import Annotated
 
@@ -23,6 +25,7 @@ from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
+from kasa.memory.document import Problem
 from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
 from kasa.memory.ltm import MemoryStore, MemoryStoreError
@@ -106,11 +109,20 @@ def show_config(config: ConfigOption = None) -> None:
 def reindex(
     config: ConfigOption = None,
     full: Annotated[bool, typer.Option("--full", help="Rebuild from scratch.")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Rebuild the search index from the memory repo.
 
     Safe at any time: the index is derived, and the repo is the source of truth.
     """
+    # Quiet by default. This command has its own report, and without any
+    # logging configured the WARNING records behind that report went out
+    # through Python's `lastResort` handler — unformatted, above the summary,
+    # saying what the summary was about to say (#77). `-v` matches `kasa run`.
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.ERROR,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     async def main() -> None:
         cfg = _load(config)
@@ -129,10 +141,12 @@ def reindex(
             manifest = await memory.refresh_manifest()
         console.print(result.summary())
         console.print(f"[dim]{manifest.summary()}[/dim]")
-        for problem in result.problems:
-            err.print(f"[yellow]![/yellow] could not index {problem}")
-        for broken in manifest.problems:
-            err.print(f"[yellow]![/yellow] {broken.path}: {broken.reason}")
+        # One line per file. The index and the manifest read the same files and
+        # refuse them for the same reasons, so a file both halves rejected was
+        # named twice — once without a reason (#77). They are not always the
+        # same set: a duplicate id indexes fine and only the manifest minds.
+        for problem in _one_per_file(result.problems, manifest.problems):
+            err.print(f"[yellow]![/yellow] {problem.path}: {problem.reason}")
 
     _run(main())
 
@@ -240,6 +254,14 @@ def db_migrate(config: ConfigOption = None) -> None:
 def db_path(config: ConfigOption = None) -> None:
     """Print the database location."""
     emit(str(_load(config).store.resolved()))
+
+
+def _one_per_file(*groups: Sequence[Problem]) -> list[Problem]:
+    """Merge problem lists by path, keeping the first reason given for each."""
+    seen: dict[str, Problem] = {}
+    for problem in chain.from_iterable(groups):
+        seen.setdefault(problem.path, problem)
+    return list(seen.values())
 
 
 def emit(value: str) -> None:

@@ -14,6 +14,7 @@ strict about the resulting values.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Self
 
@@ -64,6 +65,23 @@ class MemoryError_(KasaError):
         self.reason = reason
         self.source = source
         super().__init__(f"{source}: {reason}" if source else reason)
+
+
+@dataclass(frozen=True, slots=True)
+class Problem:
+    """A memory file that could not be read, and why.
+
+    `reason` is the bare reason. The path is the other field, and every caller
+    renders the two together in its own shape.
+
+    Here rather than in `manifest`, because the index refuses the same files
+    for the same reasons and had no way to say so — it reported bare paths, so
+    `kasa reindex` named a broken file once without a reason and once with one
+    (#77).
+    """
+
+    path: str
+    reason: str
 
 
 class Frontmatter(BaseModel):
