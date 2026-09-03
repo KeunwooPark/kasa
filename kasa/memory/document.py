@@ -266,6 +266,16 @@ def is_memory_id(value: str) -> bool:
     return bool(_ID.match(value))
 
 
+def is_visibility(value: str) -> bool:
+    """Whether `value` is a scope a memory may legitimately carry.
+
+    The same check `Frontmatter` runs, exposed for the callers that hold a
+    scope from somewhere else — a session row, a tool argument — and need to
+    know it is writable *before* building a document around it.
+    """
+    return bool(_VISIBILITY.match(value))
+
+
 #: How much of a title becomes a filename. A filename is a handle, not the
 #: title — the title is in the frontmatter and the id is the durable reference,
 #: so truncating loses nothing readers need. Unbounded, a long title produced a

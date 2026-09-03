@@ -18,6 +18,7 @@ from kasa.memory.gitcmd import GitRepo
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import INDEX_LEASE_NAME, Lease
 from kasa.memory.manifest import Manifest
+from kasa.runner.cron import HOURLY
 from kasa.runner.jobs import EVERY_FIVE_MINUTES, default_specs
 from kasa.runner.scheduler import Job, JobSpec, Scheduler
 from kasa.store import Store
@@ -211,3 +212,16 @@ async def test_the_one_that_won_the_lease_still_did_the_work(clone: Path, store:
     await asyncio.gather(handler(job), handler(job))
 
     assert (await store.raw("SELECT COUNT(*) AS n FROM chunks"))[0]["n"] > 0
+
+
+def test_promote_needs_both_a_model_and_a_repo(clone: Path, store: Store) -> None:
+    """It is the step that crosses between them: it reads observations out of
+    SQLite with a chat model and writes files into git."""
+    assert "promote" not in [spec.kind for spec in default_specs(config_for(clone), store)]
+    assert "promote" not in [spec.kind for spec in default_specs(with_model(Config()), store)]
+
+    specs = {spec.kind: spec for spec in default_specs(with_model(config_for(clone)), store)}
+
+    assert "promote" in specs
+    assert specs["promote"].cron is not None
+    assert specs["promote"].cron.expression == HOURLY

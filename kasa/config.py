@@ -183,6 +183,35 @@ class EpisodeSettings(BaseModel):
     signal_threshold: float = 0.3
 
 
+class PromoteSettings(BaseModel):
+    """How much of the pending queue one `promote` run works through.
+
+    Every number here bounds a cost. `promote` calls the *chat* model once per
+    subject and writes one commit per run, so an unbounded run is both the
+    largest bill in the system and the largest diff a person has to review.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Pending observations read per run.
+    max_observations: int = 100
+    #: Subjects reconciled per run — one chat-model call each.
+    max_subjects: int = 10
+    #: Existing memories offered per subject as competition. This is what makes
+    #: a restated fact an update instead of a duplicate, so it is the number to
+    #: raise if duplicates start appearing.
+    competing_memories: int = 5
+    #: A memory larger than this is not shown as competition. Not truncated:
+    #: an `Update` replaces the body wholesale, so a model shown half a memory
+    #: would rewrite it as half a memory. One this size is a file `reorganize`
+    #: should be splitting.
+    max_memory_chars: int = 8_000
+    #: Rejected plans a subject may produce before its observations are
+    #: discarded. Without it, one poison group costs a chat call every hour
+    #: forever and is never promoted anyway.
+    max_attempts: int = 3
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -262,6 +291,7 @@ class Config(BaseModel):
     ltm: LTMSettings = Field(default_factory=LTMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     episodes: EpisodeSettings = Field(default_factory=EpisodeSettings)
+    promote: PromoteSettings = Field(default_factory=PromoteSettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -478,6 +508,7 @@ def render_toml(cfg: Config) -> str:
     for name, section in (
         ("memory", cfg.memory),
         ("episodes", cfg.episodes),
+        ("promote", cfg.promote),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),
