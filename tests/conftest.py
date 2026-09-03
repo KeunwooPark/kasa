@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -42,3 +43,19 @@ def sse(events: list[tuple[str | None, dict[str, object]]], *, done: bool = Fals
     if done:
         chunks.append("data: [DONE]\n\n")
     return "".join(chunks).encode()
+
+
+async def until(predicate: Callable[[], bool], *, within: float = 10.0) -> None:
+    """Wait for a background loop to get somewhere, without sleeping blind.
+
+    The loops under test are driven by tasks rather than by the test, so there
+    is nothing to await directly. A deadline is what keeps a broken one from
+    hanging the suite instead of failing it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("timed out waiting for the loop under test")
