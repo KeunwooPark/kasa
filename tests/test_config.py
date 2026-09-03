@@ -177,3 +177,36 @@ def test_an_empty_config_still_writes_something_loadable(tmp_path: Path) -> None
     path = tmp_path / "config.toml"
     write_config(Config(), path)
     assert load_config(path) == Config()
+
+
+# -- the context budget is checked at load time (#76) -------------------------
+
+
+@pytest.mark.parametrize(
+    ("stanza", "expected"),
+    [
+        ("[context]\nsystem = 0.9\nrecent = 0.9\n", "must sum to 1.0"),
+        ("[context]\nretrieved = 0.0\n", "must sum to 1.0"),
+        ("[context]\ntotal = 0\n", "must be positive"),
+    ],
+)
+def test_an_unusable_context_budget_is_rejected_when_the_config_is_read(
+    tmp_path: Path, stanza: str, expected: str
+) -> None:
+    """#76. `ContextBudget` validated in `__post_init__`, and nothing built one
+    until a command built a packer — so `kasa config` and `kasa doctor` were
+    green on a config `kasa run` would not start with."""
+    path = tmp_path / "config.toml"
+    path.write_text(stanza)
+
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+
+    assert expected in str(caught.value)
+    assert str(path) in str(caught.value), "and it names the file"
+
+
+def test_the_default_budget_is_still_valid(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[store]\npath = "x.db"\n')
+    assert load_config(path).context.to_budget().total == 128_000

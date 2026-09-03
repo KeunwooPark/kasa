@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import user_config_dir, user_data_dir
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kasa.core.agent import AgentConfig
 from kasa.core.context import ContextBudget
@@ -165,6 +165,19 @@ class ContextSettings(BaseModel):
     episode: float = 0.10
     recent: float = 0.35
     headroom: float = 0.10
+
+    @model_validator(mode="after")
+    def _budget_is_constructible(self) -> ContextSettings:
+        """Fail at load time, not at the first turn.
+
+        `ContextBudget` validates the shares in `__post_init__`, and nothing
+        constructed one until a command built a packer — so a config whose
+        shares did not sum to 1.0 passed `kasa config` and `kasa doctor` and
+        then stopped `kasa run` from starting (#76). A health check that is
+        green on a config the program refuses is worse than no health check.
+        """
+        self.to_budget()
+        return self
 
     def to_budget(self) -> ContextBudget:
         return ContextBudget(**self.model_dump())
