@@ -190,12 +190,20 @@ def _clone(cfg: Config) -> Check:
         return Check("clone", Status.WARN, f"{path} has no memory skeleton; run `kasa init`")
 
     notes = [f"{path} on {repo.current_branch()}"]
+    warn = False
     if repo.is_dirty():
         # A dirty working copy is how a crashed write announces itself, and the
-        # next `apply` has to reset it before it can do anything.
+        # next `apply` has to stash it before it can do anything.
         notes.append("uncommitted changes present")
-        return Check("clone", Status.WARN, ", ".join(notes))
-    return Check("clone", Status.OK, ", ".join(notes))
+        warn = True
+    if stashes := repo.stashes():
+        # The one place anybody would think to look. A write over uncommitted
+        # work parks it in a stash and says so in a log record nothing prints
+        # at default verbosity, so without this the edit is recoverable and
+        # nobody knows there is anything to recover (#78).
+        notes.append(f"{len(stashes)} stashed change(s) — `git -C {path} stash list` to see them")
+        warn = True
+    return Check("clone", Status.WARN if warn else Status.OK, ", ".join(notes))
 
 
 async def _store_checks(cfg: Config) -> list[Check]:

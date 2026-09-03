@@ -235,6 +235,39 @@ async def test_recovery_is_a_no_op_on_a_clean_tree(memory: MemoryStore) -> None:
     assert memory.recover() is False
 
 
+async def test_the_stash_does_not_claim_to_be_kasas_own_debris(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """#78. It said "recovered from an interrupted write", which is one of the
+    two cases `recover` says it cannot tell apart — and the disposable one.
+    Somebody tidying `git stash list` would drop a hand edit as ours."""
+    (clone / "memory" / "facts" / "by-hand.md").write_text("mid-edit\n")
+
+    await memory.apply([Write(*a_memory())], META)
+    entries = GitRepo.at(clone).stashes()
+
+    assert len(entries) == 1
+    assert "recovered from an interrupted write" not in entries[0]
+    assert "uncommitted changes parked before a memory write" in entries[0]
+
+
+async def test_two_parked_edits_can_be_told_apart(memory: MemoryStore, clone: Path) -> None:
+    """They accumulate, and identically named entries are unrecoverable in
+    practice: you cannot tell which one you wanted."""
+    for n in range(2):
+        (clone / "memory" / "facts" / f"by-hand-{n}.md").write_text(f"edit {n}\n")
+        await memory.apply([Write(*a_memory(title=f"Note {n}"))], META)
+
+    entries = GitRepo.at(clone).stashes()
+
+    assert len(entries) == 2
+    assert entries[0] != entries[1], "the timestamp distinguishes them"
+
+
+async def test_stashes_lists_nothing_on_a_clean_repo(clone: Path) -> None:
+    assert GitRepo.at(clone).stashes() == []
+
+
 # -- racing another machine --------------------------------------------------
 
 
