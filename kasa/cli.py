@@ -40,7 +40,10 @@ db_app = typer.Typer(help="Database maintenance.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 
 console = Console()
-err = Console(stderr=True)
+#: Everything on stderr is a single diagnostic line, never a table, and it
+#: usually carries a path somebody is about to act on. Wrapping it at rich's
+#: 80-column fallback split those messages mid-word when stderr was a pipe.
+err = Console(stderr=True, soft_wrap=True)
 
 ConfigOption = Annotated[Path | None, typer.Option("--config", "-c", help="Path to config.toml.")]
 
@@ -48,7 +51,7 @@ ConfigOption = Annotated[Path | None, typer.Option("--config", "-c", help="Path 
 @app.command()
 def version() -> None:
     """Print the version."""
-    console.print(__version__)
+    emit(__version__)
 
 
 @app.command()
@@ -58,7 +61,7 @@ def init(config: ConfigOption = None) -> None:
     async def main() -> None:
         result = await run_init(ConsolePrompter(), path=config)
         console.print()
-        console.print(f"[green]Ready.[/green] Memory repo: {result.repo_path}")
+        console.print(f"[green]Ready.[/green] Memory repo: {result.repo_path}", soft_wrap=True)
         console.print("Run [bold]kasa run[/bold] to start talking to it.")
 
     _run(main())
@@ -92,7 +95,10 @@ def show_config(config: ConfigOption = None) -> None:
     Safe to paste: the file holds environment-variable *names*, never secrets.
     """
     cfg = _load(config)
-    console.print(f"[dim]{config or config_path()}[/dim]")
+    # The path goes to stderr: it says where the JSON came from, which makes it
+    # a comment on the output rather than part of it. On stdout it was the
+    # first thing `kasa config | jq` choked on.
+    err.print(f"[dim]{config or config_path()}[/dim]")
     console.print_json(json.dumps(cfg.redacted(), indent=2))
 
 
@@ -225,7 +231,7 @@ def db_migrate(config: ConfigOption = None) -> None:
         if applied:
             console.print(f"applied {len(applied)} migration(s): {', '.join(applied)}")
         else:
-            console.print(f"[dim]{path} is up to date[/dim]")
+            console.print(f"[dim]{path} is up to date[/dim]", soft_wrap=True)
 
     _run(main())
 
@@ -233,7 +239,22 @@ def db_migrate(config: ConfigOption = None) -> None:
 @db_app.command("path")
 def db_path(config: ConfigOption = None) -> None:
     """Print the database location."""
-    console.print(str(_load(config).store.resolved()))
+    emit(str(_load(config).store.resolved()))
+
+
+def emit(value: str) -> None:
+    """Print one value for something else to read.
+
+    A command whose whole output is a value — `kasa db path`, `kasa version` —
+    must hand it over unchanged, and rich's defaults do three things to it.
+    `soft_wrap` because rich falls back to 80 columns when stdout is not a
+    terminal and hard-wraps there, which is how `$(kasa db path)` came back
+    with a newline in the middle of it. `markup=False` because a path may
+    legitimately contain square brackets, and rich reads those as style tags
+    and deletes them. `highlight=False` because ANSI colour in a captured
+    value is no more use than a newline in it (#68).
+    """
+    console.print(value, soft_wrap=True, markup=False, highlight=False)
 
 
 # -- wiring ------------------------------------------------------------------
@@ -259,7 +280,7 @@ class ConsolePrompter:
         return bool(typer.confirm(question, default=default))
 
     def say(self, text: str) -> None:
-        console.print(text)
+        console.print(text, soft_wrap=True)
 
     def warn(self, text: str) -> None:
         err.print(f"[yellow]![/yellow] {text}")
