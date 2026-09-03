@@ -72,14 +72,14 @@ def run(
 ) -> None:
     """Start Kasa.
 
-    v0 ships the terminal adapter only; Slack arrives in v2.
+    The terminal is the only surface today; Slack arrives in v2.
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
     if not cli:
-        raise typer.BadParameter("only --cli is supported at v0")
+        raise typer.BadParameter("the terminal is the only surface today; Slack arrives in v2")
     cfg = _load(config)
     Redactor.from_config(cfg).install()
     _run(_repl(cfg))
