@@ -431,7 +431,9 @@ class Store:
                 raise StoreError(f"inbox row for {source}:{external_id} vanished mid-enqueue")
             return int(row["id"]), True
 
-    async def lease_inbox(self, *, limit: int, now: str, lease_until: str) -> list[dict[str, Any]]:
+    async def lease_inbox(
+        self, *, limit: int, now: str, lease_until: str, exclude: Sequence[int] = ()
+    ) -> list[dict[str, Any]]:
         """Claim up to `limit` deliverable rows, oldest first.
 
         One statement, so two drainers cannot claim the same row: SQLite makes
@@ -440,18 +442,28 @@ class Store:
         `attempts` counts leases, not failures. A message that kills the process
         that is answering it leaves no failure behind to count, and counting
         only failures is how such a message loops forever.
+
+        Which is why `exclude` lives here rather than in the drainer.
+        `lease_until <= now` on a leased row is how a dead process's work
+        replays, and it cannot tell that process from this one — so a caller
+        passes the ids it is still running and those rows are not offered back.
+        Dropping them from the result afterwards would be too late: this
+        statement has already spent the attempt, and a caller re-leasing its
+        own work is not a process that died holding it (#126).
         """
+        skip = f" AND id NOT IN ({', '.join('?' for _ in exclude)})" if exclude else ""
         async with self._serial:
             async with self._conn.execute(
                 "UPDATE inbox SET state = 'leased', lease_until = ?, attempts = attempts + 1"
                 " WHERE id IN ("
                 "   SELECT id FROM inbox"
-                "   WHERE (state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
-                "      OR (state = 'leased' AND lease_until <= ?)"
+                "   WHERE ((state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
+                "      OR (state = 'leased' AND lease_until <= ?))"
+                f"{skip}"
                 "   ORDER BY id LIMIT ?"
                 " )"
                 " RETURNING id, payload, attempts",
-                (lease_until, now, now, limit),
+                (lease_until, now, now, *exclude, limit),
             ) as cur:
                 rows = [dict(row) for row in await cur.fetchall()]
             await self._conn.commit()
@@ -611,17 +623,28 @@ class Store:
             return bool(cur.rowcount)
 
     async def lease_jobs(
-        self, *, kinds: Sequence[str], limit: int, now: str, lease_until: str
+        self,
+        *,
+        kinds: Sequence[str],
+        limit: int,
+        now: str,
+        lease_until: str,
+        exclude: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
         """Claim up to `limit` runnable jobs of the kinds this worker knows.
 
         The `kind` filter is what lets a second process take only the work it
         has handlers for, which is the out-of-process worker the design asks
         this model to reach without a redesign.
+
+        `exclude` is the ids the caller is still running. See `lease_inbox` for
+        why it belongs in the statement that spends the attempt rather than in
+        the drainer that reads what comes back.
         """
         if not kinds:
             return []
         placeholders = ", ".join("?" for _ in kinds)
+        skip = f" AND id NOT IN ({', '.join('?' for _ in exclude)})" if exclude else ""
         async with self._serial:
             async with self._conn.execute(
                 "UPDATE jobs SET state = 'leased', lease_until = ?, attempts = attempts + 1"
@@ -630,10 +653,11 @@ class Store:
                 f"   WHERE kind IN ({placeholders})"
                 "     AND ((state = 'pending' AND run_after <= ?)"
                 "          OR (state = 'leased' AND lease_until <= ?))"
+                f"{skip}"
                 "   ORDER BY run_after LIMIT ?"
                 " )"
                 " RETURNING id, kind, payload, attempts",
-                (lease_until, *kinds, now, now, limit),
+                (lease_until, *kinds, now, now, *exclude, limit),
             ) as cur:
                 rows = [dict(row) for row in await cur.fetchall()]
             await self._conn.commit()

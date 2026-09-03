@@ -147,13 +147,14 @@ class JobQueue:
                 callback()
         return Queued(id=identifier, duplicate=not inserted)
 
-    async def lease(self, *, limit: int = 1) -> list[Job]:
+    async def lease(self, *, limit: int = 1, exclude: Sequence[Any] = ()) -> list[Job]:
         now = datetime.now(UTC)
         rows = await self._store.lease_jobs(
             kinds=self.kinds,
             limit=limit,
             now=_stamp(now),
             lease_until=_stamp(now + timedelta(seconds=self._lease_ttl)),
+            exclude=[str(item_id) for item_id in exclude],
         )
         return [
             Job(

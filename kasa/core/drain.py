@@ -42,7 +42,7 @@ class WorkQueue[ItemT: Leased](Protocol):
 
     def subscribe(self, callback: Callable[[], None]) -> None: ...
 
-    async def lease(self, *, limit: int) -> list[ItemT]: ...
+    async def lease(self, *, limit: int, exclude: Sequence[Any] = ()) -> list[ItemT]: ...
 
     async def renew(self, ids: Sequence[Any]) -> None: ...
 
@@ -141,18 +141,19 @@ class Drainer[ItemT: Leased]:
         if free <= 0:
             return 0
         started = 0
-        for item in await self._queue.lease(limit=free):
-            if item.id in self._in_flight:
-                # Our own lease, expired under us while the work is still
-                # running: both queues' lease SQL matches `lease_until <= now`
-                # on a leased row, which is what replays a dead process's work
-                # and cannot tell that process from this one. Running it again
+        # The ids we are still running are not on offer. Both queues' lease SQL
+        # matches `lease_until <= now` on a leased row, which is what replays a
+        # dead process's work and cannot tell that process from this one — so
+        # we say which rows are ours. Asking for the exclusion rather than
+        # filtering the answer is what keeps `attempts` honest: the lease is
+        # the thing that spends one, and a lease we hand ourselves is neither a
+        # delivery nor a process that died holding the row (#126).
+        for item in await self._queue.lease(limit=free, exclude=list(self._in_flight)):
+            if item.id in self._in_flight:  # pragma: no cover - belt to the braces above
+                # Reachable only if a queue ignores `exclude`. Running it again
                 # would answer the same message twice, and the second task
                 # would evict the first from `_in_flight` — leaving it
                 # unrenewed, unsettled at shutdown and uncancellable.
-                #
-                # Skipping is also the renewal that did not happen: the lease
-                # just taken has already pushed `lease_until` out by a TTL.
                 log.warning("re-leased %s while still running it; skipping", item.id)
                 continue
             task = asyncio.create_task(self._deliver(item), name=f"work-{item.id}")

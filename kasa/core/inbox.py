@@ -109,13 +109,14 @@ class Inbox:
             callback()
         return Enqueued(id=inbox_id, duplicate=False)
 
-    async def lease(self, *, limit: int = 1) -> list[LeasedEvent]:
-        """Claim up to `limit` deliverable events."""
+    async def lease(self, *, limit: int = 1, exclude: Sequence[Any] = ()) -> list[LeasedEvent]:
+        """Claim up to `limit` deliverable events, skipping `exclude`."""
         now = datetime.now(UTC)
         rows = await self._store.lease_inbox(
             limit=limit,
             now=_stamp(now),
             lease_until=_stamp(now + timedelta(seconds=self._lease_ttl)),
+            exclude=[int(item_id) for item_id in exclude],
         )
         leased: list[LeasedEvent] = []
         for row in rows:

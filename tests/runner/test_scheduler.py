@@ -6,7 +6,7 @@ import asyncio
 import signal
 import sys
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,92 @@ async def states(store: Store) -> dict[str, str]:
 
 
 # -- the clock keeps running -------------------------------------------------
+
+
+async def test_a_slow_job_does_not_pay_for_the_leases_it_gave_itself(store: Store) -> None:
+    """`attempts` counts leases rather than failures deliberately: work that
+    kills the process answering it leaves no failure behind to count, and
+    counting only failures is how such work loops forever.
+
+    A lease the drainer hands to *itself* while it is still running the work is
+    not a killed process. #114 stopped it running that work twice; it kept
+    taking the lease, and the lease is what `attempts` counts — so the retry
+    budget went to the one job guaranteed not to need it that way: the slow one.
+    """
+    gate = asyncio.Event()
+    runs = 0
+
+    async def slow(job: Job) -> None:
+        nonlocal runs
+        runs += 1
+        await gate.wait()
+
+    scheduler = Scheduler(
+        store,
+        [JobSpec(kind="reindex", handler=slow)],
+        concurrency=2,
+        poll_interval=0.01,
+        lease_ttl=0.0,  # every lease is expired the moment it is taken
+        backoff=Backoff(max_attempts=3, base=0.0, cap=0.0),
+    )
+    await scheduler.queue.enqueue("reindex")
+
+    task = asyncio.create_task(scheduler.run())
+    try:
+        await until(lambda: runs >= 1)
+        await asyncio.sleep(0.2)  # twenty polls, each of which re-leased the row
+        attempts = [row["attempts"] for row in await store.raw("SELECT attempts FROM jobs")]
+    finally:
+        gate.set()
+        scheduler.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    assert runs == 1, f"the work ran {runs} time(s)"
+    assert attempts == [1], f"one run, and the row was charged {attempts[0]} attempt(s)"
+
+
+async def test_a_slow_job_still_gets_every_retry_it_was_promised(store: Store) -> None:
+    """The same accounting, stated as the behaviour it buys.
+
+    A job that outlives two lease TTLs and then fails used to reach its dead
+    letter having really run twice against a budget of three — the leases it
+    was handed while running spent the other one. Slowness is not a failure,
+    and the job most likely to outlive its TTL is the one most likely to want
+    the retry.
+    """
+    runs = 0
+
+    async def slow_then_broken(job: Job) -> None:
+        nonlocal runs
+        runs += 1
+        await asyncio.sleep(0.05)  # several polls' worth, each of them a re-lease
+        raise RuntimeError("the remote was busy")
+
+    scheduler = Scheduler(
+        store,
+        [JobSpec(kind="reindex", handler=slow_then_broken)],
+        concurrency=2,
+        poll_interval=0.01,
+        lease_ttl=0.0,  # every lease is expired the moment it is taken
+        backoff=Backoff(max_attempts=3, base=0.0, cap=0.0),
+    )
+    await scheduler.queue.enqueue("reindex")
+
+    task = asyncio.create_task(scheduler.run())
+    try:
+        for _ in range(1000):
+            rows = await store.raw("SELECT state, attempts FROM jobs")
+            if rows[0]["state"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        scheduler.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    rows = await store.raw("SELECT state, attempts FROM jobs")
+    assert rows[0]["state"] == "failed", "it should have run out of retries by now"
+    assert runs == 3, f"a budget of three, spent on {runs} real run(s)"
+    assert rows[0]["attempts"] == 3, f"three runs recorded as {rows[0]['attempts']} attempt(s)"
 
 
 async def test_a_spec_that_cannot_be_scheduled_does_not_starve_the_others(store: Store) -> None:
@@ -191,7 +277,7 @@ async def test_a_job_it_cannot_reach_is_reported_rather_than_waited_for(store: S
     is there beats looping until the lease expires."""
     scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))])
 
-    async def nothing_runnable(*, limit: int = 1) -> list[Job]:
+    async def nothing_runnable(*, limit: int = 1, exclude: Sequence[Any] = ()) -> list[Job]:
         return []
 
     scheduler.queue.lease = nothing_runnable  # type: ignore[method-assign]
