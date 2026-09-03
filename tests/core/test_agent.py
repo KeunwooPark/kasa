@@ -8,7 +8,7 @@ import pytest
 
 from kasa.core.agent import Agent, AgentConfig
 from kasa.core.context import ContextPacker
-from kasa.core.tools import Tool, ToolRegistry
+from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.registry import ModelRole, ProviderRegistry
 from kasa.llm.tokens import Tokenizer
 from kasa.llm.types import (
@@ -90,11 +90,11 @@ class ScriptedProvider:
         return None
 
 
-async def weather(args: dict[str, Any]) -> str:
+async def weather(args: dict[str, Any], context: ToolContext) -> str:
     return f"4C in {args.get('city')}"
 
 
-async def hang(args: dict[str, Any]) -> str:
+async def hang(args: dict[str, Any], context: ToolContext) -> str:
     await asyncio.sleep(30)
     return "never"
 

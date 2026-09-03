@@ -11,29 +11,69 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**v0 — it talks.** Terminal adapter, agent turn loop, tool dispatch, and both
-provider families. No memory yet beyond the current conversation; that starts in
-v1. See the [milestones](https://github.com/KeunwooPark/kasa/milestones).
+**v1 — it remembers on purpose.** Long-term memory lives in a private git repo
+of Markdown files. Retrieval is lexical (FTS5 + BM25, scope-filtered) and runs
+on every turn; the agent can also search, read, and propose memories with tools.
+Consolidation is still manual — background jobs arrive in v3. See the
+[milestones](https://github.com/KeunwooPark/kasa/milestones).
+
+Nothing writes to the memory repo without going through a typed patch plan that
+deterministic code validates first, and no delete is ever a force-push.
 
 ## Quick start
 
 ```bash
 uv sync --dev
 export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY
+export KASA_GITHUB_TOKEN=...     # fine-grained PAT, contents: write
+uv run kasa init
 uv run kasa run
 ```
 
-With no config file present, Kasa synthesizes one from whatever API key is
-exported. To configure it properly, write `~/.config/kasa/config.toml` — see
-Appendix A of the design doc, or `uv run kasa config` to print what is currently
-resolved.
+`kasa init` walks through the private GitHub repo that holds long-term memory —
+creating it if it does not exist — clones it, lays out the memory skeleton, and
+writes `~/.config/kasa/config.toml`. It refuses to configure a public repo, and
+it is safe to re-run: nothing already in the repo is overwritten.
+
+The config file holds **no secrets**, only the names of the environment
+variables that carry them. See Appendix A of the design doc for its shape, or
+`uv run kasa config` to print what is currently resolved.
+
+To try it without any of that, skip `init`: with no config file, Kasa
+synthesizes one from whatever API key is exported and runs without memory.
 
 ```
+kasa init         interactive setup; bootstraps the memory repo
 kasa run          start the terminal adapter
+kasa reindex      rebuild the search index from the memory repo
+kasa why "<q>"    show the full retrieval trace for a question
+kasa doctor       check config, tokens, repo privacy, and the clone
 kasa config       print the resolved configuration
 kasa cost         token and spend totals
 kasa db migrate   apply pending migrations
 ```
+
+`kasa doctor` exits non-zero if any check failed, so it works as a health check.
+Kasa also re-checks on every start that the memory repo is still private, and
+refuses to run if it is not.
+
+## Memory
+
+Every memory is a Markdown file with YAML frontmatter, under `memory/` in the
+repo `kasa init` set up. Correct a belief by editing the file; the agent reads
+your version. See what it decided to believe with `git log`; undo it with
+`git revert`.
+
+During a conversation the agent can:
+
+- `memory_search` — look for something the pre-injected context did not carry
+- `memory_read` — read one memory in full, by id
+- `memory_write` — *propose* something worth remembering
+
+`memory_write` does not write a file. It queues a candidate fact that the
+consolidation job reviews, so the interactive path and the background path share
+one validated write path. Anything scoped to a DM or a private channel stays
+there: retrieval filters on visibility before it ranks.
 
 ## Development
 

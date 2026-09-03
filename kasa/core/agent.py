@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 from kasa.core.context import ContextPacker, PackedContext, PackTrace
-from kasa.core.tools import ToolRegistry
+from kasa.core.tools import ToolContext, ToolRegistry
 from kasa.llm.base import StreamAccumulator
 from kasa.llm.registry import ModelRole, ProviderRegistry
 from kasa.llm.types import (
@@ -20,6 +20,7 @@ from kasa.llm.types import (
     ToolUseBlock,
     Usage,
 )
+from kasa.memory.retrieve import Retriever
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -69,11 +70,13 @@ class Agent:
         tools: ToolRegistry,
         packer: ContextPacker,
         config: AgentConfig | None = None,
+        retriever: Retriever | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
         self._tools = tools
         self._packer = packer
+        self._retriever = retriever
         self.config = config or AgentConfig()
 
     @property
@@ -100,8 +103,11 @@ class Agent:
     ) -> AgentResult:
         await self._store.ensure_session(session_id, surface=surface, scope=scope)
         await self._store.append_message(session_id, Message.user(user_text), author=author)
+        context = ToolContext(session_id=session_id, scope=scope)
 
         usage = Usage()
+        pinned: list[str] = []
+        retrieved: list[str] = []
         tool_calls = 0
         text = ""
         stop_reason = "end_turn"
@@ -112,8 +118,15 @@ class Agent:
         # after the last permitted round of tool calls.
         for iteration in range(1, self.config.max_tool_iterations + 2):
             history = await self._store.recent_messages(session_id, self.config.history_limit)
+            # Retrieval runs once, on the opening message. Re-running it after
+            # every tool call would pay for it on each pass and thrash the
+            # cacheable prefix for material that has not changed.
+            if iteration == 1:
+                pinned, retrieved = await self._recall(user_text, history, scope)
             packed = self._packer.pack(
                 system_prompt=self.config.system_prompt,
+                pinned=pinned,
+                retrieved=retrieved,
                 recent=history,
                 tools=self._tools.defs(),
             )
@@ -150,7 +163,7 @@ class Agent:
                 stop_reason = "max_iterations"
                 break
 
-            results = await self._dispatch_all(session_id, tool_uses)
+            results = await self._dispatch_all(session_id, tool_uses, context)
             tool_calls += len(results)
             await self._store.append_message(session_id, Message.tool_results(results))
 
@@ -184,8 +197,28 @@ class Agent:
                 await on_delta(delta)
         return acc.finish()
 
+    async def _recall(
+        self, user_text: str, history: Sequence[Message], scope: str
+    ) -> tuple[list[str], list[str]]:
+        """Pre-inject what the question is likely to need.
+
+        Failing here degrades the turn rather than ending it: an agent that
+        answers without its memory is worse than one that answers with it, and
+        far better than one that refuses to answer at all.
+        """
+        if self._retriever is None:
+            return [], []
+        try:
+            recall = await self._retriever.retrieve(
+                user_text, scope=scope, recent=[m.text for m in history[-4:] if m.text]
+            )
+        except Exception:
+            log.exception("retrieval failed; answering without memory")
+            return [], []
+        return recall.pinned, recall.snippets
+
     async def _dispatch_all(
-        self, session_id: str, uses: Sequence[ToolUseBlock]
+        self, session_id: str, uses: Sequence[ToolUseBlock], context: ToolContext
     ) -> list[ToolResultBlock]:
         """Run every tool call, and guarantee each one gets a result.
 
@@ -197,7 +230,7 @@ class Agent:
         results: list[ToolResultBlock] = []
         try:
             for use in uses:
-                results.append(await self._tools.dispatch(use))
+                results.append(await self._tools.dispatch(use, context))
         except BaseException:
             answered = {r.tool_use_id for r in results}
             filler = [

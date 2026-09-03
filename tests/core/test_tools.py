@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from kasa.core.tools import Tool, ToolRegistry, builtin_tools
+from kasa.core.tools import Tool, ToolContext, ToolRegistry, builtin_tools
 from kasa.llm.types import ToolUseBlock
 
 SCHEMA: dict[str, Any] = {
@@ -23,15 +23,15 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-async def echo(args: dict[str, Any]) -> str:
+async def echo(args: dict[str, Any], context: ToolContext) -> str:
     return f"weather in {args['city']}"
 
 
-async def explode(args: dict[str, Any]) -> str:
+async def explode(args: dict[str, Any], context: ToolContext) -> str:
     raise RuntimeError("upstream is down")
 
 
-async def hang(args: dict[str, Any]) -> str:
+async def hang(args: dict[str, Any], context: ToolContext) -> str:
     await asyncio.sleep(10)
     return "never"
 

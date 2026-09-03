@@ -17,9 +17,17 @@ from kasa.adapters.cli import run_repl
 from kasa.config import Config, config_path, load_config
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
+from kasa.core.memory_tools import memory_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
+from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
+from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
+from kasa.memory.explain import render_trace
+from kasa.memory.index import MemoryIndex
+from kasa.memory.ltm import MemoryStore, MemoryStoreError
+from kasa.memory.retrieve import Retriever
+from kasa.redact import Redactor
 from kasa.store import Store
 
 app = typer.Typer(
@@ -44,6 +52,19 @@ def version() -> None:
 
 
 @app.command()
+def init(config: ConfigOption = None) -> None:
+    """Interactive setup: the memory repo, the models, and the config file."""
+
+    async def main() -> None:
+        result = await run_init(ConsolePrompter(), path=config)
+        console.print()
+        console.print(f"[green]Ready.[/green] Memory repo: {result.repo_path}")
+        console.print("Run [bold]kasa run[/bold] to start talking to it.")
+
+    _run(main())
+
+
+@app.command()
 def run(
     config: ConfigOption = None,
     cli: Annotated[bool, typer.Option("--cli", help="Run the terminal adapter.")] = True,
@@ -59,7 +80,9 @@ def run(
     )
     if not cli:
         raise typer.BadParameter("only --cli is supported at v0")
-    _run(_repl(_load(config)))
+    cfg = _load(config)
+    Redactor.from_config(cfg).install()
+    _run(_repl(cfg))
 
 
 @app.command("config")
@@ -71,6 +94,79 @@ def show_config(config: ConfigOption = None) -> None:
     cfg = _load(config)
     console.print(f"[dim]{config or config_path()}[/dim]")
     console.print_json(json.dumps(cfg.redacted(), indent=2))
+
+
+@app.command()
+def reindex(
+    config: ConfigOption = None,
+    full: Annotated[bool, typer.Option("--full", help="Rebuild from scratch.")] = False,
+) -> None:
+    """Rebuild the search index from the memory repo.
+
+    Safe at any time: the index is derived, and the repo is the source of truth.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        if not cfg.ltm.configured:
+            err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
+            raise typer.Exit(1)
+        async with await Store.open(cfg.store.resolved()) as store:
+            result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(full=full)
+        console.print(result.summary())
+        for problem in result.problems:
+            err.print(f"[yellow]![/yellow] could not index {problem}")
+
+    _run(main())
+
+
+@app.command()
+def why(
+    question: Annotated[str, typer.Argument(help="The question to trace retrieval for.")],
+    config: ConfigOption = None,
+    scope: Annotated[str, typer.Option(help="Answer as a session in this scope.")] = "workspace",
+) -> None:
+    """Show the full retrieval trace for a question.
+
+    Every complaint about this system arrives as "why did it not remember X".
+    This is the answer: the query, every candidate and its scores, what scope
+    filtering removed, and what actually fitted in the budget.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        if not cfg.ltm.configured:
+            err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
+            raise typer.Exit(1)
+        async with await Store.open(cfg.store.resolved()) as store:
+            retriever = Retriever(
+                store,
+                tokenizer=default_tokenizer(),
+                budget_tokens=cfg.context.tokens_for_retrieval(),
+            )
+            retrieval = await retriever.retrieve(question, scope=scope, explain=True)
+        # markup=False because a memory id arrives as `[[mem_01...]]`, and rich
+        # reads square brackets as style tags — it renders the ids away entirely.
+        # soft_wrap because the score table is meant to be read in columns.
+        console.print(render_trace(retrieval), highlight=False, markup=False, soft_wrap=True)
+
+    _run(main())
+
+
+@app.command()
+def doctor(config: ConfigOption = None) -> None:
+    """Check config, tokens, repo privacy, and the local clone.
+
+    Exits non-zero if anything failed, so it is usable as a health check.
+    """
+
+    async def main() -> None:
+        report = await diagnose(_load(config), path=config or config_path())
+        _print_report(report)
+        if not report.ok:
+            raise typer.Exit(1)
+
+    _run(main())
 
 
 @app.command()
@@ -127,6 +223,32 @@ def db_path(config: ConfigOption = None) -> None:
 # -- wiring ------------------------------------------------------------------
 
 
+class ConsolePrompter:
+    """`kasa.init.Prompter`, backed by a terminal."""
+
+    def ask(self, question: str, *, default: str | None = None) -> str:
+        # An empty default is a real answer ("no base URL"), so it is offered as
+        # one rather than becoming a required question.
+        return str(typer.prompt(question, default=default if default is not None else ""))
+
+    def choose(self, question: str, choices: tuple[str, ...], *, default: str) -> str:
+        options = "/".join(choices)
+        while True:
+            answer = str(typer.prompt(f"{question} [{options}]", default=default)).strip()
+            if answer in choices:
+                return answer
+            self.warn(f"Pick one of: {options}")
+
+    def confirm(self, question: str, *, default: bool = False) -> bool:
+        return bool(typer.confirm(question, default=default))
+
+    def say(self, text: str) -> None:
+        console.print(text)
+
+    def warn(self, text: str) -> None:
+        err.print(f"[yellow]![/yellow] {text}")
+
+
 def _load(path: Path | None) -> Config:
     try:
         return load_config(path)
@@ -135,20 +257,66 @@ def _load(path: Path | None) -> Config:
         raise typer.Exit(1) from exc
 
 
+_STATUS_STYLE = {
+    Status.OK: "[green]ok[/green]",
+    Status.WARN: "[yellow]warn[/yellow]",
+    Status.FAIL: "[red]FAIL[/red]",
+    Status.SKIP: "[dim]skip[/dim]",
+}
+
+
+def _print_report(report: Report) -> None:
+    table = Table(show_header=False, box=None)
+    table.add_column("status", no_wrap=True)
+    table.add_column("check", no_wrap=True)
+    # Folded, not truncated: the detail is usually a path, and a path with its
+    # middle replaced by an ellipsis is not something you can act on.
+    table.add_column("detail", overflow="fold")
+    for check in report.checks:
+        table.add_row(_STATUS_STYLE[check.status], check.name, check.detail)
+    console.print(table)
+    if not report.ok:
+        console.print(f"\n[red]{len(report.failed)} check(s) failed.[/red]")
+
+
 async def _repl(cfg: Config) -> None:
+    # A repo that silently became public is a serious incident, so visibility is
+    # re-checked on every start rather than trusted from setup time.
+    await verify_repo_visibility(cfg)
+
     # The store must be closed on every path, including a failure to build the
     # registry: aiosqlite holds a non-daemon thread per connection, so leaking
     # one leaves the process alive after the error has already been printed.
+    tokenizer = default_tokenizer()
     async with await Store.open(cfg.store.resolved()) as store:
         registry = cfg.build_registry(store=store)
+        tools = builtin_tools()
+        retriever = None
+
+        if cfg.ltm.configured:
+            try:
+                memory = await MemoryStore.open(cfg, store)
+            except MemoryStoreError as exc:
+                # Running without memory beats not running: the conversation
+                # still works, and `kasa doctor` says what is wrong.
+                err.print(f"[yellow]![/yellow] long-term memory unavailable — {exc}")
+            else:
+                retriever = Retriever(
+                    store,
+                    tokenizer=tokenizer,
+                    budget_tokens=cfg.context.tokens_for_retrieval(),
+                )
+                tools += memory_tools(retriever=retriever, memory=memory, store=store)
+
         try:
             await run_repl(
                 Agent(
                     registry=registry,
                     store=store,
-                    tools=ToolRegistry(builtin_tools()),
-                    packer=ContextPacker(cfg.context.to_budget(), tokenizer=default_tokenizer()),
+                    tools=ToolRegistry(tools, scrub=Redactor.from_config(cfg).scrub),
+                    packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
                     config=cfg.agent_config(),
+                    retriever=retriever,
                 ),
                 console,
             )
