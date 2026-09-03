@@ -112,10 +112,15 @@ def reindex(
             err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
             raise typer.Exit(1)
         async with await Store.open(cfg.store.resolved()) as store:
+            # Opened before anything is written, because opening is what
+            # validates the clone. Discovering afterwards that there is no repo
+            # to rebuild the manifest from would leave the index rebuilt, the
+            # manifest untouched, and the command reporting failure.
+            memory = await MemoryStore.open(cfg, store)
             result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(full=full)
             # Both artifacts are derived from the repo, and rebuilding only the
             # SQLite half is what let them disagree about which memories exist.
-            manifest = await (await MemoryStore.open(cfg, store)).refresh_manifest()
+            manifest = await memory.refresh_manifest()
         console.print(result.summary())
         console.print(f"[dim]{manifest.summary()}[/dim]")
         for problem in result.problems:
