@@ -18,8 +18,11 @@ from kasa.core.events import InboundEvent
 
 SOURCE = "slack"
 
-#: `<@U123>` and `<@U123|display-name>`, which is how Slack writes a mention.
-_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+#: `<@U123>` and `<@U123|display-name>`, which is how Slack writes a mention —
+#: together with any run of spaces or tabs either side of it. The gap is part
+#: of the match because removing a mention has to remove the space it was
+#: sitting in, and that is the *only* whitespace it is allowed to touch.
+_MENTION = re.compile(r"(?P<before>[ \t]*)<@(?P<user>[A-Z0-9]+)(?:\|[^>]*)?>(?P<after>[ \t]*)")
 
 #: Slack's own name for a one-to-one conversation with the bot.
 _DM = "im"
@@ -138,14 +141,28 @@ def scope_for(channel: str, author: str, *, is_dm: bool) -> str:
 
 
 def _mentions(text: str, bot_user_id: str) -> bool:
-    return any(match.group(1) == bot_user_id for match in _MENTION.finditer(text))
+    return any(match["user"] == bot_user_id for match in _MENTION.finditer(text))
 
 
 def _strip_mention(text: str, bot_user_id: str) -> str:
-    """Drop Kasa's own @-mention; leave everyone else's alone.
+    """Drop Kasa's own @-mention; leave everyone else's, and the layout, alone.
 
     The mention is addressing, not content, and leaving it in means every turn
-    opens with a user id the model has to decide what to do with.
+    opens with a user id the model has to decide what to do with. Tidying the
+    gap it leaves behind is worth one space; it is not worth the shape of the
+    message.
+
+    This used to end `" ".join(without.split())`. `str.split()` with no
+    argument splits on every run of whitespace, newlines included, so pasted
+    code, stack traces, numbered lists and multi-paragraph questions all
+    reached the agent as one run-on line.
     """
-    without = _MENTION.sub(lambda m: "" if m.group(1) == bot_user_id else m.group(0), text)
-    return " ".join(without.split())
+
+    def drop(match: re.Match[str]) -> str:
+        if match["user"] != bot_user_id:
+            return match[0]
+        # Between two words, leave one space so they do not run together. At
+        # either end of a line, the mention takes its gap with it.
+        return " " if match["before"] and match["after"] else ""
+
+    return _MENTION.sub(drop, text).strip()

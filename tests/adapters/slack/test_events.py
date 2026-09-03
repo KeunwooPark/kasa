@@ -146,6 +146,38 @@ async def test_somebody_elses_mention_stays_in_the_text() -> None:
     )
 
 
+async def test_the_shape_of_a_message_survives() -> None:
+    """Stripping the mention used to cost every line break in the message —
+    `str.split()` with no argument splits on newlines too. Pasted code, stack
+    traces, numbered lists and multi-paragraph questions all arrived as one
+    run-on line."""
+    sent = f"<@{BOT}> please look at this:\n\n```\ndef f():\n    return 1\n```\n\nthanks"
+
+    event = accepted(
+        await normalize(in_channel(sent), context=context(), known_session=never)
+    ).event
+
+    assert event.text == "please look at this:\n\n```\ndef f():\n    return 1\n```\n\nthanks"
+
+
+async def test_the_gap_the_mention_leaves_is_still_tidied() -> None:
+    """One space where a mention was between two words, none where it was at
+    an edge — and nothing else touched."""
+    cases = {
+        f"<@{BOT}> hello": "hello",
+        f"hello <@{BOT}>": "hello",
+        f"hey <@{BOT}> what's up": "hey what's up",
+        f"<@{BOT}>\nhello": "hello",
+        f"a  b <@{BOT}> c": "a  b c",
+    }
+
+    for sent, expected in cases.items():
+        event = accepted(
+            await normalize(in_channel(sent), context=context(), known_session=never)
+        ).event
+        assert event.text == expected, sent
+
+
 # -- what does not ------------------------------------------------------------
 
 
