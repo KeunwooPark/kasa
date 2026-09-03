@@ -357,6 +357,11 @@ class Retriever:
         not have enough is asking a different question, and gets to say how many
         answers it wants. The token budget still caps both.
 
+        When `include_pinned` is on, pinned memories are packed against their
+        own allowance of `limit` rather than competing with the matched ones —
+        a standing instruction is not an answer to the question, and it must
+        not be evicted by one. See `_pack`.
+
         Every candidate's text is scrubbed before it is ranked into anything a
         caller can read, so the trace, the snippets and `kept` all carry the
         same redacted text.
@@ -383,7 +388,12 @@ class Retriever:
         if explain:
             trace.denied = await self._denied(match, scope)
 
-        return self._pack(ranked, trace, limit if limit is not None else self._limit)
+        return self._pack(
+            ranked,
+            trace,
+            limit if limit is not None else self._limit,
+            reserve_pinned=include_pinned,
+        )
 
     # -- query ---------------------------------------------------------------
 
@@ -564,25 +574,85 @@ class Retriever:
 
     # -- packing -------------------------------------------------------------
 
-    def _pack(self, ranked: Sequence[Candidate], trace: RetrievalTrace, limit: int) -> Retrieval:
+    def _pack(
+        self,
+        ranked: Sequence[Candidate],
+        trace: RetrievalTrace,
+        limit: int,
+        *,
+        reserve_pinned: bool,
+    ) -> Retrieval:
+        """Choose what goes in the prompt, best first.
+
+        `limit` is two allowances, not one. Pinned memories are taken first and
+        against their own count; matched memories are taken against theirs.
+        Sharing one bound was #75: on any question that matched eight things
+        well, the standing instruction was simply gone — and because pinned
+        material lives in the cacheable prefix, the prefix then flipped between
+        two shapes turn to turn, which is the one thing `ContextPacker` says it
+        exists to prevent.
+
+        Pinned still has a bound rather than none, so that pinning a great deal
+        cannot starve the answer to the question of every token in the budget.
+        The context packer's own `pinned` share is the ceiling on how much of
+        this actually reaches the prompt.
+
+        `reserve_pinned` is off for an explicit search. There, a pinned memory
+        is a result like any other and competes for the caller's `limit` — the
+        caller asked what matched, and the pinned block is already in the
+        prompt above the answer (#57).
+        """
         result = Retrieval(trace=trace)
         used = 0
         seen: set[str] = set()
+        chosen: dict[str, str] = {}
 
-        for candidate in ranked:
-            if candidate.denied is not None:
-                continue  # belt and braces: explanation rows are never packed
-            # One chunk per memory. Two chunks of the same file crowd out a
-            # second opinion, and the agent can read the whole file with
-            # `memory_read` when it wants more.
-            if candidate.memory_id in seen or len(seen) >= limit:
-                continue
+        def take(candidate: Candidate) -> bool:
+            nonlocal used
             snippet = render_snippet(candidate)
             cost = self._tok.count(snippet)
             if used + cost > self._budget:
-                continue
-            seen.add(candidate.memory_id)
+                return False
             used += cost
+            # One chunk per memory. Two chunks of the same file crowd out a
+            # second opinion, and the agent can read the whole file with
+            # `memory_read` when it wants more.
+            seen.add(candidate.memory_id)
+            chosen[candidate.chunk_id] = snippet
+            return True
+
+        # `denied is not None` is belt and braces: explanation rows are never
+        # packed.
+        if reserve_pinned:
+            taken = 0
+            for candidate in ranked:
+                if taken >= limit:
+                    break
+                if candidate.denied is not None or not candidate.pinned:
+                    continue
+                if candidate.memory_id not in seen and take(candidate):
+                    taken += 1
+
+        taken = 0
+        for candidate in ranked:
+            if taken >= limit:
+                break
+            if candidate.denied is not None or candidate.memory_id in seen:
+                continue
+            if reserve_pinned and candidate.pinned:
+                # It had its own pass. Letting it take a matched slot as well
+                # would starve the answer just as thoroughly as sharing one
+                # bound did — with the eviction running the other way.
+                continue
+            if take(candidate):
+                taken += 1
+
+        # Rank order, whichever pass put it there: `kept` is what ranked, and
+        # the pinned/snippets split is only a destination.
+        for candidate in ranked:
+            snippet = chosen.get(candidate.chunk_id)
+            if snippet is None:
+                continue
             result.kept.append(candidate)
             (result.pinned if candidate.pinned else result.snippets).append(snippet)
 

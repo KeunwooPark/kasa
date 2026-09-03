@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from kasa.core.context import PINNED_HEADER, ContextPacker
 from kasa.llm.tokens import HeuristicTokenizer, Tokenizer
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
@@ -901,3 +902,128 @@ async def test_the_scope_block_names_each_memory_once(
     assert len(named) == 1, f"one line per memory, got:\n{block}"
     assert f"({len(retrieval.trace.denied)} chunks)" in named[0]
     assert f"{len(retrieval.trace.denied)} chunk(s) never entered" in block
+
+
+# -- pinned memories keep their own allowance (#75) ---------------------------
+
+
+@pytest.fixture
+async def crowded(tmp_path: Path, store: Store) -> str:
+    """One standing instruction, and twelve memories that bury it. Returns its id."""
+    bootstrap(tmp_path)
+    pinned = write(
+        tmp_path,
+        MemoryDoc.new(
+            type="fact",
+            title="Standing instruction",
+            body="Always answer in metric units, and never round a currency amount.",
+            pinned=True,
+        ),
+    )
+    for n in range(12):
+        write(
+            tmp_path,
+            MemoryDoc.new(
+                type="topic",
+                title=f"Escalation runbook step {n + 1}",
+                body=f"Escalation runbook step {n + 1}: page the rota and open an incident.",
+            ),
+        )
+    await MemoryIndex(store, tmp_path).reindex()
+    return pinned.id
+
+
+async def test_a_standing_instruction_is_not_evicted_by_the_answer(
+    crowded: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """#75. Twelve better matches used to take all eight slots and the pinned
+    memory with them — on an ordinary question about a well-covered topic."""
+    search = retriever(store, tokenizer)
+
+    retrieval = await search.retrieve("escalation runbook step incident rota page")
+
+    assert len(retrieval.snippets) == DEFAULT_LIMIT, "the matched allowance is still eight"
+    assert crowded in retrieval.memory_ids
+    assert "Always answer in metric units" in "\n".join(retrieval.pinned)
+
+
+async def test_the_cacheable_prefix_does_not_flip_with_the_question(
+    crowded: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The pinned block lives in `system`. If it comes and goes with the query,
+    every alternation is a full cache miss on the prefix — the one thing
+    `ContextPacker` says it exists to prevent."""
+    search = retriever(store, tokenizer)
+    packer = ContextPacker(tokenizer=tokenizer)
+
+    prefixes = set()
+    for question in ("hello there", "every escalation runbook step", "hello again"):
+        got = await search.retrieve(question)
+        prefixes.add(
+            packer.pack(system_prompt="S", pinned=got.pinned, retrieved=got.snippets).system
+        )
+
+    assert len(prefixes) == 1
+    assert PINNED_HEADER in prefixes.pop()
+
+
+async def test_pinning_a_great_deal_cannot_starve_the_answer(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The allowance is separate, not unlimited. Twenty pinned memories must
+    still leave room for what the question was about."""
+    bootstrap(tmp_path)
+    for n in range(20):
+        write(
+            tmp_path,
+            MemoryDoc.new(
+                type="fact",
+                title=f"Standing instruction {n}",
+                body=f"Rule {n} applies.",
+                pinned=True,
+            ),
+        )
+    write(tmp_path, MemoryDoc.new(type="fact", title="Wifi", body="The wifi password is hunter2."))
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve("what is the wifi password")
+
+    assert len(retrieval.pinned) == DEFAULT_LIMIT, "capped at its own allowance, not unbounded"
+    assert "hunter2" in "\n".join(retrieval.snippets), "the question still got an answer"
+
+
+async def test_an_explicit_search_still_counts_a_pinned_hit_against_its_limit(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """#57's decision stands: `memory_search` asked what matched, so a pinned
+    memory that matches is a result like any other and does not come free.
+
+    The separate allowance is for the pre-injected retrieval, where a standing
+    instruction is not competing with the answer. Here it is one of the
+    answers, and `limit` means what the caller asked it to mean."""
+    bootstrap(tmp_path)
+    for n in range(3):
+        write(
+            tmp_path,
+            MemoryDoc.new(
+                type="fact",
+                title=f"Standing instruction {n}",
+                body="Always answer about the deploy pipeline in metric units.",
+                pinned=True,
+            ),
+        )
+    for n in range(3):
+        write(
+            tmp_path,
+            MemoryDoc.new(
+                type="fact", title=f"Note {n}", body="The deploy pipeline runs nightly in metric."
+            ),
+        )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    asked = await retriever(store, tokenizer).retrieve(
+        "deploy pipeline metric", include_pinned=False, limit=3
+    )
+
+    assert len(asked.kept) == 3, "no free slot for the pinned hits"
+    assert any(c.pinned for c in asked.kept), "and they did compete, rather than being excluded"
