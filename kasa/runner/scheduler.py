@@ -226,6 +226,7 @@ class Scheduler:
     ) -> None:
         self._store = store
         self._specs: dict[str, JobSpec] = {}
+        self._schedule_failures: dict[str, int] = {}
         self.queue = JobQueue(store, lease_ttl=lease_ttl, backoff=backoff)
         self._tick_interval = tick_interval
         # Two at a time by default: these call a frontier model, and the point
@@ -318,8 +319,20 @@ class Scheduler:
                     spec.kind, run_after=fire_at, job_id=scheduled_id(spec.kind, fire_at)
                 )
             except Exception:
-                log.exception("could not schedule %s (%s)", spec.kind, spec.cron.expression)
+                failures = self._schedule_failures.get(spec.kind, 0) + 1
+                self._schedule_failures[spec.kind] = failures
+                report = log.exception if failures == 1 else log.error
+                report("could not schedule %s (%s)", spec.kind, spec.cron.expression)
                 continue
+            failures = self._schedule_failures.pop(spec.kind, 0)
+            if failures:
+                log.info(
+                    "scheduling %s (%s) recovered after %d failed tick%s",
+                    spec.kind,
+                    spec.cron.expression,
+                    failures,
+                    "" if failures == 1 else "s",
+                )
             if not result.duplicate:
                 log.debug("queued %s for %s", spec.kind, fire_at)
                 queued.append(result.id)

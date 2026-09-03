@@ -68,6 +68,39 @@ async def test_a_spec_that_cannot_be_scheduled_does_not_starve_the_others(store:
     assert [job_id.split("@")[0] for job_id in queued] == ["healthy"]
 
 
+async def test_a_broken_spec_reports_one_traceback_until_it_recovers(
+    store: Store, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level("INFO")
+    scheduler = Scheduler(
+        store,
+        [JobSpec(kind="fragile", handler=records([]), cron=Cron.parse(HOURLY))],
+    )
+    cron = scheduler._specs["fragile"].cron
+    assert cron is not None
+    calls = 0
+    original = cron.next_after
+
+    def intermittently_broken(self: Cron, moment: datetime) -> datetime:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise RuntimeError("clock failed")
+        return original(moment)
+
+    monkeypatch.setattr(Cron, "next_after", intermittently_broken)
+
+    await scheduler.schedule_due(now=NOW)
+    await scheduler.schedule_due(now=NOW)
+    await scheduler.schedule_due(now=NOW)
+
+    failures = [r for r in caplog.records if r.message.startswith("could not schedule fragile")]
+    assert len(failures) == 2
+    assert failures[0].exc_info is not None
+    assert failures[1].exc_info is None
+    assert any("recovered after 2 failed ticks" in r.message for r in caplog.records)
+
+
 async def test_a_tick_that_raises_does_not_stop_the_clock(store: Store) -> None:
     """`schedule_due` reaches the store, so a locked database is enough. The
     clock used to end there, silently, and never queue another occurrence."""
