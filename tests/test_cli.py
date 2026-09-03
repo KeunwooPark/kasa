@@ -8,8 +8,11 @@ writes before it validates fails in a way no unit test sees.
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -363,6 +366,36 @@ def test_job_run_names_the_job_it_ran_past_a_backlog(
 
     assert result.exit_code == 0, result.output
     assert "reindex finished" in result.output
+
+
+def test_job_run_does_not_call_a_reindex_that_could_not_lock_finished(
+    rig: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The symptom, at the level somebody actually meets it.
+
+    With `flock` failing the way an NFS mount with no lock daemon fails, this
+    printed `reindex finished` and exited 0 with an empty index — because the
+    lease could not tell "cannot lock" from "somebody else has it", and #116
+    reads the latter as work that is already being done.
+    """
+    config, clone = rig
+    bootstrap(clone)
+    Manifest.rebuild(clone)[0].save(clone)
+    GitRepo.at(clone).commit("memory: seed")
+    real_flock = fcntl.flock
+
+    def enolck(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", enolck)
+
+    result = runner.invoke(app, ["job", "run", "reindex", "--config", str(config)])
+
+    assert result.exit_code == 1, result.output
+    assert "No locks available" in result.output
+    assert chunks(tmp_path / "kasa.db") == 0
 
 
 def test_job_run_says_a_job_never_ran_rather_than_None(rig: tuple[Path, Path]) -> None:

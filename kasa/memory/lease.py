@@ -53,6 +53,19 @@ class LeaseError(KasaError):
     """Someone else is writing to the memory repo."""
 
 
+class LockingUnavailable(KasaError):
+    """The filesystem cannot lock, so nothing here is enforcing anything.
+
+    Deliberately *not* a `LeaseError`. Callers are entitled to treat a
+    `LeaseError` as "somebody else is doing this work and will finish it" and
+    carry on — `runner.jobs._reindex` does exactly that (#116). That inference
+    is sound for contention and false here: nobody holds the lock, nobody is
+    doing the work, and the single-writer guarantee the repo is written under
+    does not exist. It has to be a different exception so that catching the one
+    cannot swallow the other.
+    """
+
+
 def holder_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
 
@@ -63,14 +76,29 @@ def holder_id() -> str:
 
 
 def _try_lock(path: Path) -> int | None:
-    """Take the flock, returning the fd, or None when someone else holds it."""
+    """Take the flock, returning the fd, or None when someone else holds it.
+
+    `flock` has two failure modes and one return value for both, and only one
+    of them is an answer to the question being asked. `EAGAIN`/`EWOULDBLOCK` —
+    which Python raises as `BlockingIOError` — means somebody else holds it.
+    Everything else means the lock did not happen: `ENOLCK` from NFS with no
+    lock daemon, `ENOSYS` or `EINVAL` from some FUSE mounts. Reading those as
+    contention turns the lease into a no-op that reports success.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         os.close(fd)
         return None
+    except OSError as exc:
+        os.close(fd)
+        raise LockingUnavailable(
+            f"cannot lock {path}: {exc}. Keeping two writers out of the memory repo "
+            "needs a filesystem where flock works; NFS without a lock daemon and some "
+            "FUSE mounts answer this way. Put the repo and the database on local disk."
+        ) from exc
     return fd
 
 
@@ -83,7 +111,17 @@ def _is_holder_alive(path: Path) -> bool:
     """True when the flock is currently held by a live process."""
     if not path.exists():
         return False
-    fd = _try_lock(path)
+    try:
+        fd = _try_lock(path)
+    except LockingUnavailable as exc:
+        # This only decides whether a leftover row gets *reported* at startup,
+        # and without working locks there is no way to tell a live holder from
+        # a dead one. Claiming the holder is alive is the quiet answer: no
+        # stale-lease warning on every single start. Saying so once is the
+        # loud part, and the `acquire` that is about to write raises instead
+        # of guessing.
+        log.warning("cannot tell whether anything holds %s: %s", path, exc)
+        return True
     if fd is None:
         return True
     _unlock(fd)
