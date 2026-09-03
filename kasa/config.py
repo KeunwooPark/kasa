@@ -279,6 +279,23 @@ def default_key_env(kind: ProviderKind) -> str:
     return "ANTHROPIC_API_KEY" if kind == "anthropic" else "OPENAI_API_KEY"
 
 
+def anchored(value: str, *, base: Path) -> Path:
+    """Resolve a configured path, reading a relative one as relative to `base`.
+
+    `base` is the directory holding config.toml. Resolved against the process's
+    working directory instead — which is what `expanduser()` alone leaves —
+    a relative path in a config file means a different memory repo and a
+    different database depending on where Kasa was started, and neither
+    Kasa nor the operator is told: the second directory gets a freshly
+    bootstrapped, empty world reported as healthy (#88).
+
+    Relative to the config file is the reading that gives the value a stable
+    meaning, and it is what makes a config directory portable.
+    """
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else base / path
+
+
 def load_config(path: Path | None = None) -> Config:
     target = path or config_path()
     if not target.exists():
@@ -288,9 +305,33 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{target} is not valid TOML: {exc}") from exc
     try:
-        return Config.model_validate(raw)
+        cfg = Config.model_validate(raw)
     except Exception as exc:
         raise ConfigError(f"{target} is not a valid Kasa config: {exc}") from exc
+    return anchor_paths(cfg, base=target.expanduser().resolve().parent)
+
+
+def anchor_paths(cfg: Config, *, base: Path) -> Config:
+    """Rewrite relative configured paths to be absolute. See `anchored`.
+
+    Done once here rather than inside each `resolved()`, so that everything
+    downstream — including `kasa config`, which prints the config back — sees
+    the path that will actually be used.
+
+    A value that is already absolute is left exactly as written, `~` included:
+    it is unambiguous as it stands, and rewriting it would mean `kasa init`
+    could not round-trip the file it just wrote.
+    """
+    cfg.ltm.clone_path = _anchor(cfg.ltm.clone_path, base)
+    cfg.store.path = _anchor(cfg.store.path, base)
+    return cfg
+
+
+def _anchor(value: str | None, base: Path) -> str | None:
+    if not value:
+        return value
+    path = Path(value).expanduser()
+    return value if path.is_absolute() else str(base / path)
 
 
 def config_from_env() -> Config:

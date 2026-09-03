@@ -210,3 +210,75 @@ def test_the_default_budget_is_still_valid(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[store]\npath = "x.db"\n')
     assert load_config(path).context.to_budget().total == 128_000
+
+
+# -- a relative path means "next to the config file" (#88) --------------------
+
+
+def write_relative(tmp_path: Path) -> Path:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[ltm]\nrepo = "someone/mem"\nclone_path = "ltm-here"\n\n[store]\npath = "kasa-here.db"\n'
+    )
+    return path
+
+
+def test_a_relative_path_is_read_against_the_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#88. Against the working directory instead, the same config file meant a
+    different memory repo and a different database depending on where Kasa was
+    started — and the second one bootstrapped an empty world and called it
+    healthy."""
+    config = write_relative(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    monkeypatch.chdir(elsewhere)
+    cfg = load_config(config)
+
+    assert cfg.store.resolved() == tmp_path / "kasa-here.db"
+    assert cfg.ltm.resolved_clone_path() == tmp_path / "ltm-here"
+
+
+def test_it_does_not_matter_where_kasa_was_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write_relative(tmp_path)
+    seen = set()
+    for name in ("a", "b"):
+        directory = tmp_path / name
+        directory.mkdir()
+        monkeypatch.chdir(directory)
+        seen.add(load_config(config).store.resolved())
+
+    assert len(seen) == 1
+    # A relative path is also "the same" from everywhere, and means something
+    # different at each one. Absolute is the property that makes it true.
+    assert seen.pop() == tmp_path / "kasa-here.db"
+
+
+def test_a_relative_config_argument_still_anchors_absolutely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--config config.toml` from the directory holding it. The anchor has to
+    be absolute, or joining onto it leaves a relative path behind."""
+    write_relative(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = load_config(Path("config.toml")).store.resolved()
+
+    assert resolved.is_absolute()
+    assert resolved == tmp_path / "kasa-here.db"
+
+
+@pytest.mark.parametrize("value", ["~/.kasa/ltm", "/var/lib/kasa/ltm"])
+def test_a_path_that_is_already_absolute_is_left_exactly_as_written(
+    tmp_path: Path, value: str
+) -> None:
+    """`~` included: it is unambiguous as it stands, and rewriting it would mean
+    `kasa init` could not round-trip the file it just wrote."""
+    path = tmp_path / "config.toml"
+    path.write_text(f'[ltm]\nrepo = "someone/mem"\nclone_path = "{value}"\n')
+
+    assert load_config(path).ltm.clone_path == value

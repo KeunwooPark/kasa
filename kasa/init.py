@@ -26,6 +26,7 @@ from kasa.config import (
     ProviderConfig,
     ProviderKind,
     SlackSettings,
+    anchored,
     config_path,
     default_key_env,
     load_config,
@@ -95,6 +96,12 @@ async def run_init(
         prompter.say(f"Setting up Kasa. This writes {target}, and no secrets go in it.")
 
     ltm, info = await _configure_repo(prompter, cfg.ltm, github=github)
+    # Before the clone is made, not after: a relative answer to the clone-path
+    # question would otherwise create the repo next to wherever `kasa init` was
+    # run and record a path that later resolves somewhere else entirely (#88).
+    base = target.expanduser().resolve().parent
+    if ltm.clone_path:
+        ltm = ltm.model_copy(update={"clone_path": str(anchored(ltm.clone_path, base=base))})
     repo, result = _prepare_clone(prompter, ltm, info, config_file=target)
 
     # Bound to names first: as keyword arguments these would be evaluated in
