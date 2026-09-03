@@ -167,12 +167,36 @@ def _with_attachments(text: str, event: dict[str, Any]) -> str:
     "what's in this?" with nothing in it, and no way to tell that a file is
     what it is being asked about. Naming them is what lets it say it cannot
     read them, which is the point of accepting the message at all.
+
+    Nothing is assumed about the payload beyond "it parsed as JSON". This runs
+    before the inbox row exists, so an unexpected shape has to come out as a
+    decision rather than as an exception — an exception here is a message lost
+    with no record that it arrived, which is the failure ingress exists to
+    prevent.
     """
-    names = [str(item.get("name") or "an untitled file") for item in event.get("files") or []]
+    files = event.get("files")
+    # Slack sends an array. A string here would be walked one character at a
+    # time and a mapping one key at a time, both of which invent attachments
+    # nobody sent; saying nothing is the honest reading of a field that nothing
+    # can be read from.
+    names = [_filename(item) for item in files] if isinstance(files, list) else []
     if not names:
         return text
     attached = f"[attached, which Kasa cannot open: {', '.join(names)}]"
     return f"{text}\n\n{attached}" if text else attached
+
+
+def _filename(item: Any) -> str:
+    """What to call one attachment, whatever arrived in its place.
+
+    An entry that is not an object is still an entry: a file was attached, and
+    its name is the part we do not have. That is already what a `{}` means, so
+    it gets the same words rather than a second kind of unknown — and it stays
+    counted, because "something is attached that Kasa cannot open" is the whole
+    signal this note carries.
+    """
+    name = item.get("name") if isinstance(item, dict) else None
+    return str(name) if name else "an untitled file"
 
 
 def _mentions(text: str, bot_user_id: str) -> bool:

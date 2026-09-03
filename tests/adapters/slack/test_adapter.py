@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -15,7 +16,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
 from kasa.adapters.slack.app import NO_HTTP_VERIFICATION, SlackAdapter
-from kasa.adapters.slack.events import SlackContext
+from kasa.adapters.slack.events import SlackContext, normalize
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
 from kasa.core.tools import ToolRegistry
@@ -158,6 +159,85 @@ async def test_a_forced_retry_produces_exactly_one_reply(
         await asyncio.wait_for(running, timeout=10.0)
 
     assert len(client.posted) == 1, client.posted
+    assert await adapter.runtime.inbox.counts() == {"done": 1}
+
+
+async def test_a_file_entry_that_is_not_an_object_still_reaches_the_inbox(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """The repro from #123, measured where it hurts: the row, not the decision.
+
+    `_with_attachments` read the payload's shape and trusted it, so an entry
+    that was not an object raised out of `normalize` — before the INSERT, and
+    therefore before anything recorded that the message had arrived at all.
+    """
+    adapter, client = make_adapter(store, tokenizer)
+    body = mention(text=f"<@{BOT}> what's in this?") | {
+        "subtype": "file_share",
+        "files": ["F0123456"],
+    }
+
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(body)
+        await until(lambda: len(client.posted) == 1)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+    assert await adapter.runtime.inbox.counts() == {"done": 1}
+
+
+async def test_an_event_that_cannot_be_read_is_ignored_rather_than_raised(
+    store: Store, tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    """Ingress must reach a decision for every payload Slack sends.
+
+    An exception out of `normalize` lands before the inbox row is written,
+    which is the one thing this path exists to guarantee: Slack retries three
+    times, each raises, and the message is gone with no record that it ever
+    arrived. `normalize` is patched rather than fed a payload that breaks it
+    today, because the guard is for the shape nobody has thought of yet.
+    """
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("a shape nobody anticipated")
+
+    monkeypatch.setattr("kasa.adapters.slack.app.normalize", boom)
+    adapter, _ = make_adapter(store, tokenizer)
+
+    with caplog.at_level(logging.ERROR, logger="kasa.adapters.slack.app"):
+        await adapter.on_event(mention())
+
+    assert "could not read a slack event" in caplog.text
+    assert "a shape nobody anticipated" in caplog.text, "the traceback is the whole point"
+
+
+async def test_ingress_still_works_after_an_event_it_could_not_read(
+    store: Store, tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Surviving one bad event is only worth having if the socket survives too."""
+    adapter, client = make_adapter(store, tokenizer)
+    real = normalize
+    calls = 0
+
+    async def once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("a shape nobody anticipated")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr("kasa.adapters.slack.app.normalize", once)
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention(ts="1700000000.000100"))
+        await adapter.on_event(mention(ts="1700000000.000200"))
+        await until(lambda: len(client.posted) == 1)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
     assert await adapter.runtime.inbox.counts() == {"done": 1}
 
 

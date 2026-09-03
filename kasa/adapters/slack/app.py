@@ -94,7 +94,28 @@ class SlackAdapter:
 
         Nothing here awaits a model, which is the entire reason `inbox` exists.
         """
-        decision = await normalize(event, context=self._context, known_session=self._known_session)
+        try:
+            decision = await normalize(
+                event, context=self._context, known_session=self._known_session
+            )
+        except Exception:
+            # Belt to the braces in `events.py`. Everything up to the INSERT is
+            # a judgement about a payload, and a judgement that raises loses
+            # the message: bolt hands the failure back to Slack, Slack retries
+            # into the same exception three times, and then the message is gone
+            # with nothing recording that it arrived. Dropping it loudly is
+            # worse than answering it and better than dropping it in silence.
+            #
+            # Only around `normalize`. A failure out of `submit` is the store,
+            # and there the row genuinely was not written — letting that reach
+            # bolt is what gets the message re-sent, which is the outcome we
+            # want.
+            log.exception(
+                "could not read a slack event (type=%r, ts=%r); ignoring it",
+                event.get("type"),
+                event.get("ts"),
+            )
+            return
         if isinstance(decision, Ignored):
             log.debug("ignoring a slack event: %s", decision.reason)
             return
