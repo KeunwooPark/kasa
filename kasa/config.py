@@ -126,6 +126,25 @@ class SlackSettings(BaseModel):
         return bool(self.app_token_env and self.bot_token_env)
 
 
+class MemorySettings(BaseModel):
+    """Limits on what a consolidation job is allowed to do in one commit.
+
+    These are the numbers the patch validator enforces. They exist because the
+    plan on the other side of them was written by a model reading text that
+    someone else typed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: A memory is a paragraph or two. Anything near this is a transcript that
+    #: escaped, or a prompt-injection payload.
+    max_file_bytes: int = 65_536
+    #: One job touching more than this is a runaway, not a consolidation.
+    max_files_per_commit: int = 25
+    #: How long an archived memory must sit before it can be deleted at all.
+    retention_floor_days: int = 30
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -185,6 +204,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ltm: LTMSettings = Field(default_factory=LTMSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -354,6 +374,7 @@ def render_toml(cfg: Config) -> str:
         lines += _table("slack", cfg.slack, comment="# Socket Mode; see #21.")
 
     for name, section in (
+        ("memory", cfg.memory),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),
