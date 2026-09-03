@@ -216,7 +216,18 @@ def cost(config: ConfigOption = None) -> None:
             if not rows:
                 console.print("[dim]no calls recorded yet[/dim]")
                 return
-            table = Table("role", "model", "calls", "in", "out", "cached", "usd")
+            table = Table(show_header=True)
+            table.add_column("role", no_wrap=True)
+            # Folded, not truncated, for the same reason `doctor` folds its
+            # detail: this column is the row's identity, and a provider's
+            # canonical id is long. Truncated at rich's 80-column fallback,
+            # two models from one provider became the same row as soon as the
+            # output was piped anywhere (#80).
+            table.add_column("model", overflow="fold")
+            # The figures are what the table is for, so they do not wrap while
+            # a long name is being folded beside them.
+            for column in ("calls", "in", "out", "cached", "usd"):
+                table.add_column(column, no_wrap=True)
             for row in rows:
                 usd = row["cost_usd"]
                 table.add_row(
