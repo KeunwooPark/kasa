@@ -111,6 +111,23 @@ class Manifest(BaseModel):
 
         return cls(memories=memories), problems
 
+    def accounts_for(self, root: Path) -> bool:
+        """Whether this manifest describes exactly the memory files on disk.
+
+        A path-set comparison rather than a full rebuild, because it is what
+        resolution actually depends on and it costs a directory walk instead of
+        parsing the corpus. The denormalized fields on an entry can still drift
+        — a title edited by hand, say — which is why every consumer re-reads the
+        document rather than trusting the copy.
+        """
+        root = root.expanduser()
+        on_disk = set()
+        for path in (root / MEMORY_DIR).rglob("*.md"):
+            relative = path.relative_to(root).as_posix()
+            if is_memory_path(relative):
+                on_disk.add(relative)
+        return on_disk == {entry.path for entry in self.memories.values()}
+
     # -- resolution ----------------------------------------------------------
 
     def __contains__(self, memory_id: object) -> bool:

@@ -394,3 +394,101 @@ async def test_a_push_rejected_mid_write_is_rebased_and_retried(
     landed = run_git("ls-tree", "-r", "--name-only", "main", cwd=remote).stdout
     assert "memory/facts/theirs.md" in landed, "their commit survived; nothing was forced over it"
     assert path in landed
+
+
+# -- the manifest, versus a working copy edited by hand -----------------------
+
+
+async def test_a_hand_written_memory_is_resolvable_without_a_patch_ever_running(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """#43: `memory_search` returned ids that `memory_read` denied existed.
+
+    Applying a patch was the only thing that ever rebuilt the manifest, so a
+    repo whose memories were written by hand — the workflow the README
+    recommends — had a manifest describing none of them. Retrieval reads
+    SQLite and saw every file; id resolution read the manifest and saw nothing.
+    """
+    path, content = a_memory(title="Jane Kowalski")
+    target = clone / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    doc = MemoryDoc.parse(content)
+
+    assert len(Manifest.load(clone)) == 0, "nothing has rebuilt it, and nothing will"
+    entry = memory.manifest().resolve(doc.id)
+    assert entry is not None and entry.path == path
+
+
+async def test_reconciling_the_manifest_on_read_does_not_write_to_the_repo(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """A read path that commits to somebody's repo is a read path with a bug."""
+    path, content = a_memory(title="Bob Nkemelu")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+    before = (clone / MANIFEST_PATH).read_bytes()
+
+    memory.manifest()
+
+    assert (clone / MANIFEST_PATH).read_bytes() == before
+
+
+async def test_refresh_manifest_rebuilds_and_commits_it(memory: MemoryStore, clone: Path) -> None:
+    path, content = a_memory(title="Ada Achebe")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+
+    result = await memory.refresh_manifest()
+
+    assert result.rebuilt and result.memories == 1 and result.was == 0
+    assert len(Manifest.load(clone)) == 1
+    assert result.sha, "the repair is committed, not left dirty for the next write to stash"
+
+
+async def test_refresh_manifest_is_a_no_op_when_it_already_describes_the_repo(
+    memory: MemoryStore, clone: Path
+) -> None:
+    path, content = a_memory(title="Ada Achebe")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+    await memory.refresh_manifest()
+
+    again = await memory.refresh_manifest()
+
+    assert not again.rebuilt and again.memories == 1
+    assert again.sha is None, "no empty commit"
+
+
+async def test_a_memory_deleted_by_hand_leaves_the_manifest(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """Drift in either direction, not just files the manifest has never seen."""
+    path, content = a_memory(title="Temporary note")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+    await memory.refresh_manifest()
+    doc = MemoryDoc.parse(content)
+    (clone / path).unlink()
+
+    assert memory.manifest().resolve(doc.id) is None
+
+
+async def test_refreshing_the_manifest_never_stashes_the_memories_it_describes(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """The files being recorded are, by definition, the uncommitted ones.
+
+    `apply` parks a dirty working copy before it writes, which is right for a
+    patch and exactly wrong here — it would stash the hand-written memory and
+    then record a manifest describing a file that is no longer there.
+    """
+    path, content = a_memory(title="Uncommitted by design")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+
+    await memory.refresh_manifest()
+
+    assert (clone / path).exists()
+    assert (clone / path).read_text() == content
+    assert len(Manifest.load(clone)) == 1

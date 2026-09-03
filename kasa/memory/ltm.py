@@ -32,7 +32,7 @@ from kasa.memory.bootstrap import is_bootstrapped
 from kasa.memory.gitcmd import GitRepo
 from kasa.memory.layout import MANIFEST_PATH, is_memory_path
 from kasa.memory.lease import LOCK_FILENAME, Lease, stale_lease
-from kasa.memory.manifest import Manifest
+from kasa.memory.manifest import Manifest, Problem
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -91,6 +91,23 @@ class CommitMeta:
         if self.memory_ids:
             trailers.append(f"Kasa-Memory-Ids: {', '.join(self.memory_ids)}")
         return f"memory: {self.summary}\n\n" + "\n".join(trailers) + "\n"
+
+
+@dataclass(slots=True)
+class ManifestRefresh:
+    """What `refresh_manifest` found, and what it did about it."""
+
+    memories: int = 0
+    #: How many the stale manifest claimed, when it was stale.
+    was: int = 0
+    rebuilt: bool = False
+    sha: str | None = None
+    problems: list[Problem] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if not self.rebuilt:
+            return f"manifest already describes all {self.memories} memories"
+        return f"manifest rebuilt: {self.memories} memories (it claimed {self.was})"
 
 
 @dataclass(slots=True)
@@ -158,7 +175,54 @@ class MemoryStore:
         return target.read_text()
 
     def manifest(self) -> Manifest:
-        return Manifest.load(self._repo.path)
+        """The id → path index, reconciled against the working copy.
+
+        The manifest is derived data that happens to be committed, and until
+        #43 the only thing that rebuilt it was applying a patch. A repo whose
+        memories were written by hand — the workflow the README recommends —
+        therefore had a manifest describing none of them, and `memory_read`
+        denied the existence of ids `memory_search` had just returned.
+
+        Rebuilding unconditionally would parse the whole corpus on every tool
+        call, so the manifest is trusted whenever it accounts for the files on
+        disk and rebuilt when it does not. In memory: a read does not write to
+        anyone's repo. `refresh_manifest` is how the repair becomes durable.
+        """
+        manifest = Manifest.load(self._repo.path)
+        if manifest.accounts_for(self._repo.path):
+            return manifest
+
+        rebuilt, problems = self._rebuild_manifest()
+        log.info(
+            "the manifest did not describe the working copy at %s; rebuilt it "
+            "from %d memory file(s). `kasa reindex` makes this stick.",
+            self._repo.path,
+            len(rebuilt),
+        )
+        del problems  # already logged
+        return rebuilt
+
+    async def refresh_manifest(self) -> ManifestRefresh:
+        """Regenerate the committed manifest from the working copy.
+
+        `kasa reindex` calls this. The SQLite index and the manifest are both
+        derived from the repo, and rebuilding only one of them is what left
+        them able to disagree.
+        """
+        before = Manifest.load(self._repo.path)
+        after, problems = self._rebuild_manifest()
+        if before.memories == after.memories:
+            return ManifestRefresh(memories=len(after), problems=problems)
+
+        lease = self.lease()
+        await lease.acquire(job="reindex")
+        try:
+            sha = await asyncio.to_thread(self._commit_manifest, after)
+        finally:
+            await lease.release()
+        return ManifestRefresh(
+            memories=len(after), was=len(before), rebuilt=True, sha=sha, problems=problems
+        )
 
     # -- writing -------------------------------------------------------------
 
@@ -233,13 +297,32 @@ class MemoryStore:
         return change.path
 
     def _rewrite_manifest(self) -> str:
+        manifest, _ = self._rebuild_manifest()
+        manifest.save(self._repo.path)
+        return MANIFEST_PATH
+
+    def _rebuild_manifest(self) -> tuple[Manifest, list[Problem]]:
         manifest, problems = Manifest.rebuild(self._repo.path)
         for problem in problems:
             # Not fatal: one file somebody broke by hand must not block every
             # later write to the repo. It is loud, and `kasa doctor` sees it too.
             log.warning("manifest: %s — %s", problem.path, problem.reason)
+        return manifest, problems
+
+    def _commit_manifest(self, manifest: Manifest) -> str | None:
+        # Deliberately no `recover()`: the memories this manifest is being
+        # rebuilt to describe are usually the uncommitted ones, and stashing
+        # them is how a repair becomes a disappearance. Only the manifest path
+        # is staged, so whatever else is in flight stays in flight — the same
+        # rule `init` follows when it commits only what it bootstrapped.
         manifest.save(self._repo.path)
-        return MANIFEST_PATH
+        sha = self._repo.commit(
+            "memory: rebuild the manifest from the working copy\n\nKasa-Job: reindex",
+            paths=[MANIFEST_PATH],
+        )
+        if sha and self._push:
+            self._push_with_rebase()
+        return sha
 
     def _sync_with_remote(self) -> None:
         if not self._push:

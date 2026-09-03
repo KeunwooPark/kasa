@@ -205,3 +205,20 @@ def test_record_then_forget(repo: Path, jane: MemoryDoc) -> None:
 
 def test_moving_an_unknown_id_is_a_no_op() -> None:
     assert Manifest().move(new_memory_id(), "memory/facts/x.md") is False
+
+
+def test_accounts_for_compares_the_manifest_against_the_files_on_disk(tmp_path: Path) -> None:
+    """The cheap staleness check id resolution leans on."""
+    bootstrap(tmp_path)
+    doc = MemoryDoc.new(type="fact", title="A thing", body="It is so.")
+    target = tmp_path / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+
+    assert not Manifest().accounts_for(tmp_path), "a file it has never seen"
+
+    rebuilt, _ = Manifest.rebuild(tmp_path)
+    assert rebuilt.accounts_for(tmp_path)
+
+    target.unlink()
+    assert not rebuilt.accounts_for(tmp_path), "and a file that went away"
