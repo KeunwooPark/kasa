@@ -88,3 +88,28 @@ class ProviderProtocolError(LLMError):
 
 class ToolError(KasaError):
     """A tool could not be dispatched, or failed in a way the agent should see."""
+
+
+class GitError(KasaError):
+    """A git command failed.
+
+    Carries the command's own stderr: git's diagnostics are better than
+    anything we would write over the top of them.
+    """
+
+    def __init__(self, message: str, *, command: str | None = None, stderr: str | None = None):
+        super().__init__(message)
+        self.command = command
+        self.stderr = stderr
+
+    def __str__(self) -> str:
+        detail = (self.stderr or "").strip()
+        return f"{super().__str__()}\n{detail}" if detail else super().__str__()
+
+
+class GitHubError(KasaError):
+    """The GitHub API rejected a request or returned something unusable."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status

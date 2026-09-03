@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kasa.config import Config, config_from_env, load_config
+from kasa.config import Config, config_from_env, load_config, write_config
 from kasa.errors import ConfigError
 from kasa.llm.registry import ModelRole
 
@@ -99,3 +99,81 @@ def test_config_dump_contains_no_secrets(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("ANTHROPIC_API_KEY", "super-secret")
     cfg = config_from_env()
     assert "super-secret" not in str(cfg.redacted())
+
+
+# -- writing -----------------------------------------------------------------
+
+
+def _full_config() -> Config:
+    return Config.model_validate(
+        {
+            "ltm": {
+                "repo": "someone/kasa-memory",
+                "clone_path": "~/.kasa/ltm",
+                "branch": "trunk",
+                "token_env": "GH_TOKEN",
+                "supervised": ["forget", "reorganize"],
+            },
+            "slack": {
+                "app_token_env": "SLACK_APP_TOKEN",
+                "bot_token_env": "SLACK_BOT_TOKEN",
+                "allowed_channels": ["C0123", "C0456"],
+            },
+            "llm": {
+                "chat": {
+                    "kind": "anthropic",
+                    "model": "claude-opus-5",
+                    "key_env": "ANTHROPIC_API_KEY",
+                    "fallbacks": [{"kind": "openai", "model": "gpt-4o-mini"}],
+                },
+                "embedding": {
+                    "kind": "openai",
+                    "model": "text-embedding-3-small",
+                    "base_url": "https://api.openai.com/v1",
+                    "embedding_dimensions": 1536,
+                },
+            },
+            "agent": {"max_tool_iterations": 3},
+            "pricing": {"claude-opus-5": {"input": 3.0, "output": 15.0}},
+        }
+    )
+
+
+def test_written_config_round_trips(tmp_path: Path) -> None:
+    original = _full_config()
+    path = tmp_path / "config.toml"
+    write_config(original, path)
+
+    assert load_config(path) == original
+
+
+def test_written_config_omits_untouched_defaults(tmp_path: Path) -> None:
+    """The file should read as the decisions someone made, not a settings dump."""
+    path = tmp_path / "config.toml"
+    write_config(_full_config(), path)
+    written = path.read_text()
+
+    assert "max_tool_iterations = 3" in written
+    assert "history_limit" not in written, "left at its default"
+    assert "[context]" not in written
+
+
+def test_written_config_is_owner_readable_only(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(Config(), path)
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_special_characters_survive_the_round_trip(tmp_path: Path) -> None:
+    cfg = Config.model_validate(
+        {"llm": {"chat": {"kind": "openai", "model": 'a"quoted\\model', "base_url": "x\ty"}}}
+    )
+    path = tmp_path / "config.toml"
+    write_config(cfg, path)
+    assert load_config(path) == cfg
+
+
+def test_an_empty_config_still_writes_something_loadable(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(Config(), path)
+    assert load_config(path) == Config()

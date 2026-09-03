@@ -1,9 +1,9 @@
 """Configuration loading and object construction.
 
 Secrets are never stored in the config file — only the *name* of the environment
-variable holding them. `kasa init` (#10) will write this file; until then a
-usable config is synthesized from the environment so v0 runs with nothing but an
-API key exported.
+variable holding them. `kasa init` writes this file; with no file present a
+usable config is synthesized from the environment, so a first run needs nothing
+but an API key exported.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ NO_CHAT_PROVIDER = (
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_CLONE_PATH = "~/.kasa/ltm"
 
 
 def config_path() -> Path:
@@ -61,7 +62,7 @@ class ProviderConfig(BaseModel):
     fallbacks: list[ProviderConfig] = Field(default_factory=list)
 
     def api_key(self) -> str:
-        env = self.key_env or _default_key_env(self.kind)
+        env = self.key_env or default_key_env(self.kind)
         key = os.environ.get(env)
         if not key:
             raise ConfigError(
@@ -85,6 +86,44 @@ class ProviderConfig(BaseModel):
 
     def chain(self) -> list[LLMProvider]:
         return [self.build(), *(f.build() for f in self.fallbacks)]
+
+
+class LTMSettings(BaseModel):
+    """The private GitHub repository that holds long-term memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: `owner/name`, or any URL git can clone. None until `kasa init` has run.
+    repo: str | None = None
+    clone_path: str | None = None
+    branch: str = "main"
+    token_env: str = "KASA_GITHUB_TOKEN"
+    #: Jobs that open a pull request instead of pushing to the branch. Defaults
+    #: to the destructive one: `forget` is the job you want to read before it
+    #: lands, and `promote` is the one you would get tired of approving.
+    supervised: list[str] = Field(default_factory=lambda: ["forget"])
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.repo)
+
+    def resolved_clone_path(self) -> Path:
+        return Path(self.clone_path or DEFAULT_CLONE_PATH).expanduser()
+
+    def token(self) -> str | None:
+        return os.environ.get(self.token_env) or None
+
+
+class SlackSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    app_token_env: str | None = None  # xapp-, Socket Mode
+    bot_token_env: str | None = None  # xoxb-
+    allowed_channels: list[str] = Field(default_factory=list)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.app_token_env and self.bot_token_env)
 
 
 class AgentSettings(BaseModel):
@@ -145,6 +184,8 @@ class RetrySettings(BaseModel):
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    ltm: LTMSettings = Field(default_factory=LTMSettings)
+    slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
@@ -196,7 +237,7 @@ async def _null_sink(record: Any) -> None:
     return None
 
 
-def _default_key_env(kind: ProviderKind) -> str:
+def default_key_env(kind: ProviderKind) -> str:
     return "ANTHROPIC_API_KEY" if kind == "anthropic" else "OPENAI_API_KEY"
 
 
@@ -238,3 +279,95 @@ def config_from_env() -> Config:
     else:
         return Config()
     return Config(llm={"chat": chat})
+
+
+# -- writing -----------------------------------------------------------------
+
+_HEADER = """# Kasa configuration — written by `kasa init`.
+#
+# This file holds no secrets. Credentials are referenced by the *name* of the
+# environment variable that carries them, so this file is safe to read, diff,
+# and back up. See docs/DESIGN.md Appendix A.
+"""
+
+_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    text = "".join(_ESCAPES.get(ch, ch) for ch in str(value))
+    return f'"{text}"'
+
+
+def _table(
+    name: str,
+    model: BaseModel,
+    *,
+    comment: str = "",
+    full: bool = False,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Render one table, omitting fields left at their default unless `full`."""
+    fields = model.model_dump(
+        mode="json", exclude_defaults=not full, exclude_none=True, exclude=exclude
+    )
+    if not fields:
+        return []
+    lines = [f"[{name}]"]
+    if comment:
+        lines.insert(0, comment)
+    width = max(len(key) for key in fields)
+    lines += [f"{key.ljust(width)} = {_toml_value(value)}" for key, value in fields.items()]
+    return [*lines, ""]
+
+
+def render_toml(cfg: Config) -> str:
+    """Serialize a config back to TOML.
+
+    Hand-rolled rather than via a TOML writer so the generated file can carry
+    the comments that make it editable by hand — which is the only reason to
+    write a config file instead of a pickle.
+    """
+    lines = [_HEADER]
+
+    if cfg.ltm.configured:
+        lines += _table(
+            "ltm",
+            cfg.ltm,
+            comment="# The private GitHub repo holding long-term memory.",
+            full=True,
+        )
+
+    for role, provider in cfg.llm.items():
+        # `fallbacks` is a TOML array of tables, so it is emitted as its own
+        # `[[...]]` sections rather than inline in the parent.
+        lines += _table(f"llm.{role}", provider, full=True, exclude={"fallbacks"})
+        for fallback in provider.fallbacks:
+            lines += _table(f"[llm.{role}.fallbacks]", fallback, full=True, exclude={"fallbacks"})
+
+    if cfg.slack.configured:
+        lines += _table("slack", cfg.slack, comment="# Socket Mode; see #21.")
+
+    for name, section in (
+        ("agent", cfg.agent),
+        ("context", cfg.context),
+        ("store", cfg.store),
+        ("retry", cfg.retry),
+    ):
+        lines += _table(name, section)
+    for model, price in cfg.pricing.items():
+        lines += _table(f'pricing."{model}"', price, full=True)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_config(cfg: Config, path: Path) -> None:
+    """Write the config file with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_toml(cfg))
+    path.chmod(0o600)

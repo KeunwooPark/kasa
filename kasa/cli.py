@@ -19,6 +19,7 @@ from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.errors import KasaError
+from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
 from kasa.store import Store
 
@@ -41,6 +42,19 @@ ConfigOption = Annotated[Path | None, typer.Option("--config", "-c", help="Path 
 def version() -> None:
     """Print the version."""
     console.print(__version__)
+
+
+@app.command()
+def init(config: ConfigOption = None) -> None:
+    """Interactive setup: the memory repo, the models, and the config file."""
+
+    async def main() -> None:
+        result = await run_init(ConsolePrompter(), path=config)
+        console.print()
+        console.print(f"[green]Ready.[/green] Memory repo: {result.repo_path}")
+        console.print("Run [bold]kasa run[/bold] to start talking to it.")
+
+    _run(main())
 
 
 @app.command()
@@ -125,6 +139,32 @@ def db_path(config: ConfigOption = None) -> None:
 
 
 # -- wiring ------------------------------------------------------------------
+
+
+class ConsolePrompter:
+    """`kasa.init.Prompter`, backed by a terminal."""
+
+    def ask(self, question: str, *, default: str | None = None) -> str:
+        # An empty default is a real answer ("no base URL"), so it is offered as
+        # one rather than becoming a required question.
+        return str(typer.prompt(question, default=default if default is not None else ""))
+
+    def choose(self, question: str, choices: tuple[str, ...], *, default: str) -> str:
+        options = "/".join(choices)
+        while True:
+            answer = str(typer.prompt(f"{question} [{options}]", default=default)).strip()
+            if answer in choices:
+                return answer
+            self.warn(f"Pick one of: {options}")
+
+    def confirm(self, question: str, *, default: bool = False) -> bool:
+        return bool(typer.confirm(question, default=default))
+
+    def say(self, text: str) -> None:
+        console.print(text)
+
+    def warn(self, text: str) -> None:
+        err.print(f"[yellow]![/yellow] {text}")
 
 
 def _load(path: Path | None) -> Config:
