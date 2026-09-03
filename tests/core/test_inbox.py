@@ -8,9 +8,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
-
-from kasa.core import inbox as inbox_module
+from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Dispatcher, Inbox
 from kasa.store import Store
@@ -109,11 +107,8 @@ async def test_a_failed_delivery_is_not_retried_immediately(store: Store) -> Non
     assert await inbox.counts() == {"pending": 1}
 
 
-async def test_a_message_that_keeps_failing_is_dead_lettered(
-    store: Store, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(inbox_module, "BACKOFF_BASE", 0.0)
-    inbox = Inbox(store, max_attempts=3)
+async def test_a_message_that_keeps_failing_is_dead_lettered(store: Store) -> None:
+    inbox = Inbox(store, backoff=Backoff(max_attempts=3, base=0.0, cap=0.0))
     await inbox.enqueue(event("E1"))
 
     outcomes = []
@@ -129,7 +124,7 @@ async def test_a_message_that_keeps_failing_is_dead_lettered(
 
 async def test_a_dead_letter_can_be_put_back(store: Store) -> None:
     """Dead-lettering is a pause for a human, not a delete."""
-    inbox = Inbox(store, max_attempts=1)
+    inbox = Inbox(store, backoff=Backoff(max_attempts=1, base=0.0, cap=0.0))
     await inbox.enqueue(event("E1"))
     await inbox.fail((await inbox.lease())[0], "nope")
 

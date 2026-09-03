@@ -14,15 +14,14 @@ answer, which is the duplicate that actually happens in production.
 
 from __future__ import annotations
 
-import asyncio
-import functools
 import logging
-import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from kasa.core.backoff import Backoff
+from kasa.core.drain import Drainer
 from kasa.core.events import EventError, InboundEvent
 from kasa.store import Store
 
@@ -33,14 +32,11 @@ log = logging.getLogger(__name__)
 #: work sits unclaimed — not how long a turn is allowed to take.
 DEFAULT_LEASE_TTL = 60.0
 
-#: Leases burned before a message stops being retried. It counts leases rather
-#: than failures on purpose; see `Store.reclaim_inbox`.
-DEFAULT_MAX_ATTEMPTS = 5
-
-#: Retry backoff: 2s, 4s, 8s, … capped. Short at the start because the common
-#: failure is a provider blip and the person is still watching the thread.
-BACKOFF_BASE = 2.0
-BACKOFF_CAP = 300.0
+#: Five leases, then a dead letter, waiting 2s, 4s, 8s … between them. Short at
+#: the start because the common failure is a provider blip and the person is
+#: still watching the thread. Leases rather than failures on purpose; see
+#: `Store.reclaim_inbox`.
+DEFAULT_BACKOFF = Backoff(max_attempts=5, base=2.0, cap=300.0)
 
 #: How long a delivered row is kept. It is still the dedupe record for its
 #: event id, so purging eagerly is how a late provider retry earns a second
@@ -79,12 +75,12 @@ class Inbox:
         store: Store,
         *,
         lease_ttl: float = DEFAULT_LEASE_TTL,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        backoff: Backoff = DEFAULT_BACKOFF,
         retention: timedelta = DONE_RETENTION,
     ) -> None:
         self._store = store
         self._lease_ttl = lease_ttl
-        self._max_attempts = max_attempts
+        self._backoff = backoff
         self._retention = retention
         self._subscribers: list[Callable[[], None]] = []
 
@@ -151,11 +147,11 @@ class Inbox:
     async def fail(self, item: LeasedEvent, error: BaseException | str) -> bool:
         """Record a failed delivery. False once the row is dead-lettered."""
         reason = f"{type(error).__name__}: {error}" if isinstance(error, BaseException) else error
-        if item.attempts >= self._max_attempts:
+        delay = self._backoff.delay_after(item.attempts)
+        if delay is None:
             log.error("inbox %s failed %d time(s), giving up: %s", item.id, item.attempts, reason)
             await self._store.fail_inbox(item.id, error=reason)
             return False
-        delay = min(BACKOFF_CAP, BACKOFF_BASE * 2 ** (item.attempts - 1))
         log.warning(
             "inbox %s failed (attempt %d), retrying in %.0fs: %s",
             item.id,
@@ -170,10 +166,13 @@ class Inbox:
         )
         return True
 
-    async def reclaim(self, *, expired_only: bool = False) -> list[dict[str, Any]]:
+    async def reclaim(self, *, expired_only: bool = False) -> list[str]:
         """Make work a stopped process was holding deliverable again."""
         now = _stamp(datetime.now(UTC)) if expired_only else None
-        return await self._store.reclaim_inbox(now=now)
+        return [
+            f"{row['source']}:{row['external_id']} (attempt {row['attempts']})"
+            for row in await self._store.reclaim_inbox(now=now)
+        ]
 
     async def purge(self) -> int:
         """Drop delivered rows old enough that no provider will retry them."""
@@ -189,12 +188,14 @@ class Inbox:
         return await self._store.revive_inbox_failed()
 
 
-class Dispatcher:
-    """Drains the inbox into a handler, holding each row's lease while it runs.
+class Dispatcher(Drainer[LeasedEvent]):
+    """The drainer over the inbox — the design doc's word for it (§3.1).
 
-    One per process. Sessions serialize inside the handler (#20); this layer
-    only bounds how many events are in flight at once, and guarantees every
-    leased row reaches exactly one of `complete`, `fail` or `release`.
+    No loop of its own: that is generic, and the inbox is the durable half it
+    drains. What it adds is the handler's signature. A handler here answers a
+    *message*, and has no business knowing which row carried it; sessions
+    serialize inside it (#20), and this layer only bounds how many are in
+    flight at once.
     """
 
     def __init__(
@@ -208,137 +209,15 @@ class Dispatcher:
         shutdown_grace: float = 30.0,
         purge_interval: float = 3600.0,
     ) -> None:
-        self._inbox = inbox
-        self._handler = handler
-        self._concurrency = max(1, concurrency)
-        self._poll_interval = poll_interval
-        #: A sole drainer may assume every leased row belongs to the run that
-        #: just died, and take it back immediately instead of waiting out a
-        #: lease nobody is holding. Set False the day a second worker exists.
-        self._reclaim_on_start = reclaim_on_start
-        self._shutdown_grace = shutdown_grace
-        self._purge_interval = purge_interval
-        self._in_flight: dict[int, asyncio.Task[None]] = {}
-        self._woken = asyncio.Event()
-        self._stop = asyncio.Event()
-        self._last_purge = 0.0
-        inbox.subscribe(self.wake)
+        async def work(item: LeasedEvent) -> None:
+            await handler(item.event)
 
-    def wake(self) -> None:
-        """Look for work now rather than at the next poll."""
-        self._woken.set()
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._woken.set()
-
-    @property
-    def in_flight(self) -> int:
-        return len(self._in_flight)
-
-    async def run(self) -> None:
-        """Drain until `stop()`, then let in-flight work finish."""
-        if self._reclaim_on_start:
-            for row in await self._inbox.reclaim():
-                log.warning(
-                    "replaying %s:%s, which a previous run was holding (attempt %s)",
-                    row["source"],
-                    row["external_id"],
-                    row["attempts"],
-                )
-        keepalive = asyncio.create_task(self._keepalive(), name="inbox-keepalive")
-        try:
-            while not self._stop.is_set():
-                self._woken.clear()
-                if await self._start_batch() == 0:
-                    await self._idle()
-        finally:
-            keepalive.cancel()
-            await asyncio.gather(keepalive, return_exceptions=True)
-            await self._settle()
-
-    async def drain_once(self) -> int:
-        """Deliver everything currently due and wait for it.
-
-        The synchronous shape of the loop above, for callers that want the
-        queue empty before they look at the result — tests, and `kasa` commands
-        that are not the daemon.
-        """
-        started = await self._start_batch()
-        if started:
-            await asyncio.gather(*list(self._in_flight.values()))
-        return started
-
-    # -- internals -----------------------------------------------------------
-
-    async def _start_batch(self) -> int:
-        free = self._concurrency - len(self._in_flight)
-        if free <= 0:
-            return 0
-        items = await self._inbox.lease(limit=free)
-        for item in items:
-            task = asyncio.create_task(self._deliver(item), name=f"inbox-{item.id}")
-            self._in_flight[item.id] = task
-            task.add_done_callback(functools.partial(self._forget, item.id))
-        return len(items)
-
-    def _forget(self, inbox_id: int, task: asyncio.Task[None]) -> None:
-        self._in_flight.pop(inbox_id, None)
-
-    async def _deliver(self, item: LeasedEvent) -> None:
-        try:
-            await self._handler(item.event)
-        except asyncio.CancelledError:
-            # Shutdown, not failure. Shielded because we are already being
-            # cancelled, and an unshielded await here would leave the row
-            # leased until it expired — the delay this whole path exists to
-            # avoid. Same reasoning as `Agent._dispatch_all`.
-            await asyncio.shield(self._inbox.release([item.id]))
-            raise
-        except Exception as exc:
-            log.exception("handling inbox %s raised", item.id)
-            await self._inbox.fail(item, exc)
-        else:
-            await self._inbox.complete(item.id)
-
-    async def _idle(self) -> None:
-        """Wait for an arrival, a stop, a slot to free up, or the poll timeout."""
-        signals = [
-            asyncio.create_task(self._woken.wait()),
-            asyncio.create_task(self._stop.wait()),
-        ]
-        try:
-            await asyncio.wait(
-                {*signals, *self._in_flight.values()},
-                timeout=self._poll_interval,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for signal in signals:
-                signal.cancel()
-            await asyncio.gather(*signals, return_exceptions=True)
-
-    async def _keepalive(self) -> None:
-        """Hold the leases of work still running, and retire old delivered rows."""
-        interval = max(1.0, self._inbox.lease_ttl / 3)
-        while True:
-            await asyncio.sleep(interval)
-            if self._in_flight:
-                await self._inbox.renew(list(self._in_flight))
-            now = time.monotonic()
-            if now - self._last_purge >= self._purge_interval:
-                self._last_purge = now
-                if purged := await self._inbox.purge():
-                    log.debug("purged %d delivered inbox row(s)", purged)
-
-    async def _settle(self) -> None:
-        """Let in-flight work finish; cancel what outstays the grace period."""
-        tasks = list(self._in_flight.values())
-        if not tasks:
-            return
-        _, pending = await asyncio.wait(tasks, timeout=self._shutdown_grace)
-        if pending:
-            log.warning("cancelling %d event(s) still running at shutdown", len(pending))
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+        super().__init__(
+            inbox,
+            work,
+            concurrency=concurrency,
+            poll_interval=poll_interval,
+            reclaim_on_start=reclaim_on_start,
+            shutdown_grace=shutdown_grace,
+            purge_interval=purge_interval,
+        )

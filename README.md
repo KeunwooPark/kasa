@@ -22,6 +22,10 @@ Mode, so a self-hosted daemon needs no public ingress. Events land in a durable
 queue and are acknowledged immediately; one actor per thread answers them in
 order, and many threads at once.
 
+Background jobs are rows in the same database, run by a scheduler inside the
+daemon: a restart loses nothing and a crashed job runs again. The jobs that
+consolidate memory arrive in v3; today the scheduler runs `reindex`.
+
 Nothing writes to the memory repo without going through a typed patch plan that
 deterministic code validates first, and no delete is ever a force-push.
 
@@ -72,6 +76,9 @@ kasa config       print the resolved configuration
 kasa cost         token and spend totals
 kasa inbox status what is queued, and what stopped being retried
 kasa inbox retry  requeue every dead-lettered event
+kasa job run <k>  run a background job now
+kasa job list     what each job is doing, and when it last ran
+kasa job retry    requeue every dead-lettered job
 kasa db migrate   apply pending migrations
 ```
 

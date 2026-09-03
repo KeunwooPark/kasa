@@ -239,19 +239,35 @@ blob actually changed.
 
 ```sql
 CREATE TABLE jobs (
-  id            TEXT PRIMARY KEY,
+  id            TEXT PRIMARY KEY,       -- ULID for a one-shot; `kind@fire-time` for a scheduled run
   kind          TEXT NOT NULL,          -- episode_close | promote | reflect | ...
   payload       TEXT,
-  run_after     TEXT NOT NULL,
+  run_after     TEXT NOT NULL,          -- when it is due; also where a retry's backoff lands
   state         TEXT NOT NULL,          -- pending | leased | done | failed
   lease_until   TEXT,
   attempts      INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT
+  last_error    TEXT,
+  created_at    TEXT NOT NULL,
+  finished_at   TEXT                    -- when this kind last actually ran
 );
 ```
 
 Durable across restarts; a crashed job's lease expires and it retries. The same
-model scales to out-of-process workers later without a redesign.
+model scales to out-of-process workers later without a redesign: a second
+worker is another drainer over these rows, leasing only the kinds it has
+handlers for.
+
+The id is what makes the clock safe. A recurring job's next occurrence is
+inserted under an id derived from its fire time, so two schedulers ticking at
+the same moment — or one ticking twice inside a minute — write the same row.
+The clock only ever looks *forward*, which means a daemon that was down over a
+fire time does not stampede on restart: the occurrence it had already queued
+still runs, late, and the ones it never queued never happened.
+
+`inbox` (§4.1) has the same lease, attempt and dead-letter shape, deliberately,
+and is still a separate table: the inbox dedupes on a provider's event id and
+never schedules, a job schedules and never dedupes on anything external. What
+the two genuinely share is the loop over them, which is one implementation.
 
 ### 4.4 Long-term memory (git repo)
 
@@ -803,6 +819,8 @@ kasa why "<question>"         show the retrieval trace
 kasa memory search "<q>"      search LTM from the terminal
 kasa memory show <id>         print a memory file
 kasa job run <kind>           run a consolidation job on demand
+kasa job list                 what each job is doing, and when it last ran
+kasa job retry                requeue every dead-lettered job
 kasa inbox status             what is queued, and what stopped being retried
 kasa inbox retry              requeue every dead-lettered event
 kasa doctor                   check config, tokens, repo privacy, lease state

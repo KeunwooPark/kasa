@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from kasa import __version__
 from kasa.cli import app
+from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Inbox
 from kasa.llm.cost import CallRecord
@@ -293,7 +294,7 @@ def test_inbox_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
 
     async def seed() -> None:
         async with await Store.open(db) as store:
-            inbox = Inbox(store, max_attempts=1)
+            inbox = Inbox(store, backoff=Backoff(max_attempts=1, base=0.0, cap=0.0))
             await inbox.enqueue(
                 InboundEvent(source="slack", external_id="Ev1", session_id="slack:T:C:1")
             )
@@ -322,3 +323,46 @@ def test_run_slack_without_tokens_says_so(tmp_path: Path) -> None:
 
     assert result.exit_code == 1, result.output
     assert "no Slack tokens configured" in result.output
+
+
+def test_job_run_reports_a_job_that_failed(tmp_path: Path) -> None:
+    """`kasa job run` exits non-zero with the reason, so it is usable in a
+    script and readable in a terminal."""
+    config = config_for(tmp_path / "kasa.db")
+
+    result = runner.invoke(app, ["job", "run", "promote", "--config", str(config)])
+
+    assert result.exit_code == 1, result.output
+    assert "no job named 'promote'" in result.output
+
+
+def test_job_list_names_what_this_build_knows_when_nothing_is_queued(
+    rig: tuple[Path, Path],
+) -> None:
+    config, _ = rig
+
+    result = runner.invoke(app, ["job", "list", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "reindex" in result.output
+
+
+def test_job_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+
+    async def seed() -> None:
+        async with await Store.open(db) as store:
+            await store.enqueue_job(
+                job_id="j1", kind="reindex", payload=None, run_after="2020-01-01T00:00:00.000+00:00"
+            )
+            await store.fail_job("j1", error="the clone was gone")
+
+    asyncio.run(seed())
+
+    listed = runner.invoke(app, ["job", "list", "--config", str(config)])
+    assert "the clone was gone" in listed.output, listed.output
+
+    result = runner.invoke(app, ["job", "retry", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "requeued 1 job(s)" in result.output
