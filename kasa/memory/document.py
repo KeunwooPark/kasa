@@ -240,9 +240,19 @@ def is_memory_id(value: str) -> bool:
     return bool(_ID.match(value))
 
 
+#: How much of a title becomes a filename. A filename is a handle, not the
+#: title — the title is in the frontmatter and the id is the durable reference,
+#: so truncating loses nothing readers need. Unbounded, a long title produced a
+#: basename past the filesystem's 255-byte limit and the write failed with an
+#: `OSError` from inside the patch validator (#93).
+MAX_SLUG_CHARS = 80
+
+
 def slugify(title: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    return slug or "untitled"
+    # Trimmed after the strip, and stripped again: cutting mid-word can leave a
+    # trailing separator, and `deploy-.md` is not a name anybody wrote.
+    return slug[:MAX_SLUG_CHARS].strip("-") or "untitled"
 
 
 def _now() -> datetime:
