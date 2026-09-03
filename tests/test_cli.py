@@ -367,6 +367,18 @@ def test_job_run_names_the_job_it_ran_past_a_backlog(
     assert result.exit_code == 0, result.output
     assert "reindex finished" in result.output
 
+    conn = sqlite3.connect(tmp_path / "kasa.db")
+    try:
+        backlog_states = [
+            row[0] for row in conn.execute("SELECT state FROM jobs WHERE id LIKE 'older-%'")
+        ]
+    finally:
+        conn.close()
+    # "Run one job now, in this process." Reaching the queued row by draining
+    # the whole due backlog of its kind ran five other people's jobs, each of
+    # which calls a frontier model, from a command that names one (#127).
+    assert backlog_states == ["pending"] * 5, "the backlog is the daemon's, not this command's"
+
 
 def test_job_run_does_not_call_a_reindex_that_could_not_lock_finished(
     rig: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch

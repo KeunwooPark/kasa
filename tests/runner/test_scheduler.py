@@ -249,12 +249,34 @@ async def test_a_one_shot_runs_even_with_older_rows_of_its_kind_ahead_of_it(
 
     assert row["state"] == "done", "the job the user asked for is the one reported on"
     assert row["id"] not in {f"older-{n}" for n in range(5)}
-    assert len(ran) == 6, "the rows it passed on the way ran too, which is a drainer's job"
 
 
-async def test_running_a_job_by_hand_leaves_nothing_queued_behind(store: Store) -> None:
-    """Every call inserts a row. One that is not drained is one that stays,
-    so a command retried four times used to grow the table by four."""
+async def test_a_one_shot_runs_one_job(store: Store) -> None:
+    """ "Run one job now, in this process" is what the command says it does.
+
+    #117 reached this row by draining until it had been attempted, which runs
+    everything of the same kind that is already due on the way past. Each of
+    those calls a frontier model, and not one of them is what was asked for.
+    """
+    for n in range(20):
+        await store.enqueue_job(
+            job_id=f"older-{n}",
+            kind="reindex",
+            payload=None,
+            run_after="2020-01-01T00:00:00.000+00:00",
+        )
+    ran: list[Job] = []
+    scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records(ran))], concurrency=2)
+
+    row = await scheduler.run_now("reindex")
+
+    assert row["state"] == "done"
+    assert [job.id for job in ran] == [row["id"]], f"one job asked for, {len(ran)} run"
+
+
+async def test_the_backlog_it_no_longer_runs_is_left_exactly_as_it_was(store: Store) -> None:
+    """Not running them means not touching them: still pending, still unspent,
+    and still there for the daemon whose job they are."""
     for n in range(5):
         await store.enqueue_job(
             job_id=f"older-{n}",
@@ -264,12 +286,35 @@ async def test_running_a_job_by_hand_leaves_nothing_queued_behind(store: Store) 
         )
     scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))], concurrency=2)
 
-    for _ in range(4):
-        await scheduler.run_now("reindex")
+    await scheduler.run_now("reindex")
+
+    older = await store.raw("SELECT state, attempts FROM jobs WHERE id LIKE 'older-%'")
+    assert [row["state"] for row in older] == ["pending"] * 5
+    assert [row["attempts"] for row in older] == [0] * 5, "a row not run has not been tried"
+
+
+async def test_running_a_job_by_hand_leaves_nothing_queued_behind(store: Store) -> None:
+    """Every call inserts a row. One that is not drained is one that stays,
+    so a command retried four times used to grow the table by four.
+
+    Stated over the rows this command inserted, which is what #117 was about.
+    The five seeded ahead of them stay pending on purpose now (#127): they
+    belong to the daemon, and running them was never what was asked for.
+    """
+    for n in range(5):
+        await store.enqueue_job(
+            job_id=f"older-{n}",
+            kind="reindex",
+            payload=None,
+            run_after="2020-01-01T00:00:00.000+00:00",
+        )
+    scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))], concurrency=2)
+
+    inserted = [(await scheduler.run_now("reindex"))["id"] for _ in range(4)]
 
     ran = await states(store)
     assert len(ran) == 9, "five already due, one per call"
-    assert set(ran.values()) == {"done"}, "and not one of them left queued"
+    assert [ran[job_id] for job_id in inserted] == ["done"] * 4, "not one left queued"
 
 
 async def test_a_job_it_cannot_reach_is_reported_rather_than_waited_for(store: Store) -> None:
@@ -277,7 +322,9 @@ async def test_a_job_it_cannot_reach_is_reported_rather_than_waited_for(store: S
     is there beats looping until the lease expires."""
     scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))])
 
-    async def nothing_runnable(*, limit: int = 1, exclude: Sequence[Any] = ()) -> list[Job]:
+    async def nothing_runnable(
+        *, limit: int = 1, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
+    ) -> list[Job]:
         return []
 
     scheduler.queue.lease = nothing_runnable  # type: ignore[method-assign]

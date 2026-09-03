@@ -432,7 +432,13 @@ class Store:
             return int(row["id"]), True
 
     async def lease_inbox(
-        self, *, limit: int, now: str, lease_until: str, exclude: Sequence[int] = ()
+        self,
+        *,
+        limit: int,
+        now: str,
+        lease_until: str,
+        exclude: Sequence[int] = (),
+        only: Sequence[int] = (),
     ) -> list[dict[str, Any]]:
         """Claim up to `limit` deliverable rows, oldest first.
 
@@ -452,6 +458,7 @@ class Store:
         own work is not a process that died holding it (#126).
         """
         skip = f" AND id NOT IN ({', '.join('?' for _ in exclude)})" if exclude else ""
+        pick = f" AND id IN ({', '.join('?' for _ in only)})" if only else ""
         async with self._serial:
             async with self._conn.execute(
                 "UPDATE inbox SET state = 'leased', lease_until = ?, attempts = attempts + 1"
@@ -459,11 +466,11 @@ class Store:
                 "   SELECT id FROM inbox"
                 "   WHERE ((state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
                 "      OR (state = 'leased' AND lease_until <= ?))"
-                f"{skip}"
+                f"{skip}{pick}"
                 "   ORDER BY id LIMIT ?"
                 " )"
                 " RETURNING id, payload, attempts",
-                (lease_until, now, now, *exclude, limit),
+                (lease_until, now, now, *exclude, *only, limit),
             ) as cur:
                 rows = [dict(row) for row in await cur.fetchall()]
             await self._conn.commit()
@@ -630,6 +637,7 @@ class Store:
         now: str,
         lease_until: str,
         exclude: Sequence[str] = (),
+        only: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
         """Claim up to `limit` runnable jobs of the kinds this worker knows.
 
@@ -640,11 +648,18 @@ class Store:
         `exclude` is the ids the caller is still running. See `lease_inbox` for
         why it belongs in the statement that spends the attempt rather than in
         the drainer that reads what comes back.
+
+        `only` narrows the other way, to specific rows. `kasa job run` wants
+        the one row it queued and not the backlog of its kind sitting in front
+        of it, and the row still has to be *leased* to be run — so the
+        narrowing belongs in the same statement rather than in a caller that
+        would have to lease the others to find out what they were (#127).
         """
         if not kinds:
             return []
         placeholders = ", ".join("?" for _ in kinds)
         skip = f" AND id NOT IN ({', '.join('?' for _ in exclude)})" if exclude else ""
+        pick = f" AND id IN ({', '.join('?' for _ in only)})" if only else ""
         async with self._serial:
             async with self._conn.execute(
                 "UPDATE jobs SET state = 'leased', lease_until = ?, attempts = attempts + 1"
@@ -653,11 +668,11 @@ class Store:
                 f"   WHERE kind IN ({placeholders})"
                 "     AND ((state = 'pending' AND run_after <= ?)"
                 "          OR (state = 'leased' AND lease_until <= ?))"
-                f"{skip}"
+                f"{skip}{pick}"
                 "   ORDER BY run_after LIMIT ?"
                 " )"
                 " RETURNING id, kind, payload, attempts",
-                (lease_until, *kinds, now, now, *exclude, limit),
+                (lease_until, *kinds, now, now, *exclude, *only, limit),
             ) as cur:
                 rows = [dict(row) for row in await cur.fetchall()]
             await self._conn.commit()

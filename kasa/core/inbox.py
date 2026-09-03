@@ -109,14 +109,22 @@ class Inbox:
             callback()
         return Enqueued(id=inbox_id, duplicate=False)
 
-    async def lease(self, *, limit: int = 1, exclude: Sequence[Any] = ()) -> list[LeasedEvent]:
-        """Claim up to `limit` deliverable events, skipping `exclude`."""
+    async def lease(
+        self, *, limit: int = 1, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
+    ) -> list[LeasedEvent]:
+        """Claim up to `limit` deliverable events, skipping `exclude`.
+
+        `only` narrows to specific rows; nothing on the inbox path needs it
+        today, and it is here because the drainer is shared with the job queue,
+        which does (#127).
+        """
         now = datetime.now(UTC)
         rows = await self._store.lease_inbox(
             limit=limit,
             now=_stamp(now),
             lease_until=_stamp(now + timedelta(seconds=self._lease_ttl)),
             exclude=[int(item_id) for item_id in exclude],
+            only=[int(item_id) for item_id in only],
         )
         leased: list[LeasedEvent] = []
         for row in rows:
