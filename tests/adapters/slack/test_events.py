@@ -178,6 +178,38 @@ async def test_the_gap_the_mention_leaves_is_still_tidied() -> None:
         assert event.text == expected, sent
 
 
+async def test_a_question_with_a_file_attached_is_answered() -> None:
+    """`file_share` is not an edit. It is somebody asking a question with a
+    document attached, and it used to be dropped in silence — the failure the
+    design doc is otherwise careful about ("a chat assistant that silently
+    ignores you is worse than one that answers you twice")."""
+    body = in_channel(f"<@{BOT}> what's in this?") | {
+        "subtype": "file_share",
+        "files": [{"name": "q3.pdf"}],
+    }
+
+    event = accepted(await normalize(body, context=context(), known_session=never)).event
+
+    assert event.text == "what's in this?\n\n[attached, which Kasa cannot open: q3.pdf]"
+
+
+async def test_a_file_with_no_comment_still_says_what_arrived() -> None:
+    """Otherwise the turn is empty and the agent has nothing to answer."""
+    body = dm("") | {"subtype": "file_share", "files": [{"name": "q3.pdf"}, {}]}
+
+    event = accepted(await normalize(body, context=context(), known_session=never)).event
+
+    assert event.text == "[attached, which Kasa cannot open: q3.pdf, an untitled file]"
+
+
+@pytest.mark.parametrize("subtype", ["file_share", "me_message", "thread_broadcast"])
+async def test_the_subtypes_that_are_somebody_talking_get_through(subtype: str) -> None:
+    assert isinstance(
+        await normalize(dm() | {"subtype": subtype}, context=context(), known_session=never),
+        Accepted,
+    )
+
+
 # -- what does not ------------------------------------------------------------
 
 
@@ -190,10 +222,14 @@ async def test_a_channel_message_that_is_not_addressed_to_kasa_is_ignored() -> N
     assert decision.reason == "not addressed to Kasa"
 
 
-@pytest.mark.parametrize("subtype", ["message_changed", "message_deleted", "channel_join"])
-async def test_a_subtype_is_ignored(subtype: str) -> None:
+@pytest.mark.parametrize(
+    "subtype", ["message_changed", "message_deleted", "channel_join", "channel_topic", "invented"]
+)
+async def test_a_subtype_that_is_not_somebody_talking_is_ignored(subtype: str) -> None:
     """Editing a message must not read as sending a new one. #25 is where
-    `message_changed` and `message_deleted` become something."""
+    `message_changed` and `message_deleted` become something — and an unknown
+    subtype is ignored rather than answered, because Kasa replies in any thread
+    it is already part of and "Bob joined the channel" is not a question."""
     decision = await normalize(dm() | {"subtype": subtype}, context=context(), known_session=never)
 
     assert isinstance(decision, Ignored)
