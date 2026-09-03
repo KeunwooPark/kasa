@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from kasa.core.backoff import Backoff
+from kasa.errors import StoreError
 from kasa.runner.cron import HOURLY, NIGHTLY, Cron
 from kasa.runner.scheduler import (
     Job,
@@ -44,6 +45,45 @@ def explodes(message: str = "the remote was busy") -> Callable[[Job], Any]:
 
 async def states(store: Store) -> dict[str, str]:
     return {row["id"]: row["state"] for row in await store.raw("SELECT id, state FROM jobs")}
+
+
+# -- the clock keeps running -------------------------------------------------
+
+
+async def test_a_spec_that_cannot_be_scheduled_does_not_starve_the_others(store: Store) -> None:
+    """February 30th parses and never arrives. `_specs` is iterated in
+    registration order, so one bad expression used to take every spec behind it
+    down with it — on this tick and on every tick after."""
+    ran: list[Job] = []
+    sched = Scheduler(
+        store,
+        [
+            JobSpec(kind="broken", handler=records(ran), cron=Cron.parse("0 0 30 2 *")),
+            JobSpec(kind="healthy", handler=records(ran), cron=Cron.parse(HOURLY)),
+        ],
+    )
+
+    queued = await sched.schedule_due(now=NOW)
+
+    assert [job_id.split("@")[0] for job_id in queued] == ["healthy"]
+
+
+async def test_a_tick_that_raises_does_not_stop_the_clock(store: Store) -> None:
+    """`schedule_due` reaches the store, so a locked database is enough. The
+    clock used to end there, silently, and never queue another occurrence."""
+    ticks = 0
+    sched = Scheduler(store, [], tick_interval=0.01)
+
+    async def failing_tick(*, now: datetime | None = None) -> list[str]:
+        nonlocal ticks
+        ticks += 1
+        raise StoreError("database is locked")
+
+    sched.schedule_due = failing_tick  # type: ignore[method-assign]
+    task = asyncio.create_task(sched.run())
+    await until(lambda: ticks >= 5)
+    sched.stop()
+    await asyncio.wait_for(task, timeout=5.0)
 
 
 # -- running -----------------------------------------------------------------

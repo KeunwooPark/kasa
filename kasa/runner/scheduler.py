@@ -26,6 +26,7 @@ from ulid import ULID
 
 from kasa.core.backoff import Backoff
 from kasa.core.drain import Drainer
+from kasa.core.supervise import keep_running
 from kasa.errors import KasaError
 from kasa.runner.cron import Cron
 from kasa.store import Store
@@ -254,7 +255,15 @@ class Scheduler:
 
     async def run(self) -> None:
         """Fill the table from the clock and drain it, until `stop()`."""
-        clock = asyncio.create_task(self._tick_forever(), name="scheduler-clock")
+        clock = asyncio.create_task(
+            keep_running(
+                self.schedule_due,
+                every=self._tick_interval,
+                name="scheduler clock",
+                start_now=True,
+            ),
+            name="scheduler-clock",
+        )
         try:
             await self._drainer.run()
         finally:
@@ -287,10 +296,18 @@ class Scheduler:
         for spec in self._specs.values():
             if spec.cron is None:
                 continue
-            fire_at = spec.cron.next_after(moment)
-            result = await self.queue.enqueue(
-                spec.kind, run_after=fire_at, job_id=scheduled_id(spec.kind, fire_at)
-            )
+            # Per spec, because one that cannot be scheduled must not stop the
+            # ones registered behind it. An expression that parses and never
+            # fires is enough to reach here, and `_specs` is iterated in
+            # registration order.
+            try:
+                fire_at = spec.cron.next_after(moment)
+                result = await self.queue.enqueue(
+                    spec.kind, run_after=fire_at, job_id=scheduled_id(spec.kind, fire_at)
+                )
+            except Exception:
+                log.exception("could not schedule %s (%s)", spec.kind, spec.cron.expression)
+                continue
             if not result.duplicate:
                 log.debug("queued %s for %s", spec.kind, fire_at)
                 queued.append(result.id)
@@ -306,11 +323,6 @@ class Scheduler:
 
     async def _run_job(self, job: Job) -> None:
         await self._require(job.kind).handler(job)
-
-    async def _tick_forever(self) -> None:
-        while True:
-            await self.schedule_due()
-            await asyncio.sleep(self._tick_interval)
 
 
 def _stamp(moment: datetime) -> str:

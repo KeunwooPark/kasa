@@ -22,6 +22,8 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol
 
+from kasa.core.supervise import keep_running
+
 log = logging.getLogger(__name__)
 
 
@@ -102,7 +104,14 @@ class Drainer[ItemT: Leased]:
         if self._reclaim_on_start:
             for description in await self._queue.reclaim():
                 log.warning("replaying %s, which a previous run was holding", description)
-        keepalive = asyncio.create_task(self._keepalive(), name="drain-keepalive")
+        keepalive = asyncio.create_task(
+            keep_running(
+                self._renew_and_purge,
+                every=max(1.0, self._queue.lease_ttl / 3),
+                name="drain keepalive",
+            ),
+            name="drain-keepalive",
+        )
         try:
             while not self._stop.is_set():
                 self._woken.clear()
@@ -190,18 +199,21 @@ class Drainer[ItemT: Leased]:
                 signal.cancel()
             await asyncio.gather(*signals, return_exceptions=True)
 
-    async def _keepalive(self) -> None:
-        """Hold the leases of work still running, and retire old finished rows."""
-        interval = max(1.0, self._queue.lease_ttl / 3)
-        while True:
-            await asyncio.sleep(interval)
-            if self._in_flight:
-                await self._queue.renew(list(self._in_flight))
-            now = time.monotonic()
-            if now - self._last_purge >= self._purge_interval:
-                self._last_purge = now
-                if purged := await self._queue.purge():
-                    log.debug("purged %d finished row(s)", purged)
+    async def _renew_and_purge(self) -> None:
+        """Hold the leases of work still running, and retire old finished rows.
+
+        One tick of the keepalive. A `StoreError` out of either call is a
+        transient the supervisor logs and retries; the cost of missing this
+        tick is one lease renewal, which is bounded by the guard in
+        `_start_batch` rather than by this loop staying alive.
+        """
+        if self._in_flight:
+            await self._queue.renew(list(self._in_flight))
+        now = time.monotonic()
+        if now - self._last_purge >= self._purge_interval:
+            self._last_purge = now
+            if purged := await self._queue.purge():
+                log.debug("purged %d finished row(s)", purged)
 
     async def _settle(self) -> None:
         """Let in-flight work finish; cancel what outstays the grace period."""
