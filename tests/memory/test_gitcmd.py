@@ -171,3 +171,31 @@ def test_git_never_blocks_on_a_credential_prompt(tmp_path: Path) -> None:
     with pytest.raises(GitError):
         repo.push("main")
     assert os.environ.get("GIT_TERMINAL_PROMPT") is None, "the setting stays scoped to the child"
+
+
+def test_ahead_of_upstream_counts_only_what_was_not_pushed(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    run_git("init", "--bare", "--initial-branch", "main", str(remote))
+    repo = GitRepo.init(tmp_path / "clone", branch="main")
+    (tmp_path / "clone" / "a.md").write_text("a")
+    repo.commit("a")
+    repo.set_remote(str(remote))
+    repo.push("main", set_upstream=True)
+    assert repo.ahead_of_upstream() == 0
+
+    for name in ("b", "c"):
+        (tmp_path / "clone" / f"{name}.md").write_text(name)
+        repo.commit(name)
+
+    assert repo.ahead_of_upstream() == 2
+    repo.push("main")
+    assert repo.ahead_of_upstream() == 0
+
+
+def test_ahead_of_upstream_is_none_without_an_upstream(tmp_path: Path) -> None:
+    """Never pushed, or deliberately local — a configuration, not a failure."""
+    repo = GitRepo.init(tmp_path / "clone", branch="main")
+    (tmp_path / "clone" / "a.md").write_text("a")
+    repo.commit("a")
+
+    assert repo.ahead_of_upstream() is None
