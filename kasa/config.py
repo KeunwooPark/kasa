@@ -430,7 +430,11 @@ def render_toml(cfg: Config) -> str:
             lines += _table(f"[llm.{role}.fallbacks]", fallback, full=True, exclude={"fallbacks"})
 
     if cfg.slack.configured:
-        lines += _table("slack", cfg.slack, comment="# Socket Mode; see #21.")
+        lines += _table(
+            "slack",
+            cfg.slack,
+            comment="# Socket Mode: the connection is outbound, so there is no ingress.",
+        )
 
     for name, section in (
         ("memory", cfg.memory),

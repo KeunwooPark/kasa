@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-from collections.abc import Sequence
+import signal
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from itertools import chain
 from pathlib import Path
 from typing import Annotated
@@ -76,21 +79,27 @@ def init(config: ConfigOption = None) -> None:
 @app.command()
 def run(
     config: ConfigOption = None,
-    cli: Annotated[bool, typer.Option("--cli", help="Run the terminal adapter.")] = True,
+    slack: Annotated[bool, typer.Option("--slack", help="Serve Slack over Socket Mode.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Start Kasa.
 
-    The terminal is the only surface today; Slack arrives in v2.
+    With no flags this is the terminal adapter. `--slack` runs the Socket Mode
+    daemon instead: the connection is outbound, so there is no public ingress
+    to expose and nothing to put a certificate on.
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    if not cli:
-        raise typer.BadParameter("the terminal is the only surface today; Slack arrives in v2")
     cfg = _load(config)
     Redactor.from_config(cfg).install()
+    if slack:
+        if not cfg.slack.configured:
+            err.print("[red]error[/red]: no Slack tokens configured; run `kasa init`")
+            raise typer.Exit(1)
+        _run(_serve_slack(cfg))
+        return
     _run(_repl(cfg))
 
 
@@ -411,7 +420,13 @@ def _print_report(report: Report) -> None:
         console.print(f"\n[red]{len(report.failed)} check(s) failed.[/red]")
 
 
-async def _repl(cfg: Config) -> None:
+@asynccontextmanager
+async def _agent(cfg: Config) -> AsyncIterator[Agent]:
+    """Everything a surface talks to, built once and torn down on every path.
+
+    Shared by the terminal and by Slack, so a conversation held in one is
+    indistinguishable in the database from one held in the other.
+    """
     # A repo that silently became public is a serious incident, so visibility is
     # re-checked on every start rather than trusted from setup time.
     await verify_repo_visibility(cfg)
@@ -446,19 +461,47 @@ async def _repl(cfg: Config) -> None:
                 tools += memory_tools(retriever=retriever, memory=memory, store=store)
 
         try:
-            await run_repl(
-                Agent(
-                    registry=registry,
-                    store=store,
-                    tools=ToolRegistry(tools, scrub=scrub),
-                    packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
-                    config=cfg.agent_config(),
-                    retriever=retriever,
-                ),
-                console,
+            yield Agent(
+                registry=registry,
+                store=store,
+                tools=ToolRegistry(tools, scrub=scrub),
+                packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
+                config=cfg.agent_config(),
+                retriever=retriever,
             )
         finally:
             await registry.aclose()
+
+
+async def _repl(cfg: Config) -> None:
+    async with _agent(cfg) as agent:
+        await run_repl(agent, console)
+
+
+async def _serve_slack(cfg: Config) -> None:
+    # Imported here because it is the `slack` extra. `kasa run` with no flags
+    # must keep working on an install that never asked for Slack.
+    from kasa.adapters.slack import SlackAdapter
+
+    async with _agent(cfg) as agent:
+        adapter = await SlackAdapter.connect(agent, cfg.slack)
+        console.print(
+            f"[green]Connected[/green] to Slack as {adapter.context.bot_user_id}"
+            f" in {adapter.context.team_id}. Ctrl-C to stop."
+        )
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            # A daemon is stopped by a signal, and `stop()` drains rather than
+            # dropping: in-flight turns finish and their inbox rows complete.
+            # Without this, systemd restarting Kasa replays every turn that was
+            # running at the time.
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, adapter.runtime.stop)
+        try:
+            await adapter.start()
+            await adapter.runtime.run()
+        finally:
+            await adapter.aclose()
 
 
 def _run(coro: object) -> None:

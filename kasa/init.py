@@ -312,7 +312,10 @@ def _configure_role(
 
 
 def _configure_slack(prompter: Prompter, current: SlackSettings) -> SlackSettings:
-    prompter.say("Slack arrives in v2; the tokens can be filled in now or later.")
+    prompter.say(
+        "Slack runs over Socket Mode, so it needs an app token and a bot token. "
+        "They can be filled in now or later."
+    )
     if not prompter.confirm("Configure Slack?", default=current.configured):
         return current
 
