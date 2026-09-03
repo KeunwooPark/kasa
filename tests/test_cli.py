@@ -7,6 +7,7 @@ writes before it validates fails in a way no unit test sees.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -17,10 +18,13 @@ from typer.testing import CliRunner
 
 from kasa import __version__
 from kasa.cli import app
+from kasa.llm.cost import CallRecord
+from kasa.llm.types import Usage
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo
 from kasa.memory.manifest import Manifest
+from kasa.store import Store
 
 runner = CliRunner()
 
@@ -212,3 +216,44 @@ def test_the_log_record_names_the_file_once_too(
     message = next(r.getMessage() for r in caplog.records if r.name == "kasa.memory.index")
     assert message.count(path) == 1, message
     assert "no YAML frontmatter" in message
+
+
+def test_the_cost_table_does_not_truncate_the_model_name(deep: Path) -> None:
+    """#80. The model column is the row's identity, and rich's 80-column
+    fallback put an ellipsis in it as soon as the output was piped — so two
+    models from one provider became the same row."""
+    db = deep / "kasa.db"
+    config = config_for(db)
+    model = "accounts/fireworks/models/kimi-k3-instruct-0905-preview"
+
+    async def seed() -> None:
+        async with await Store.open(db) as store:
+            await store.record_call(
+                CallRecord(
+                    role="chat",
+                    provider="openai",
+                    model=model,
+                    usage=Usage(input_tokens=10, output_tokens=5),
+                    latency_ms=1,
+                    cost_usd=None,
+                    tag=None,
+                    ok=True,
+                )
+            )
+
+    # Not an async test: `runner.invoke` runs a command that calls
+    # `asyncio.run`, which cannot be nested inside a running loop.
+    asyncio.run(seed())
+
+    result = runner.invoke(app, ["cost", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "\u2026" not in result.output, result.output
+    # Folded, like `doctor`'s detail column: the name survives across two
+    # lines of the same cell, so the column is read back column-wise.
+    cells = [
+        line.split("\u2502")[2].strip()
+        for line in result.output.splitlines()
+        if line.count("\u2502") > 2
+    ]
+    assert "".join(cells) == model, result.output
