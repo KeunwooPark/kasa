@@ -336,6 +336,48 @@ def test_job_run_reports_a_job_that_failed(tmp_path: Path) -> None:
     assert "no job named 'promote'" in result.output
 
 
+def test_job_run_names_the_job_it_ran_past_a_backlog(
+    rig: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The reported row has to be the one the command queued, not whichever of
+    that kind happened to be oldest. With rows already due, `kasa job run`
+    printed `reindex pending: None` and exited 1 without running anything."""
+    config, clone = rig
+    bootstrap(clone)
+    Manifest.rebuild(clone)[0].save(clone)
+    GitRepo.at(clone).commit("memory: seed")
+
+    async def backlog() -> None:
+        async with await Store.open(tmp_path / "kasa.db") as store:
+            for n in range(5):
+                await store.enqueue_job(
+                    job_id=f"older-{n}",
+                    kind="reindex",
+                    payload=None,
+                    run_after="2020-01-01T00:00:00.000+00:00",
+                )
+
+    asyncio.run(backlog())
+
+    result = runner.invoke(app, ["job", "run", "reindex", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "reindex finished" in result.output
+
+
+def test_job_run_says_a_job_never_ran_rather_than_None(rig: tuple[Path, Path]) -> None:
+    """A row with no recorded error did not fail. `None` names no reason, and
+    "pending" reads as though the command did nothing at all."""
+    config, _ = rig
+
+    result = runner.invoke(app, ["job", "run", "reindex", "--config", str(config)])
+
+    assert result.exit_code == 1, result.output
+    assert "reindex retrying" in result.output
+    assert "no memory skeleton" in result.output
+    assert "None" not in result.output
+
+
 def test_job_list_names_what_this_build_knows_when_nothing_is_queued(
     rig: tuple[Path, Path],
 ) -> None:

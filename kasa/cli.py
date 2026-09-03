@@ -351,7 +351,11 @@ def job_run(
         if job["state"] == "done":
             console.print(f"{kind} finished")
             return
-        err.print(f"[red]{kind} {job['state']}[/red]: {job['last_error']}")
+        # A pending row that has been attempted is waiting out its backoff, and
+        # "pending" reads as though nothing happened. A row with no recorded
+        # error did not fail — it never ran — and `None` is not a reason.
+        state = "retrying" if job["state"] == "pending" else job["state"]
+        err.print(f"[red]{kind} {state}[/red]: {job['last_error'] or 'it never ran'}")
         raise typer.Exit(1)
 
     _run(main())
