@@ -211,9 +211,26 @@ class Store:
             return [dict(row) for row in await cur.fetchall()]
 
     async def raw(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        """Escape hatch for the CLI and tests."""
+        """Run a query and return its rows.
+
+        Together with `write`, this is what lets the derived index own its own
+        SQL in `kasa/memory/index.py` instead of pushing another dozen methods
+        into this class. Durable state still goes through the typed methods
+        above; these two are for the rebuildable half.
+        """
         async with self._conn.execute(sql, params) as cur:
             return [dict(row) for row in await cur.fetchall()]
+
+    async def write(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        cur = await self._conn.execute(sql, params)
+        await self._conn.commit()
+        return int(cur.rowcount)
+
+    async def write_many(self, sql: str, rows: Sequence[tuple[Any, ...]]) -> None:
+        if not rows:
+            return
+        await self._conn.executemany(sql, rows)
+        await self._conn.commit()
 
     # -- leases --------------------------------------------------------------
 

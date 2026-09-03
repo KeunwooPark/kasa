@@ -22,6 +22,7 @@ from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
+from kasa.memory.index import MemoryIndex
 from kasa.redact import Redactor
 from kasa.store import Store
 
@@ -89,6 +90,30 @@ def show_config(config: ConfigOption = None) -> None:
     cfg = _load(config)
     console.print(f"[dim]{config or config_path()}[/dim]")
     console.print_json(json.dumps(cfg.redacted(), indent=2))
+
+
+@app.command()
+def reindex(
+    config: ConfigOption = None,
+    full: Annotated[bool, typer.Option("--full", help="Rebuild from scratch.")] = False,
+) -> None:
+    """Rebuild the search index from the memory repo.
+
+    Safe at any time: the index is derived, and the repo is the source of truth.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        if not cfg.ltm.configured:
+            err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
+            raise typer.Exit(1)
+        async with await Store.open(cfg.store.resolved()) as store:
+            result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(full=full)
+        console.print(result.summary())
+        for problem in result.problems:
+            err.print(f"[yellow]![/yellow] could not index {problem}")
+
+    _run(main())
 
 
 @app.command()

@@ -20,6 +20,7 @@ from kasa.errors import ConfigError, GitHubError, KasaError
 from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
 from kasa.memory.gitcmd import GitRepo, git_available
+from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LEASE_NAME, LOCK_FILENAME, stale_lease
 from kasa.store import Store
 
@@ -201,12 +202,36 @@ async def _store_checks(cfg: Config) -> list[Check]:
         async with await Store.open(path) as store:
             rows = await store.raw("SELECT name FROM schema_version ORDER BY name")
             lease = await _lease(cfg, store)
+            index = await _index(cfg, store)
     except KasaError as exc:
         return [Check("database", Status.FAIL, f"{path}: {exc}")]
     return [
         Check("database", Status.OK, f"{path}, {len(rows)} migration(s) applied"),
         lease,
+        index,
     ]
+
+
+async def _index(cfg: Config, store: Store) -> Check:
+    if not cfg.ltm.configured:
+        return Check("index freshness", Status.SKIP, "no memory repo to index")
+    root = cfg.ltm.resolved_clone_path()
+    if not root.exists():
+        return Check("index freshness", Status.SKIP, "no clone to index")
+
+    index = MemoryIndex(store, root)
+    stats = await index.stats()
+    if await index.is_stale():
+        return Check(
+            "index freshness",
+            Status.WARN,
+            f"{stats['chunks']} chunk(s) indexed, but the repo has moved on — run `kasa reindex`",
+        )
+    return Check(
+        "index freshness",
+        Status.OK,
+        f"{stats['chunks']} chunk(s) across {stats['memories']} memories",
+    )
 
 
 async def _lease(cfg: Config, store: Store) -> Check:
@@ -233,7 +258,7 @@ async def _lease(cfg: Config, store: Store) -> Check:
 
 def _not_yet() -> list[Check]:
     """Checks whose subjects do not exist yet, listed so they are not forgotten."""
-    return [Check("index freshness", Status.SKIP, "arrives with the FTS index (#14)")]
+    return [Check("embeddings", Status.SKIP, "arrives with hybrid retrieval (#31)")]
 
 
 async def _lookup(cfg: Config, *, github: GitHubClient | None) -> RepoInfo | None:

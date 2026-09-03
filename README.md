@@ -41,6 +41,7 @@ synthesizes one from whatever API key is exported and runs without memory.
 ```
 kasa init         interactive setup; bootstraps the memory repo
 kasa run          start the terminal adapter
+kasa reindex      rebuild the search index from the memory repo
 kasa doctor       check config, tokens, repo privacy, and the clone
 kasa config       print the resolved configuration
 kasa cost         token and spend totals
