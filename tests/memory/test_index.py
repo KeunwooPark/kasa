@@ -9,6 +9,7 @@ from kasa.memory.chunk import MAX_CHUNK_CHARS, MIN_CHUNK_CHARS, chunk_document, 
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import run_git
 from kasa.memory.index import MemoryIndex, blob_sha
+from kasa.memory.lease import INDEX_LEASE_NAME, Lease, LeaseError
 from kasa.store import Store
 
 
@@ -361,3 +362,48 @@ def test_blob_sha_matches_git(tmp_path: Path) -> None:
 
     expected = run_git("hash-object", str(path)).stdout.strip()
     assert blob_sha(content) == expected
+
+
+# -- one rebuild at a time (#95) ----------------------------------------------
+
+
+async def test_a_second_reindex_is_refused_rather_than_interleaved(
+    repo: Path, store: Store
+) -> None:
+    """#95. `_replace` is delete-then-insert, and SQLite makes each statement
+    atomic rather than the pair — so two runs both saw a path as absent and
+    both inserted, and the loser died on `UNIQUE constraint failed: chunks.id`.
+    """
+    add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    index = MemoryIndex(store, repo)
+
+    held = await Lease(store, index._lock_path(), name=INDEX_LEASE_NAME).acquire()
+    try:
+        with pytest.raises(LeaseError) as caught:
+            await index.reindex()
+    finally:
+        await held.release()
+
+    assert "index rebuild lease" in str(caught.value)
+    assert "memory write lease" not in str(caught.value), "it names the lease it is about"
+
+
+async def test_the_lease_is_released_and_the_next_run_works(repo: Path, store: Store) -> None:
+    add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    index = MemoryIndex(store, repo)
+
+    assert (await index.reindex()).indexed
+    assert await store.get_lease(INDEX_LEASE_NAME) is None
+    assert (await index.reindex(full=True)).indexed, "and again"
+
+
+async def test_the_lock_is_not_put_in_the_repo(repo: Path, store: Store) -> None:
+    """It guards the database, which is what a second run corrupts. Putting it
+    in the repo meant fabricating a `.git` directory for a tree that had none,
+    which git then reads as a broken repository."""
+    await MemoryIndex(store, repo).reindex()
+
+    assert not (repo / ".git").exists()
+    assert MemoryIndex(store, repo)._lock_path() == Path(store.path).parent / (
+        f".{Path(store.path).name}.index.lock"
+    )
