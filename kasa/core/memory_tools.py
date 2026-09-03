@@ -72,10 +72,15 @@ def _search_tool(retriever: Retriever) -> Tool:
         # prompt under `# Pinned memory`. Leading with one answered a question
         # nobody asked, and spent a result slot doing it. A pinned memory that
         # does match the query still ranks, and still gets its pinned bonus.
-        retrieval = await retriever.retrieve(query, scope=scope, include_pinned=False)
+        # The limit is passed down rather than applied to the result. The
+        # retriever's own limit is how many memories fit in a prompt beside the
+        # conversation; slicing what it had already packed to that bound meant
+        # `limit` could only ever shrink a list of eight, and a request for
+        # twenty was answered with eight and no indication of it (#61).
+        retrieval = await retriever.retrieve(query, scope=scope, include_pinned=False, limit=limit)
         if not retrieval.kept:
             return f"No memories matched {query!r}."
-        return "\n\n".join(render_snippet(c) for c in retrieval.kept[:limit])
+        return "\n\n".join(render_snippet(c) for c in retrieval.kept)
 
     return Tool(
         name="memory_search",

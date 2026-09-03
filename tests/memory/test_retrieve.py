@@ -18,7 +18,13 @@ from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
-from kasa.memory.retrieve import Retriever, build_match, is_self_contained, permits
+from kasa.memory.retrieve import (
+    DEFAULT_LIMIT,
+    Retriever,
+    build_match,
+    is_self_contained,
+    permits,
+)
 from kasa.store import Store
 
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
@@ -737,3 +743,29 @@ async def test_a_question_that_finds_nothing_says_so(
     )
     assert "none matched" in rendered
     assert "nothing was injected" in rendered
+
+
+async def test_a_caller_can_ask_for_more_memories_than_a_prompt_holds(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """#61. `DEFAULT_LIMIT` bounds what fits in a prompt, not what can be found."""
+    search = retriever(store, tokenizer)
+    question = "deploy billing postgres review incident wifi kasa credentials retrospective"
+
+    default = await search.retrieve(question)
+    assert len(default.kept) == DEFAULT_LIMIT
+
+    wider = await search.retrieve(question, limit=10)
+    assert len(wider.kept) == 10
+    # Still one chunk per memory, and still in rank order.
+    assert wider.memory_ids == sorted(set(wider.memory_ids), key=wider.memory_ids.index)
+    assert wider.kept[: len(default.kept)] == default.kept
+
+
+async def test_a_smaller_limit_still_takes_the_best_ones(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    search = retriever(store, tokenizer)
+    narrow = await search.retrieve("who owns the deploy pipeline", limit=2)
+    assert len(narrow.kept) == 2
+    assert corpus["Jane Okafor"] in narrow.memory_ids
