@@ -129,7 +129,7 @@ PLAN_ADAPTER: TypeAdapter[list[MemoryPatch]] = TypeAdapter(list[MemoryPatch])
 _IMMUTABLE = frozenset({"id", "created", "updated"})
 
 
-def parse_plan(payload: object) -> list[MemoryPatch]:
+def parse_plan(payload: object, *, job: str = "consolidation") -> list[MemoryPatch]:
     """Validate a model's raw output into a typed plan.
 
     An unknown `type`, a missing field, or a malformed document is rejected
@@ -138,7 +138,12 @@ def parse_plan(payload: object) -> list[MemoryPatch]:
     try:
         return PLAN_ADAPTER.validate_python(payload)
     except Exception as exc:
-        raise PatchError([Rejection(f"not a valid patch plan: {_first_line(exc)}")]) from exc
+        rejection = Rejection(f"not a valid patch plan: {_first_line(exc)}")
+        # Parse failures used to disappear before PatchCompiler had a chance to
+        # log them. They are the most likely shape of a successful injection:
+        # prose, a shell command, or an invented operation instead of a plan.
+        log.warning("rejected a %s patch plan:\n  - %s\nplan was: %r", job, rejection, payload)
+        raise PatchError([rejection]) from exc
 
 
 # -- compiling ---------------------------------------------------------------
