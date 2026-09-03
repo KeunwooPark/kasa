@@ -261,6 +261,21 @@ async def test_an_expired_lease_is_not_handed_back_to_the_drainer_still_running_
     assert await inbox.counts() == {"done": 1}
 
 
+async def test_a_lease_can_be_narrowed_to_one_row(store: Store) -> None:
+    """`only` is on the shared drainer for the job queue's sake — `kasa job
+    run` runs the row it queued and not the backlog of its kind (#127). The
+    inbox has no caller for it yet, and an untested branch is one that stops
+    working quietly, so this is that caller."""
+    inbox = Inbox(store, lease_ttl=30.0)
+    first = (await inbox.enqueue(event("E1"))).id
+    await inbox.enqueue(event("E2"))
+
+    leased = await inbox.lease(limit=10, only=[first])
+
+    assert [item.id for item in leased] == [first]
+    assert await inbox.counts() == {"leased": 1, "pending": 1}, "the other was left alone"
+
+
 async def test_a_lease_we_hand_ourselves_does_not_spend_an_attempt(store: Store) -> None:
     """The same row, one delivery, and the count that decides how many more it
     gets. `attempts` counts leases so that a message which kills its process
@@ -292,10 +307,12 @@ async def test_a_batch_of_only_our_own_rows_polls_rather_than_spins(store: Store
     leases = 0
     taken = inbox.lease
 
-    async def counted(*, limit: int = 1, exclude: Sequence[Any] = ()) -> list[LeasedEvent]:
+    async def counted(
+        *, limit: int = 1, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
+    ) -> list[LeasedEvent]:
         nonlocal leases
         leases += 1
-        return await taken(limit=limit, exclude=exclude)
+        return await taken(limit=limit, exclude=exclude, only=only)
 
     inbox.lease = counted  # type: ignore[method-assign]
 

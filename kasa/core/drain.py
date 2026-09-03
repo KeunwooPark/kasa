@@ -42,7 +42,9 @@ class WorkQueue[ItemT: Leased](Protocol):
 
     def subscribe(self, callback: Callable[[], None]) -> None: ...
 
-    async def lease(self, *, limit: int, exclude: Sequence[Any] = ()) -> list[ItemT]: ...
+    async def lease(
+        self, *, limit: int, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
+    ) -> list[ItemT]: ...
 
     async def renew(self, ids: Sequence[Any]) -> None: ...
 
@@ -122,21 +124,25 @@ class Drainer[ItemT: Leased]:
             await asyncio.gather(keepalive, return_exceptions=True)
             await self._settle()
 
-    async def drain_once(self) -> int:
+    async def drain_once(self, *, only: Sequence[Any] = ()) -> int:
         """Run everything currently due and wait for it.
 
         The synchronous shape of the loop above, for callers that want the
         queue empty before they look at the result — tests, and the commands
         that are not the daemon.
+
+        `only` narrows it to specific ids, for a caller that queued one item
+        and wants that item run rather than everything of its kind that
+        happens to be due (#127).
         """
-        started = await self._start_batch()
+        started = await self._start_batch(only=only)
         if started:
             await asyncio.gather(*list(self._in_flight.values()))
         return started
 
     # -- internals -----------------------------------------------------------
 
-    async def _start_batch(self) -> int:
+    async def _start_batch(self, *, only: Sequence[Any] = ()) -> int:
         free = self._concurrency - len(self._in_flight)
         if free <= 0:
             return 0
@@ -148,7 +154,8 @@ class Drainer[ItemT: Leased]:
         # filtering the answer is what keeps `attempts` honest: the lease is
         # the thing that spends one, and a lease we hand ourselves is neither a
         # delivery nor a process that died holding the row (#126).
-        for item in await self._queue.lease(limit=free, exclude=list(self._in_flight)):
+        leased = await self._queue.lease(limit=free, exclude=list(self._in_flight), only=only)
+        for item in leased:
             if item.id in self._in_flight:  # pragma: no cover - belt to the braces above
                 # Reachable only if a queue ignores `exclude`. Running it again
                 # would answer the same message twice, and the second task

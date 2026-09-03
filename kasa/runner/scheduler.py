@@ -147,7 +147,9 @@ class JobQueue:
                 callback()
         return Queued(id=identifier, duplicate=not inserted)
 
-    async def lease(self, *, limit: int = 1, exclude: Sequence[Any] = ()) -> list[Job]:
+    async def lease(
+        self, *, limit: int = 1, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
+    ) -> list[Job]:
         now = datetime.now(UTC)
         rows = await self._store.lease_jobs(
             kinds=self.kinds,
@@ -155,6 +157,7 @@ class JobQueue:
             now=_stamp(now),
             lease_until=_stamp(now + timedelta(seconds=self._lease_ttl)),
             exclude=[str(item_id) for item_id in exclude],
+            only=[str(item_id) for item_id in only],
         )
         return [
             Job(
@@ -287,20 +290,21 @@ class Scheduler:
         leases, retries and dead-letters exactly like one the scheduler picked
         up — the difference is only who is waiting for it.
 
-        Which means draining until *this* row has been attempted, not draining
-        once. `lease` takes the oldest runnable rows of the kind, ordered by
-        `run_after`, so a row queued just now is behind anything of the same
-        kind already due: one pass need not reach it, and reporting on a row
-        nobody ran is worse than taking a moment longer. The rows ahead of it
-        run on the way past, which is a drainer doing its job.
+        One row: the one this call queued. `lease` orders by `run_after`, so a
+        row queued just now is behind everything of its kind already due —
+        #117 reached it by draining until it had been attempted, which runs
+        that whole backlog on the way past. Each of those calls a frontier
+        model, and none of them is what the person typing this asked for
+        (#127). Naming the row instead reports on the right one *and* runs only
+        it, which is what the command has always said it does.
+
+        Still a lease, so the row retries and dead-letters exactly as it would
+        under the daemon. A zero here means the row was not ours to run —
+        held by another process — and what is there is worth more than
+        spinning until the lease expires.
         """
         job_id = await self.trigger(kind, payload)
-        while not await self._attempted(job_id):
-            if await self._drainer.drain_once() == 0:
-                # Nothing of this kind is runnable at all, so our row is not
-                # ours to run — held by another process, or not yet due. Say
-                # what is there rather than spin waiting for it.
-                break
+        await self._drainer.drain_once(only=[job_id])
         return await self._row(job_id)
 
     async def schedule_due(self, *, now: datetime | None = None) -> list[str]:
@@ -344,11 +348,6 @@ class Scheduler:
     async def _row(self, job_id: str) -> dict[str, Any]:
         rows = await self._store.raw("SELECT * FROM jobs WHERE id = ?", (job_id,))
         return rows[0]
-
-    async def _attempted(self, job_id: str) -> bool:
-        """Whether this row has been leased. A lease is what runs it, and a
-        drainer that leased it also waited for it, so the row is settled."""
-        return bool((await self._row(job_id))["attempts"])
 
     def _require(self, kind: str) -> JobSpec:
         if (spec := self._specs.get(kind)) is None:
