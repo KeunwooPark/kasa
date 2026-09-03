@@ -441,9 +441,43 @@ async def test_refresh_manifest_rebuilds_and_commits_it(memory: MemoryStore, clo
 
     result = await memory.refresh_manifest()
 
-    assert result.rebuilt and result.memories == 1 and result.was == 0
+    assert result.rebuilt and result.memories == 1
+    assert (result.added, result.removed, result.updated) == (1, 0, 0)
+    assert result.summary() == "manifest rebuilt: 1 memories (1 added)"
     assert len(Manifest.load(clone)) == 1
     assert result.sha, "the repair is committed, not left dirty for the next write to stash"
+
+
+async def test_an_edited_memory_is_reported_as_an_update_not_a_count(
+    memory: MemoryStore, clone: Path
+) -> None:
+    """#58. Drift compares whole entries, so an edit changes no count at all."""
+    path, content = a_memory(title="Ada Achebe")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+    await memory.refresh_manifest()
+
+    (clone / path).write_text(content + "\nShe also runs the Q4 release.\n")
+    result = await memory.refresh_manifest()
+
+    assert result.rebuilt
+    assert (result.added, result.removed, result.updated) == (0, 0, 1)
+    assert result.summary() == "manifest rebuilt: 1 memories (1 updated)"
+
+
+async def test_a_memory_gone_from_disk_is_reported_as_removed(
+    memory: MemoryStore, clone: Path
+) -> None:
+    path, content = a_memory(title="Temporary note")
+    (clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (clone / path).write_text(content)
+    await memory.refresh_manifest()
+
+    (clone / path).unlink()
+    result = await memory.refresh_manifest()
+
+    assert (result.added, result.removed, result.updated) == (0, 1, 0)
+    assert result.summary() == "manifest rebuilt: 0 memories (1 removed)"
 
 
 async def test_refresh_manifest_is_a_no_op_when_it_already_describes_the_repo(
@@ -457,6 +491,7 @@ async def test_refresh_manifest_is_a_no_op_when_it_already_describes_the_repo(
     again = await memory.refresh_manifest()
 
     assert not again.rebuilt and again.memories == 1
+    assert again.summary() == "manifest already describes all 1 memories"
     assert again.sha is None, "no empty commit"
 
 

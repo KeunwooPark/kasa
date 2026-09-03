@@ -98,8 +98,13 @@ class ManifestRefresh:
     """What `refresh_manifest` found, and what it did about it."""
 
     memories: int = 0
-    #: How many the stale manifest claimed, when it was stale.
-    was: int = 0
+    #: What the rebuild changed. Drift is detected by comparing whole entries,
+    #: so a hand-edit to one file is drift with no change in count at all — a
+    #: before/after count cannot describe that, and used to report it as a
+    #: discrepancy between two equal numbers.
+    added: int = 0
+    removed: int = 0
+    updated: int = 0
     rebuilt: bool = False
     sha: str | None = None
     problems: list[Problem] = field(default_factory=list)
@@ -107,7 +112,16 @@ class ManifestRefresh:
     def summary(self) -> str:
         if not self.rebuilt:
             return f"manifest already describes all {self.memories} memories"
-        return f"manifest rebuilt: {self.memories} memories (it claimed {self.was})"
+        changes = ", ".join(
+            f"{count} {label}"
+            for count, label in (
+                (self.added, "added"),
+                (self.removed, "removed"),
+                (self.updated, "updated"),
+            )
+            if count
+        )
+        return f"manifest rebuilt: {self.memories} memories ({changes})"
 
 
 @dataclass(slots=True)
@@ -221,7 +235,17 @@ class MemoryStore:
         finally:
             await lease.release()
         return ManifestRefresh(
-            memories=len(after), was=len(before), rebuilt=True, sha=sha, problems=problems
+            memories=len(after),
+            added=len(after.memories.keys() - before.memories.keys()),
+            removed=len(before.memories.keys() - after.memories.keys()),
+            updated=sum(
+                1
+                for memory_id, entry in after.memories.items()
+                if memory_id in before.memories and before.memories[memory_id] != entry
+            ),
+            rebuilt=True,
+            sha=sha,
+            problems=problems,
         )
 
     # -- writing -------------------------------------------------------------
