@@ -53,7 +53,19 @@ def _reindex(cfg: Config, store: Store) -> JobHandler:
             # rather than by another reindex, and nothing else will rebuild the
             # manifest afterwards — so that one is a retry, and the backoff is
             # long enough for the write to finish.
-            log.info("reindex: another rebuild already holds the lease (%s); leaving it to it", exc)
+            #
+            # `LeaseError` and nothing wider. A filesystem that cannot lock at
+            # all raises `LockingUnavailable`, which is not a `LeaseError`
+            # precisely so that it lands here as a failure: nobody holds the
+            # lock, nobody else is doing this work, and reporting `done` would
+            # be a lie about an index that is still empty (#124).
+            # WARNING, not INFO: this is a pass that did not run, and `kasa job
+            # run` configures logging at ERROR without `-v`, so the one line
+            # explaining why the job reported `done` without indexing anything
+            # was below the threshold of every command that prints it.
+            log.warning(
+                "reindex: another rebuild already holds the lease (%s); leaving it to it", exc
+            )
             return
         manifest = await memory.refresh_manifest()
         log.info("reindex: %s; %s", result.summary(), manifest.summary())

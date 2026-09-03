@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -61,6 +65,52 @@ async def test_a_reindex_that_loses_the_lease_is_done_rather_than_failed(
         await only_spec(cfg, store).handler(Job(id="j1", kind="reindex", payload={}, attempts=1))
     finally:
         await held.release()
+
+
+async def test_a_reindex_that_cannot_lock_at_all_is_not_reported_as_done(
+    clone: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#116 reads a lost index lease as "another rebuild is doing this work".
+
+    On a filesystem where `flock` fails rather than blocks — NFS with no lock
+    daemon, some FUSE mounts — nothing was holding it and nothing else was
+    going to do the work. The row said `done`, the index stayed empty, and the
+    explanation was logged at INFO, which `kasa job run` does not print
+    without `-v`: broken, silent, and reporting success.
+    """
+    real_flock = fcntl.flock
+
+    def enolck(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", enolck)
+    cfg = config_for(clone)
+
+    row = await Scheduler(store, default_specs(cfg, store)).run_now("reindex")
+
+    assert row["state"] != "done", "nothing was indexed; saying otherwise is the bug"
+    assert "No locks available" in str(row["last_error"])
+    assert (await store.raw("SELECT COUNT(*) AS n FROM chunks"))[0]["n"] == 0
+
+
+async def test_the_skip_for_a_lease_someone_else_holds_is_said_out_loud(
+    clone: Path, store: Store, caplog: Any
+) -> None:
+    """Doing nothing is the right call there, but it is still a pass that did
+    not run, and INFO is below what `kasa job run` prints without `-v`."""
+    cfg = config_for(clone)
+    index = MemoryIndex(store, clone)
+    held = await Lease(store, index._lock_path(), name=INDEX_LEASE_NAME).acquire()
+    try:
+        job = Job(id="j1", kind="reindex", payload={}, attempts=1)
+        with caplog.at_level("WARNING", logger="kasa.runner.jobs"):
+            await only_spec(cfg, store).handler(job)
+    finally:
+        await held.release()
+
+    assert "another rebuild already holds the lease" in caplog.text
 
 
 async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
