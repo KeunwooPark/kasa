@@ -113,9 +113,15 @@ def reindex(
             raise typer.Exit(1)
         async with await Store.open(cfg.store.resolved()) as store:
             result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(full=full)
+            # Both artifacts are derived from the repo, and rebuilding only the
+            # SQLite half is what let them disagree about which memories exist.
+            manifest = await (await MemoryStore.open(cfg, store)).refresh_manifest()
         console.print(result.summary())
+        console.print(f"[dim]{manifest.summary()}[/dim]")
         for problem in result.problems:
             err.print(f"[yellow]![/yellow] could not index {problem}")
+        for broken in manifest.problems:
+            err.print(f"[yellow]![/yellow] {broken.path}: {broken.reason}")
 
     _run(main())
 

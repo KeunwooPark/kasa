@@ -11,7 +11,9 @@ from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
+from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo
+from kasa.memory.manifest import Manifest
 from kasa.store import Store
 from tests.conftest import mock_client
 
@@ -231,3 +233,39 @@ async def test_startup_skips_when_no_repo_is_configured() -> None:
 async def test_startup_skips_a_plain_git_url(tmp_path: Path) -> None:
     """Nothing to ask GitHub about; init already warned when it was configured."""
     await verify_repo_visibility(config_for(tmp_path, repo="git@example.test:a/b.git"))
+
+
+# -- the manifest ------------------------------------------------------------
+
+
+async def test_a_manifest_that_does_not_describe_the_repo_is_reported(
+    tmp_path: Path, clone: Path
+) -> None:
+    """Index freshness alone called this system healthy, which is how #43 hid.
+
+    Retrieval reads SQLite and sees every file on disk; id resolution reads the
+    manifest and sees only what it lists. Nothing compared the two.
+    """
+    doc = MemoryDoc.new(type="fact", title="Written by hand", body="Not by a patch.")
+    target = clone / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "manifest") is Status.WARN
+    assert "reindex" in detail_of(report, "manifest")
+
+
+async def test_a_manifest_in_step_with_the_repo_passes(tmp_path: Path, clone: Path) -> None:
+    doc = MemoryDoc.new(type="fact", title="Recorded", body="By a patch, notionally.")
+    target = clone / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+    rebuilt, _ = Manifest.rebuild(clone)
+    rebuilt.save(clone)
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "manifest") is Status.OK
+    assert "1 memories resolvable" in detail_of(report, "manifest")

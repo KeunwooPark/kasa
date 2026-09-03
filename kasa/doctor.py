@@ -19,9 +19,11 @@ from kasa.config import Config, config_path, default_key_env
 from kasa.errors import ConfigError, GitHubError, KasaError
 from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
+from kasa.memory.document import MemoryError_
 from kasa.memory.gitcmd import GitRepo, git_available
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LEASE_NAME, LOCK_FILENAME, stale_lease
+from kasa.memory.manifest import Manifest
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ async def diagnose(
     checks += _models(cfg)
     checks += await _memory_repo(cfg, github=github)
     checks += await _store_checks(cfg)
+    checks.append(_manifest(cfg))
     checks += _not_yet()
     return Report(tuple(checks))
 
@@ -232,6 +235,40 @@ async def _index(cfg: Config, store: Store) -> Check:
         Status.OK,
         f"{stats['chunks']} chunk(s) across {stats['memories']} memories",
     )
+
+
+def _manifest(cfg: Config) -> Check:
+    """Whether `.kasa/manifest.json` still describes the repo.
+
+    Index freshness alone reported a healthy system while the manifest was
+    empty, which is how #43 stayed invisible: retrieval reads SQLite and sees
+    every file, `memory_read` resolves through the manifest and sees only what
+    it lists.
+    """
+    if not cfg.ltm.configured:
+        return Check("manifest", Status.SKIP, "no memory repo")
+    root = cfg.ltm.resolved_clone_path()
+    if not root.exists():
+        return Check("manifest", Status.SKIP, "no clone")
+
+    try:
+        manifest = Manifest.load(root)
+    except MemoryError_ as exc:
+        return Check("manifest", Status.FAIL, str(exc))
+
+    rebuilt, problems = Manifest.rebuild(root)
+    if problems:
+        listed = ", ".join(f"{p.path} ({p.reason})" for p in problems[:3])
+        return Check("manifest", Status.WARN, f"{len(problems)} unreadable file(s): {listed}")
+    if not manifest.accounts_for(root):
+        missing = len(rebuilt) - len(manifest)
+        drift = f"{abs(missing)} memories {'missing from' if missing > 0 else 'stale in'} it"
+        return Check(
+            "manifest",
+            Status.WARN,
+            f"does not describe the repo — {drift}; run `kasa reindex`",
+        )
+    return Check("manifest", Status.OK, f"{len(manifest)} memories resolvable by id")
 
 
 async def _lease(cfg: Config, store: Store) -> Check:
