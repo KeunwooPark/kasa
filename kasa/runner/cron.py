@@ -41,6 +41,12 @@ class Cron:
     #: that as "either day matches", not "both" — `0 0 1 * 1` is the first of
     #: the month and every Monday, which is surprising until you have been
     #: caught by it once.
+    #:
+    #: "Narrowed" is decided the way Vixie decides it: a field *beginning* with
+    #: `*` is unrestricted, whatever follows. So `*/2` in day-of-month keeps
+    #: the relation AND, and `0 0 */2 * 1` fires on Mondays that fall on an odd
+    #: day rather than on every other day *or* every Monday. Reading it as
+    #: restricted, which the obvious `!= "*"` does, yields a much larger set.
     either_day: bool
     expression: str
 
@@ -62,7 +68,7 @@ class Cron:
             days=values[2],
             months=values[3],
             weekdays=values[4],
-            either_day=fields[2] != "*" and fields[4] != "*",
+            either_day=not fields[2].startswith("*") and not fields[4].startswith("*"),
             expression=expression,
         )
 
