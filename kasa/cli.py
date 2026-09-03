@@ -19,6 +19,7 @@ from kasa.adapters.cli import run_repl
 from kasa.config import Config, config_path, load_config
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
+from kasa.core.inbox import Inbox
 from kasa.core.memory_tools import memory_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
@@ -41,6 +42,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="Database maintenance.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+inbox_app = typer.Typer(help="The durable ingress queue.", no_args_is_help=True)
+app.add_typer(inbox_app, name="inbox")
 
 console = Console()
 #: Everything on stderr is a single diagnostic line, never a table, and it
@@ -242,6 +245,63 @@ def cost(config: ConfigOption = None) -> None:
                     f"{usd:.4f}" if usd else "[dim]unpriced[/dim]",
                 )
             console.print(table)
+
+    _run(main())
+
+
+#: Printed in this order whatever the database returns, so a state with no rows
+#: reads as zero rather than as a missing line.
+INBOX_STATES = ("pending", "leased", "done", "failed")
+
+
+@inbox_app.command("status")
+def inbox_status(config: ConfigOption = None) -> None:
+    """Show what is queued, and what stopped being retried.
+
+    `failed` is the one to read. Those are messages somebody sent that Kasa
+    gave up on, and nothing retries them until `kasa inbox retry` says so.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            inbox = Inbox(store)
+            counts = await inbox.counts()
+            failed = await inbox.dead_letters()
+        if not counts:
+            console.print("[dim]nothing has arrived yet[/dim]")
+            return
+        table = Table(show_header=True)
+        table.add_column("state", no_wrap=True)
+        table.add_column("events", no_wrap=True)
+        for state in INBOX_STATES:
+            table.add_row(state, str(counts.get(state, 0)))
+        console.print(table)
+        for row in failed:
+            err.print(
+                f"[red]![/red] {row['id']} {row['source']}:{row['external_id']}"
+                f" after {row['attempts']} attempt(s) — {row['last_error']}"
+            )
+
+    _run(main())
+
+
+@inbox_app.command("retry")
+def inbox_retry(config: ConfigOption = None) -> None:
+    """Put every dead-lettered event back in the queue.
+
+    Dead-lettering is a pause for a human, not a delete: the message is still
+    there, with its payload, and this is how it gets another five attempts.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            revived = await Inbox(store).revive()
+        if revived:
+            console.print(f"requeued {revived} event(s)")
+        else:
+            console.print("[dim]no dead letters[/dim]")
 
     _run(main())
 

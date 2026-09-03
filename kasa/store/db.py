@@ -306,6 +306,176 @@ class Store:
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
+    # -- inbox ---------------------------------------------------------------
+    #
+    # The state machine, in one place, because every method below is a move in
+    # it: pending -> leased -> done, with leased -> pending on expiry or a
+    # retry, and pending -> failed once the attempts run out. `lease_until`
+    # means "not before" in every state it is set in, which is what lets one
+    # index answer "what is deliverable now".
+
+    async def enqueue_inbox(
+        self, *, source: str, external_id: str, payload: str
+    ) -> tuple[int, bool]:
+        """Queue an event, or report the id of the one already queued.
+
+        The insert is the dedupe. Two adapters racing on the same provider
+        retry both end up here; one inserts, the other conflicts, and both are
+        told which row won, so neither has to decide what to do about it.
+        """
+        cur = await self._conn.execute(
+            "INSERT INTO inbox (source, external_id, payload, received_at, state)"
+            " VALUES (?, ?, ?, ?, 'pending')"
+            " ON CONFLICT (source, external_id) DO NOTHING",
+            (source, external_id, payload, _now()),
+        )
+        await self._conn.commit()
+        if cur.rowcount and cur.lastrowid is not None:
+            return int(cur.lastrowid), False
+        async with self._conn.execute(
+            "SELECT id FROM inbox WHERE source = ? AND external_id = ?", (source, external_id)
+        ) as existing:
+            row = await existing.fetchone()
+        if row is None:  # pragma: no cover - the conflict proves the row exists
+            raise StoreError(f"inbox row for {source}:{external_id} vanished mid-enqueue")
+        return int(row["id"]), True
+
+    async def lease_inbox(self, *, limit: int, now: str, lease_until: str) -> list[dict[str, Any]]:
+        """Claim up to `limit` deliverable rows, oldest first.
+
+        One statement, so two drainers cannot claim the same row: SQLite makes
+        the UPDATE atomic and RETURNING hands back exactly what it changed.
+
+        `attempts` counts leases, not failures. A message that kills the process
+        that is answering it leaves no failure behind to count, and counting
+        only failures is how such a message loops forever.
+        """
+        async with self._conn.execute(
+            "UPDATE inbox SET state = 'leased', lease_until = ?, attempts = attempts + 1"
+            " WHERE id IN (("
+            "   SELECT id FROM inbox"
+            "   WHERE (state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
+            "      OR (state = 'leased' AND lease_until <= ?)"
+            "   ORDER BY id LIMIT ?"
+            " ))"
+            " RETURNING id, payload, attempts",
+            (lease_until, now, now, limit),
+        ) as cur:
+            rows = [dict(row) for row in await cur.fetchall()]
+        await self._conn.commit()
+        return rows
+
+    async def renew_inbox(self, ids: Sequence[int], *, lease_until: str) -> None:
+        """Push the expiry out on rows still being worked on."""
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        await self._conn.execute(
+            f"UPDATE inbox SET lease_until = ? WHERE state = 'leased' AND id IN ({placeholders})",
+            (lease_until, *ids),
+        )
+        await self._conn.commit()
+
+    async def complete_inbox(self, inbox_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE inbox SET state = 'done', lease_until = NULL, last_error = NULL WHERE id = ?",
+            (inbox_id,),
+        )
+        await self._conn.commit()
+
+    async def retry_inbox(self, inbox_id: int, *, error: str, not_before: str) -> None:
+        await self._conn.execute(
+            "UPDATE inbox SET state = 'pending', lease_until = ?, last_error = ? WHERE id = ?",
+            (not_before, error, inbox_id),
+        )
+        await self._conn.commit()
+
+    async def fail_inbox(self, inbox_id: int, *, error: str) -> None:
+        """Dead-letter a row. Nothing retries it until somebody says so."""
+        await self._conn.execute(
+            "UPDATE inbox SET state = 'failed', lease_until = NULL, last_error = ? WHERE id = ?",
+            (error, inbox_id),
+        )
+        await self._conn.commit()
+
+    async def release_inbox(self, ids: Sequence[int]) -> None:
+        """Hand rows back unfinished, as a clean shutdown does.
+
+        The attempt is given back with them. Stopping the daemon is not the
+        message's fault, and a queue that dead-letters its backlog after five
+        deploys is worse than no bound at all.
+        """
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        await self._conn.execute(
+            "UPDATE inbox SET state = 'pending', lease_until = NULL,"
+            " attempts = MAX(attempts - 1, 0)"
+            f" WHERE state = 'leased' AND id IN ({placeholders})",
+            tuple(ids),
+        )
+        await self._conn.commit()
+
+    async def reclaim_inbox(self, *, now: str | None = None) -> list[dict[str, Any]]:
+        """Make rows a stopped process was holding deliverable again.
+
+        With `now`, only rows whose lease has already expired — the safe
+        reading when somebody else may still be working. Without it, every
+        leased row, which is what a sole drainer may assume at startup.
+
+        The attempt is *not* given back. A message that kills whatever is
+        answering it leaves no failure behind to count, so the lease it burned
+        is the only record that it was tried, and giving it back is how such a
+        message loops forever.
+        """
+        clause = " AND lease_until <= ?" if now is not None else ""
+        params: tuple[Any, ...] = (now,) if now is not None else ()
+        async with self._conn.execute(
+            "UPDATE inbox SET state = 'pending', lease_until = NULL"
+            f" WHERE state = 'leased'{clause}"
+            " RETURNING id, source, external_id, attempts",
+            params,
+        ) as cur:
+            rows = [dict(row) for row in await cur.fetchall()]
+        await self._conn.commit()
+        return rows
+
+    async def inbox_counts(self) -> dict[str, int]:
+        async with self._conn.execute(
+            "SELECT state, COUNT(*) AS n FROM inbox GROUP BY state"
+        ) as cur:
+            return {row["state"]: int(row["n"]) for row in await cur.fetchall()}
+
+    async def inbox_failed(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with self._conn.execute(
+            "SELECT id, source, external_id, received_at, attempts, last_error FROM inbox"
+            " WHERE state = 'failed' ORDER BY id LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def revive_inbox_failed(self) -> int:
+        """Put every dead letter back in the queue with a fresh attempt budget."""
+        cur = await self._conn.execute(
+            "UPDATE inbox SET state = 'pending', attempts = 0, lease_until = NULL"
+            " WHERE state = 'failed'"
+        )
+        await self._conn.commit()
+        return int(cur.rowcount)
+
+    async def purge_inbox(self, *, before: str) -> int:
+        """Drop delivered rows older than `before`.
+
+        Only `done` rows, and only old ones. A delivered row is still the
+        dedupe record for its event id, so purging eagerly is how a late
+        provider retry gets answered a second time.
+        """
+        cur = await self._conn.execute(
+            "DELETE FROM inbox WHERE state = 'done' AND received_at < ?", (before,)
+        )
+        await self._conn.commit()
+        return int(cur.rowcount)
+
     # -- leases --------------------------------------------------------------
 
     async def take_lease(

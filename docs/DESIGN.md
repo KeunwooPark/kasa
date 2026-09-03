@@ -115,6 +115,17 @@ adapter writes an `inbox` row, acks, and returns. A separate dispatcher drains
 The payoff beyond latency: a crash mid-turn replays from `inbox` instead of
 losing the message.
 
+Delivery is therefore at-least-once. Marking a row done before the work happens
+would make it at-most-once, and a chat assistant that silently drops a message
+is worse than one that answers twice. The duplicate that actually happens in
+production is the provider re-sending an event, and `UNIQUE (source,
+external_id)` is what stops that one.
+
+`attempts` counts leases rather than failures. A message that kills the process
+answering it leaves no failure behind to count, so the lease it burned is the
+only record that it was ever tried — and without that record it is retried
+forever.
+
 ### 3.2 One actor per thread
 
 Session key is the Slack `thread_ts` (or `ts` for a new thread). Each session has
@@ -135,11 +146,12 @@ CREATE TABLE inbox (
   id            INTEGER PRIMARY KEY,
   source        TEXT NOT NULL,          -- 'slack' | 'cli' | 'http'
   external_id   TEXT NOT NULL,          -- provider event id, for dedupe
-  payload       TEXT NOT NULL,          -- raw JSON
+  payload       TEXT NOT NULL,          -- the normalized InboundEvent, as JSON
   received_at   TEXT NOT NULL,
   state         TEXT NOT NULL,          -- pending | leased | done | failed
-  lease_until   TEXT,
+  lease_until   TEXT,                   -- pending: not before. leased: expires at.
   attempts      INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
   UNIQUE (source, external_id)
 );
 
@@ -774,5 +786,7 @@ kasa why "<question>"         show the retrieval trace
 kasa memory search "<q>"      search LTM from the terminal
 kasa memory show <id>         print a memory file
 kasa job run <kind>           run a consolidation job on demand
+kasa inbox status             what is queued, and what stopped being retried
+kasa inbox retry              requeue every dead-lettered event
 kasa doctor                   check config, tokens, repo privacy, lease state
 ```

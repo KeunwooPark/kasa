@@ -18,6 +18,8 @@ from typer.testing import CliRunner
 
 from kasa import __version__
 from kasa.cli import app
+from kasa.core.events import InboundEvent
+from kasa.core.inbox import Inbox
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import Usage
 from kasa.memory.bootstrap import bootstrap
@@ -257,3 +259,55 @@ def test_the_cost_table_does_not_truncate_the_model_name(deep: Path) -> None:
         if line.count("\u2502") > 2
     ]
     assert "".join(cells) == model, result.output
+
+
+def test_inbox_status_reports_a_state_with_no_rows_as_zero(tmp_path: Path) -> None:
+    """A missing line reads as "no idea"; a zero reads as "none". The states are
+    printed in a fixed order for that reason."""
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+
+    async def seed() -> None:
+        async with await Store.open(db) as store:
+            await Inbox(store).enqueue(
+                InboundEvent(source="slack", external_id="Ev1", session_id="slack:T:C:1")
+            )
+
+    asyncio.run(seed())
+
+    result = runner.invoke(app, ["inbox", "status", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    counts = {
+        cells[1].strip(): cells[2].strip()
+        for line in result.output.splitlines()
+        if len(cells := line.split("\u2502")) > 3
+    }
+    assert counts == {"pending": "1", "leased": "0", "done": "0", "failed": "0"}
+
+
+def test_inbox_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
+    """Dead-lettering is a pause for a human. This is the human."""
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+
+    async def seed() -> None:
+        async with await Store.open(db) as store:
+            inbox = Inbox(store, max_attempts=1)
+            await inbox.enqueue(
+                InboundEvent(source="slack", external_id="Ev1", session_id="slack:T:C:1")
+            )
+            await inbox.fail((await inbox.lease())[0], "the model was down all afternoon")
+
+    asyncio.run(seed())
+
+    listed = runner.invoke(app, ["inbox", "status", "--config", str(config)])
+    assert "the model was down all afternoon" in listed.output, listed.output
+
+    result = runner.invoke(app, ["inbox", "retry", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "requeued 1 event(s)" in result.output
+
+    assert (
+        "no dead letters" in runner.invoke(app, ["inbox", "retry", "--config", str(config)]).output
+    )
