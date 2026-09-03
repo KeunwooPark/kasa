@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 import yaml
@@ -230,6 +231,31 @@ class MemoryDoc(BaseModel):
         """Where a memory of this type belongs, by convention."""
         directory = TYPE_DIRECTORY[self.frontmatter.type]
         return f"memory/{directory}/{slug or slugify(self.frontmatter.title)}.md"
+
+
+def read_memory_bytes(path: Path, *, source: str) -> bytes:
+    """Read one memory file, or raise `MemoryError_` saying why not.
+
+    Every walker over the tree finds its candidates with `rglob("*.md")`, which
+    matches anything whose *name* ends in `.md` — a directory, a broken
+    symlink, a symlink loop, a fifo — and then read it. Each of those raised an
+    `OSError` that nobody caught, so one entry somebody created by accident
+    cost the whole index and the whole manifest (#97). A fifo was worse: the
+    open blocked, and no `except` can fix that.
+
+    So the shape is checked before the read, and the read's own `OSError` — a
+    file that exists and cannot be opened, which is what `chmod 000` after a
+    restore leaves — is turned into the same `MemoryError_` the parse raises.
+    One exception type for the callers, and one `Problem` each.
+    """
+    if not path.is_file():
+        # False, and never raising, for a directory, a dangling symlink, a
+        # symlink loop and a fifo alike.
+        raise MemoryError_("not a readable file", source=source)
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise MemoryError_(f"could not be read: {exc.strerror}", source=source) from exc
 
 
 def new_memory_id() -> str:
