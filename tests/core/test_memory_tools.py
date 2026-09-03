@@ -308,8 +308,11 @@ async def test_write_enqueues_an_observation(memory: Memory, store: Store) -> No
 
     assert "queued" in result
     pending = await store.pending_observations()
+    # The subject is stored normalized: it is the key `promote` groups by, and
+    # "Bob" typed here has to meet "Bob's" extracted from a conversation. The
+    # claim is not — it is prose a person will read in a memory file.
     assert [(o["subject"], o["claim"], o["kind"]) for o in pending] == [
-        ("Bob", "Bob runs the incident rota.", "fact")
+        ("bob", "Bob runs the incident rota.", "fact")
     ]
 
 

@@ -24,12 +24,13 @@ from typing import Any
 from kasa.core.tools import Tool, ToolContext
 from kasa.memory.document import MemoryDoc, MemoryError_, is_memory_id
 from kasa.memory.ltm import MemoryStore, MemoryStoreError
+from kasa.memory.observation import OBSERVATION_KINDS
 from kasa.memory.retrieve import Retriever, permits, render_snippet
+from kasa.memory.subject import normalize_subject
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
 
-OBSERVATION_KINDS = ("fact", "preference", "decision", "task", "relation")
 
 MAX_SEARCH_LIMIT = 20
 
@@ -168,7 +169,10 @@ def _write_tool(store: Store) -> Tool:
         if kind not in OBSERVATION_KINDS:
             return f"kind must be one of {', '.join(OBSERVATION_KINDS)}."
 
-        subject = str(args["subject"]).strip()
+        # Normalized here as well as in the store, because the store cannot
+        # answer the model. A subject of "???" is a grouping key of "", and an
+        # observation nothing can ever be grouped with is one nobody will read.
+        subject = normalize_subject(str(args["subject"]))
         claim = str(args["claim"]).strip()
         # `minLength` in the schema rejects the empty string upstream, the way
         # the `kind` enum does; it cannot see a string of spaces. Both used to

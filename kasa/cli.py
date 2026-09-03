@@ -626,7 +626,7 @@ async def _serve_slack(cfg: Config) -> None:
         adapter = await SlackAdapter.connect(agent, cfg.slack)
         # The daemon is where background work belongs: it is the process that
         # stays up, and `kasa run` on a terminal is not.
-        scheduler = Scheduler(agent.store, default_specs(cfg, agent.store))
+        scheduler = Scheduler(agent.store, default_specs(cfg, agent.store, agent.registry))
         console.print(
             f"[green]Connected[/green] to Slack as {adapter.context.bot_user_id}"
             f" in {adapter.context.team_id}. Ctrl-C to stop."
