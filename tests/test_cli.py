@@ -101,6 +101,40 @@ def test_reindex_rebuilds_both_halves_once_the_repo_is_bootstrapped(
     assert chunks(tmp_path / "kasa.db") > 0
 
 
+def test_audit_lists_every_memory_by_scope_even_when_manifest_is_stale(
+    rig: tuple[Path, Path],
+) -> None:
+    config, clone = rig
+    bootstrap(clone)
+    Manifest.rebuild(clone)[0].save(clone)
+    private = MemoryDoc.new(
+        type="fact", title="Salary review", body="Private outcome.", visibility="private:U01"
+    )
+    target = clone / private.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(private.render())
+
+    result = runner.invoke(app, ["audit", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "workspace" in result.output
+    assert "private:U01" in result.output
+    assert str(private.id) in result.output
+    assert "2 memory(s) across 2 scope(s)" in result.output
+
+
+def test_audit_reports_unreadable_memories(rig: tuple[Path, Path]) -> None:
+    config, clone = rig
+    bootstrap(clone)
+    path = broken(clone, "unscoped.md")
+
+    result = runner.invoke(app, ["audit", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert path in result.stderr
+    assert "no YAML frontmatter" in result.stderr
+
+
 # -- output a shell can use (#68) --------------------------------------------
 #
 # rich falls back to 80 columns when stdout is not a terminal and hard-wraps

@@ -33,6 +33,7 @@ from kasa.memory.document import Problem
 from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
 from kasa.memory.ltm import MemoryStore, MemoryStoreError
+from kasa.memory.manifest import Manifest
 from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.runner.jobs import default_specs
@@ -205,6 +206,39 @@ def why(
         console.print(render_trace(retrieval), highlight=False, markup=False, soft_wrap=True)
 
     _run(main())
+
+
+@app.command()
+def audit(config: ConfigOption = None) -> None:
+    """List every long-term memory by visibility scope.
+
+    The corpus is read directly instead of trusting the committed manifest: an
+    audit whose input can be stale is exactly where a newly added private file
+    could disappear from view.
+    """
+    cfg = _load(config)
+    if not cfg.ltm.configured:
+        err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
+        raise typer.Exit(1)
+
+    root = cfg.ltm.resolved_clone_path()
+    manifest, problems = Manifest.rebuild(root)
+    table = Table(show_header=True)
+    table.add_column("scope", no_wrap=True)
+    table.add_column("id", no_wrap=True)
+    table.add_column("path", overflow="fold")
+    table.add_column("title", overflow="fold")
+    for memory_id, entry in sorted(
+        manifest.memories.items(), key=lambda item: (item[1].visibility, item[1].path)
+    ):
+        table.add_row(entry.visibility, memory_id, entry.path, entry.title)
+    console.print(table)
+    scope_count = len({entry.visibility for entry in manifest.memories.values()})
+    console.print(f"[dim]{len(manifest)} memory(s) across {scope_count} scope(s)[/dim]")
+    for problem in problems:
+        err.print(f"[yellow]![/yellow] {problem.path}: {problem.reason}")
+    if problems:
+        raise typer.Exit(1)
 
 
 @app.command()
