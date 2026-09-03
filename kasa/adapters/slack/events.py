@@ -27,6 +27,20 @@ _MENTION = re.compile(r"(?P<before>[ \t]*)<@(?P<user>[A-Z0-9]+)(?:\|[^>]*)?>(?P<
 #: Slack's own name for a one-to-one conversation with the bot.
 _DM = "im"
 
+#: Subtypes that are still somebody talking. Slack puts a `subtype` on a
+#: message for two quite different reasons: because of *how* it was composed —
+#: a file attached, a `/me`, a thread reply also sent to the channel — and
+#: because it is not somebody talking at all: an edit, a deletion, a join, a
+#: topic change, a pin.
+#:
+#: Named rather than excluded, because silence stays the default. Kasa answers
+#: in any thread it is already part of, so a denylist would answer every
+#: unknown subtype that turned up in one, and "Bob joined the channel" is not a
+#: question. The cost of an allowlist is that the next subtype carrying a
+#: person's words is ignored until it is added here — a line, rather than the
+#: class of bug.
+_SPOKEN_SUBTYPES = frozenset({"file_share", "me_message", "thread_broadcast"})
+
 
 @dataclass(frozen=True, slots=True)
 class SlackContext:
@@ -79,7 +93,8 @@ async def normalize(
     event: dict[str, Any], *, context: SlackContext, known_session: KnownSession
 ) -> Decision:
     """Turn one Slack event into something to answer, or say why not."""
-    if subtype := event.get("subtype"):
+    subtype = str(event.get("subtype") or "")
+    if subtype and subtype not in _SPOKEN_SUBTYPES:
         # `message_changed` and `message_deleted` are real signals, and #25 is
         # where they get handled. Until then, editing a message must not read
         # as sending a new one.
@@ -117,7 +132,7 @@ async def normalize(
             source=SOURCE,
             external_id=message_id(context.team_id, channel, ts),
             session_id=session,
-            text=_strip_mention(text, context.bot_user_id),
+            text=_with_attachments(_strip_mention(text, context.bot_user_id), event),
             scope=scope_for(channel, author, is_dm=is_dm),
             author=author,
             channel=channel,
@@ -138,6 +153,21 @@ def scope_for(channel: str, author: str, *, is_dm: bool) -> str:
     that every public channel picks up on the way in.
     """
     return f"private:{author}" if is_dm else f"channel:{channel}"
+
+
+def _with_attachments(text: str, event: dict[str, Any]) -> str:
+    """Say what came attached, since Kasa cannot open it yet.
+
+    Without this a `file_share` reaches the agent as its comment alone —
+    "what's in this?" with nothing in it, and no way to tell that a file is
+    what it is being asked about. Naming them is what lets it say it cannot
+    read them, which is the point of accepting the message at all.
+    """
+    names = [str(item.get("name") or "an untitled file") for item in event.get("files") or []]
+    if not names:
+        return text
+    attached = f"[attached, which Kasa cannot open: {', '.join(names)}]"
+    return f"{text}\n\n{attached}" if text else attached
 
 
 def _mentions(text: str, bot_user_id: str) -> bool:
