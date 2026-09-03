@@ -283,7 +283,15 @@ class PatchCompiler:
         return changes
 
     def _supersede(self, patch: Supersede, index: int, projected: Manifest) -> list[Change]:
-        self._load(patch.old_id, index, projected)
+        _, old = self._load(patch.old_id, index, projected)
+        # The successor makes the same claim as the memory it replaces, so it
+        # inherits the same audience. Without this a `private:` note can be
+        # restated as a `workspace` one and archived out of sight — which is
+        # the same leak `_update` and `_merge` already refuse, taking the
+        # scenic route.
+        self._require_no_widening(
+            old.frontmatter.visibility, patch.new.frontmatter.visibility, index
+        )
         successor = patch.new.model_copy(
             update={
                 "frontmatter": patch.new.frontmatter.model_copy(
