@@ -96,8 +96,11 @@ class Manifest(BaseModel):
             if not is_memory_path(relative):
                 continue
             try:
-                doc = MemoryDoc.parse(path.read_text(), source=relative)
-            except MemoryError_ as exc:
+                doc = MemoryDoc.parse(path.read_bytes().decode(), source=relative)
+            except (MemoryError_, UnicodeDecodeError) as exc:
+                # Decoding explicitly, and counted as a problem rather than
+                # raised: a `.md` that is not text is one broken file, and it
+                # must not cost the manifest for the whole repo.
                 problems.append(Problem(relative, str(exc)))
                 continue
             if (existing := memories.get(doc.id)) is not None:

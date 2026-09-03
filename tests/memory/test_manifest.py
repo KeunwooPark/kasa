@@ -222,3 +222,18 @@ def test_accounts_for_compares_the_manifest_against_the_files_on_disk(tmp_path: 
 
     target.unlink()
     assert not rebuilt.accounts_for(tmp_path), "and a file that went away"
+
+
+def test_a_markdown_file_that_is_not_text_is_a_problem_not_a_crash(tmp_path: Path) -> None:
+    """One broken file must not cost the manifest for the whole repo."""
+    bootstrap(tmp_path)
+    doc = MemoryDoc.new(type="fact", title="Readable", body="Fine.")
+    target = tmp_path / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+    (tmp_path / "memory" / "facts" / "binary.md").write_bytes(b"\xff\xfe\x00not utf-8")
+
+    manifest, problems = Manifest.rebuild(tmp_path)
+
+    assert manifest.resolve(doc.id) is not None
+    assert [p.path for p in problems] == ["memory/facts/binary.md"]

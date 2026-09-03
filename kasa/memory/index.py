@@ -47,6 +47,24 @@ class IndexResult:
         return ", ".join(parts)
 
 
+@dataclass(slots=True)
+class Freshness:
+    """The gap between the repo and the index, split by what can close it.
+
+    `changed` and `removed` are what a reindex would act on. `unreadable` is
+    what it would refuse again — the same list every run, which is why it must
+    not be reported as staleness.
+    """
+
+    changed: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
+
+    @property
+    def stale(self) -> bool:
+        return bool(self.changed or self.removed)
+
+
 def blob_sha(data: bytes) -> str:
     """Git's own hash for a blob.
 
@@ -89,9 +107,12 @@ class MemoryIndex:
 
             try:
                 doc = MemoryDoc.parse(raw.decode(), source=relative)
-            except MemoryError_ as exc:
+            except (MemoryError_, UnicodeDecodeError) as exc:
                 # One file somebody broke by hand must not cost the whole index.
-                log.warning("index: %s", exc)
+                # `UnicodeDecodeError` because a `.md` that is not text at all —
+                # a stray binary, a bad `git add` — used to take the command
+                # down before it reported any of the work it had already done.
+                log.warning("index: %s: %s", relative, exc)
                 result.problems.append(relative)
                 continue
 
@@ -118,15 +139,45 @@ class MemoryIndex:
             "files": int(files[0]["n"]) if files else 0,
         }
 
-    async def is_stale(self) -> bool:
-        """True when a file on disk differs from what was indexed."""
+    async def freshness(self) -> Freshness:
+        """What a reindex would do if it ran right now.
+
+        Comparing hashes alone was not enough. A file the parser refuses is
+        never written to `index_state`, so it differs from the index forever,
+        and `doctor` reported a repo that "has moved on" and prescribed
+        `kasa reindex` — a command that had already run and could not change it
+        (#69). Staleness is "a reindex would fix this"; a file that cannot be
+        parsed is a different fact, and it belongs in a different sentence.
+
+        Files whose hash matches are not parsed. The set this has to open is
+        the set that differs, which is normally empty.
+        """
         state = await self._state()
-        on_disk = {}
-        for path in (self._root / MEMORY_DIR).rglob("*.md"):
+        fresh = Freshness()
+        on_disk: set[str] = set()
+
+        for path in sorted((self._root / MEMORY_DIR).rglob("*.md")):
             relative = path.relative_to(self._root).as_posix()
-            if is_memory_path(relative):
-                on_disk[relative] = blob_sha(path.read_bytes())
-        return on_disk != state
+            if not is_memory_path(relative):
+                continue
+            on_disk.add(relative)
+
+            raw = path.read_bytes()
+            if state.get(relative) == blob_sha(raw):
+                continue
+            try:
+                MemoryDoc.parse(raw.decode(), source=relative)
+            except (MemoryError_, UnicodeDecodeError):
+                fresh.unreadable.append(relative)
+            else:
+                fresh.changed.append(relative)
+
+        fresh.removed.extend(sorted(set(state) - on_disk))
+        return fresh
+
+    async def is_stale(self) -> bool:
+        """True when a reindex would change the index."""
+        return (await self.freshness()).stale
 
     # -- internals -----------------------------------------------------------
 
