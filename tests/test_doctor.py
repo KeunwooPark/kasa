@@ -311,3 +311,28 @@ async def test_a_clean_index_says_what_it_holds(tmp_path: Path, clone: Path) -> 
     report = await diagnose(config_for(tmp_path), github=github())
 
     assert status_of(report, "index freshness") is Status.OK
+
+
+async def test_a_parked_edit_is_reported_where_somebody_would_look(
+    tmp_path: Path, clone: Path
+) -> None:
+    """#78. A write over uncommitted work stashes it and says so only in a log
+    record nothing prints. Recoverable, with nobody told there is anything to
+    recover."""
+    (clone / "memory" / "facts").mkdir(parents=True, exist_ok=True)
+    (clone / "memory" / "facts" / "by-hand.md").write_text("mid-edit\n")
+    GitRepo.at(clone).stash("kasa: uncommitted changes parked before a memory write (t)")
+
+    report = await diagnose(config_for(tmp_path), github=github())
+    detail = detail_of(report, "clone")
+
+    assert status_of(report, "clone") is Status.WARN
+    assert "1 stashed change(s)" in detail
+    assert "stash list" in detail, "and how to look at them"
+
+
+async def test_a_clone_with_nothing_parked_is_ok(tmp_path: Path, clone: Path) -> None:
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "clone") is Status.OK
+    assert "stashed" not in detail_of(report, "clone")

@@ -242,6 +242,10 @@ class GitRepo:
         self.run("stash", "push", "--include-untracked", "--message", message)
         return True
 
+    def stashes(self) -> list[str]:
+        """Every stash entry, newest first. Empty when there are none."""
+        return [line for line in self.run("stash", "list").splitlines() if line]
+
     def tracked(self, path: str) -> bool:
         return not run_git(
             "ls-files", "--error-unmatch", "--", path, cwd=self.path, check=False

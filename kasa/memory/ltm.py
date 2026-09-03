@@ -23,6 +23,7 @@ import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
@@ -277,6 +278,14 @@ class MemoryStore:
         Returns whether there was something to park. Stash rather than reset:
         the leftovers may be a crashed job's half-write, or they may be an edit
         somebody made by hand, and from here the two are indistinguishable.
+
+        Which is why the stash says only what is true of both. It used to be
+        labelled "recovered from an interrupted write", asserting the case that
+        is safe to throw away — so somebody clearing `git stash list` would
+        read a hand edit as Kasa's own debris and drop it, losing the one thing
+        stashing rather than resetting exists to protect (#78). The timestamp
+        is there because these accumulate, and two identically named entries
+        cannot be told apart.
         """
         if not self._repo.is_dirty():
             return False
@@ -284,7 +293,8 @@ class MemoryStore:
             "the memory repo at %s has uncommitted changes; stashing them before writing",
             self._repo.path,
         )
-        return self._repo.stash("kasa: recovered from an interrupted write")
+        when = datetime.now(UTC).isoformat(timespec="seconds")
+        return self._repo.stash(f"kasa: uncommitted changes parked before a memory write ({when})")
 
     # -- internals -----------------------------------------------------------
 
