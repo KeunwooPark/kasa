@@ -29,6 +29,14 @@ CONTEXT_HEADER = "# Working context"
 RETRIEVED_HEADER = "## Retrieved memory"
 EPISODE_HEADER = "## Conversation so far"
 
+#: Pinned memories stay in the cacheable prefix — they are the stable-across-
+#: turns half of retrieval — but they are still recalled material, and #45 was
+#: that they arrived fused to the end of the system prompt with no header at
+#: all. Anything the model is told to treat as background needs to be inside a
+#: section the system prompt can name; content the consolidator wrote from a
+#: conversation must not read as though the operator wrote it.
+PINNED_HEADER = "# Pinned memory"
+
 
 @dataclass(frozen=True, slots=True)
 class ContextBudget:
@@ -120,8 +128,8 @@ class ContextPacker:
     ) -> PackedContext:
         traces: list[SegmentTrace] = []
 
-        system_text, system_trace = self._pack_prefix(system_prompt, pinned, tools)
-        traces.append(system_trace)
+        system_text, prefix_traces = self._pack_prefix(system_prompt, pinned, tools)
+        traces.extend(prefix_traces)
 
         context_text, context_traces = self._pack_context(retrieved, episode_summary)
         traces.extend(context_traces)
@@ -141,7 +149,7 @@ class ContextPacker:
 
     def _pack_prefix(
         self, system_prompt: str, pinned: Sequence[str], tools: Sequence[ToolDef]
-    ) -> tuple[str, SegmentTrace]:
+    ) -> tuple[str, list[SegmentTrace]]:
         # Tool schemas are serialized into the prompt by every provider, so they
         # are charged against the system share even though they are not ours to
         # truncate.
@@ -155,17 +163,33 @@ class ContextPacker:
         pinned_budget = self.budget.tokens_for(self.budget.pinned)
 
         kept_pinned, dropped = _fit(list(pinned), pinned_budget, self._tok.count)
-        parts = [system_prompt, *kept_pinned]
+        parts = [system_prompt]
+        if kept_pinned:
+            # Labelled, not concatenated: the system prompt tells the model to
+            # treat recalled material as background rather than as instructions,
+            # and that sentence can only scope to a section it can name.
+            parts.append(PINNED_HEADER + "\n" + PINNED_SEPARATOR.join(kept_pinned))
         text = PINNED_SEPARATOR.join(p for p in parts if p)
 
-        used = self._tok.count(text) + tool_tokens
-        return text, SegmentTrace(
-            name="system",
-            budget=system_budget + pinned_budget,
-            used=used,
-            kept=len(kept_pinned),
-            dropped=dropped,
-        )
+        # Two traces, not one. Reporting the prefix as a single `system` row hid
+        # how much of it was memory rather than prompt, which is the number
+        # anyone reading `/trace` about a bloated prefix is looking for.
+        return text, [
+            SegmentTrace(
+                name="system",
+                budget=system_budget,
+                used=self._tok.count(system_prompt) + tool_tokens,
+                kept=1 if system_prompt else 0,
+                dropped=0,
+            ),
+            SegmentTrace(
+                name="pinned",
+                budget=pinned_budget,
+                used=sum(self._tok.count(p) for p in kept_pinned),
+                kept=len(kept_pinned),
+                dropped=dropped,
+            ),
+        ]
 
     def _pack_context(
         self, retrieved: Sequence[str], episode_summary: str | None
