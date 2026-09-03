@@ -56,6 +56,9 @@ HEADER_WEIGHT = 2.0
 #: How many chunks each candidate source contributes before fusion.
 SOURCE_LIMIT = 30
 
+#: How many memories belong in a prompt that also has to hold the conversation.
+#: A packing bound, not a ceiling on what retrieval can find — a caller asking an
+#: explicit question passes its own limit to `retrieve` (#61).
 DEFAULT_LIMIT = 8
 
 #: A message shorter than this, or one that opens with an anaphor, is not a
@@ -323,6 +326,7 @@ class Retriever:
         recent: Sequence[str] = (),
         explain: bool = False,
         include_pinned: bool = True,
+        limit: int | None = None,
     ) -> Retrieval:
         """Rank memories against `question`.
 
@@ -332,6 +336,13 @@ class Retriever:
         explicit query wants the opposite — see `memory_search`. Pinned
         memories that *do* match are found by the lexical query either way, and
         keep their pinned bonus.
+
+        `limit` overrides how many memories are packed. The retriever's own
+        limit is a budget for the prompt: it is how many memories fit alongside
+        a conversation, and it is the right default for the pre-injected
+        retrieval every turn pays for. A caller that has decided the prompt did
+        not have enough is asking a different question, and gets to say how many
+        answers it wants. The token budget still caps both.
         """
         query, rewritten = await self._build_query(question, recent)
         match = build_match(query)
@@ -355,7 +366,7 @@ class Retriever:
         if explain:
             trace.denied = await self._denied(match, scope)
 
-        return self._pack(ranked, trace)
+        return self._pack(ranked, trace, limit if limit is not None else self._limit)
 
     # -- query ---------------------------------------------------------------
 
@@ -509,7 +520,7 @@ class Retriever:
 
     # -- packing -------------------------------------------------------------
 
-    def _pack(self, ranked: Sequence[Candidate], trace: RetrievalTrace) -> Retrieval:
+    def _pack(self, ranked: Sequence[Candidate], trace: RetrievalTrace, limit: int) -> Retrieval:
         result = Retrieval(trace=trace)
         used = 0
         seen: set[str] = set()
@@ -520,7 +531,7 @@ class Retriever:
             # One chunk per memory. Two chunks of the same file crowd out a
             # second opinion, and the agent can read the whole file with
             # `memory_read` when it wants more.
-            if candidate.memory_id in seen or len(seen) >= self._limit:
+            if candidate.memory_id in seen or len(seen) >= limit:
                 continue
             snippet = render_snippet(candidate)
             cost = self._tok.count(snippet)

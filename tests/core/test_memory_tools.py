@@ -155,6 +155,47 @@ async def test_the_search_limit_is_capped(memory: Memory) -> None:
     assert result  # the schema caps it; the handler clamps it too
 
 
+async def stock(memory: Memory, count: int, term: str) -> None:
+    """Add `count` memories that all match `term`, and reindex."""
+    for n in range(count):
+        doc = MemoryDoc.new(
+            type="fact",
+            title=f"{term.title()} runbook step {n}",
+            body=f"Step {n} of the {term} runbook is owned by the platform team.",
+        )
+        target = memory.root / doc.suggested_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(doc.render())
+    await MemoryIndex(memory.store, memory.root).reindex()
+
+
+def snippet_count(result: str) -> int:
+    return result.count("[[mem_")
+
+
+async def test_search_returns_as_many_results_as_it_asked_for(memory: Memory) -> None:
+    """#61. The schema advertises 20; the retriever's packing limit capped it at 8."""
+    await stock(memory, 15, "escalation")
+
+    twelve = await memory.call("memory_search", {"query": "escalation runbook", "limit": 12})
+    assert snippet_count(twelve) == 12
+
+
+async def test_search_returns_five_when_it_asks_for_nothing(memory: Memory) -> None:
+    """The default is the tool's, and passing it down must not have changed it."""
+    await stock(memory, 15, "escalation")
+
+    default = await memory.call("memory_search", {"query": "escalation runbook"})
+    assert snippet_count(default) == 5
+
+
+async def test_a_limit_below_one_is_refused_before_the_handler_sees_it(memory: Memory) -> None:
+    """Why the handler needs no floor: `limit` now bounds packing, and a zero
+    there would report an empty pack as "nothing matched"."""
+    result = await memory.call("memory_search", {"query": "deploy pipeline", "limit": 0})
+    assert "less than the minimum" in result
+
+
 async def pin(memory: Memory, **fields: Any) -> str:
     """Add a pinned memory to the corpus and reindex, returning its id."""
     doc = MemoryDoc.new(pinned=True, **fields)
