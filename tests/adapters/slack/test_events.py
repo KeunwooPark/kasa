@@ -19,6 +19,7 @@ from kasa.adapters.slack.events import (
     Ignored,
     SlackContext,
     normalize,
+    scope_for,
 )
 
 BOT = "U0KASA"
@@ -67,6 +68,17 @@ def in_channel(
     if thread is not None:
         body["thread_ts"] = thread
     return body
+
+
+def as_mention(body: dict[str, Any]) -> dict[str, Any]:
+    """The same message as Slack's other delivery of it.
+
+    An `app_mention` payload carries no `channel_type` — the field is on the
+    conversation, and this event is about the mention.
+    """
+    return {key: value for key, value in body.items() if key != "channel_type"} | {
+        "type": "app_mention"
+    }
 
 
 def accepted(decision: Decision) -> Accepted:
@@ -279,6 +291,53 @@ async def test_the_channel_allowlist_does_not_govern_dms() -> None:
     )
 
     assert isinstance(decision, Accepted)
+
+
+async def test_both_deliveries_of_one_message_normalize_identically() -> None:
+    """A mention in a readable channel arrives twice, as `message` and as
+    `app_mention`, under one `ts` and therefore one dedupe key — so the second
+    is discarded unexamined and whichever landed first decided everything. The
+    two payloads must not be able to disagree about anything."""
+    for body in (dm(f"<@{BOT}> what did we decide?"), in_channel()):
+        as_message = accepted(await normalize(body, context=context(), known_session=never)).event
+        as_app_mention = accepted(
+            await normalize(as_mention(body), context=context(), known_session=never)
+        ).event
+
+        assert as_message == as_app_mention, body
+
+
+async def test_a_dm_is_private_however_slack_delivered_it() -> None:
+    """`app_mention` carries no `channel_type`, so reading `is_dm` off it filed
+    a private conversation under `channel:` — the leak class this module exists
+    to contain. The channel id says what kind of conversation it is."""
+    body = as_mention(dm(f"<@{BOT}> what did we decide?"))
+
+    event = accepted(await normalize(body, context=context(), known_session=never)).event
+
+    assert event.scope == f"private:{HUMAN}"
+
+
+async def test_the_allowlist_still_does_not_govern_a_dm_either_way() -> None:
+    """It masked the bug: the `app_mention` copy of a DM was dropped for being
+    off-allowlist, so only the default empty allowlist showed it."""
+    body = as_mention(dm(f"<@{BOT}> what did we decide?"))
+
+    decision = await normalize(
+        body, context=context(allowed=frozenset({"C1"})), known_session=never
+    )
+
+    assert accepted(decision).event.scope == f"private:{HUMAN}"
+
+
+@pytest.mark.parametrize(
+    ("channel", "expected"),
+    [("D1", f"private:{HUMAN}"), ("C1", "channel:C1"), ("G1", "channel:G1")],
+)
+async def test_only_a_d_channel_is_a_one_to_one(channel: str, expected: str) -> None:
+    """`D` is the one-to-one with the bot. A private channel or a group DM is
+    `G`, and neither belongs to one person."""
+    assert scope_for(channel, HUMAN, is_dm=channel.startswith("D")) == expected
 
 
 # -- dedupe -------------------------------------------------------------------

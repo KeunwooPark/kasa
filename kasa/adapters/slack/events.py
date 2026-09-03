@@ -24,8 +24,13 @@ SOURCE = "slack"
 #: sitting in, and that is the *only* whitespace it is allowed to touch.
 _MENTION = re.compile(r"(?P<before>[ \t]*)<@(?P<user>[A-Z0-9]+)(?:\|[^>]*)?>(?P<after>[ \t]*)")
 
-#: Slack's own name for a one-to-one conversation with the bot.
-_DM = "im"
+#: Slack channel ids are prefixed by kind, and a one-to-one conversation with
+#: the bot is `D`. Derived from the id rather than from `channel_type`, which
+#: only one of the two deliveries carries: a mention in a DM arrives as both
+#: `message` (with `channel_type: "im"`) and `app_mention` (without it), under
+#: one `ts` and therefore one dedupe key — so whichever landed first decided
+#: whether the conversation was private, and which one that was is a race.
+_DM_PREFIX = "D"
 
 #: Subtypes that are still somebody talking. Slack puts a `subtype` on a
 #: message for two quite different reasons: because of *how* it was composed —
@@ -114,7 +119,7 @@ async def normalize(
         return Ignored("no channel or timestamp")
 
     text = str(event.get("text") or "")
-    is_dm = event.get("channel_type") == _DM
+    is_dm = channel.startswith(_DM_PREFIX)
     thread = str(event.get("thread_ts") or ts)
     session = session_id(context.team_id, channel, thread)
 

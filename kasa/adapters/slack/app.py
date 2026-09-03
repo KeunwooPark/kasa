@@ -144,7 +144,10 @@ class SlackAdapter:
         # Both, on purpose. `app_mention` is all a minimally-scoped install
         # gets; `message` is what carries DMs and thread replies. Where an
         # install has both, the same message arrives twice and the dedupe key
-        # in `events.message_id` is what makes that harmless.
+        # in `events.message_id` is what makes that harmless — which is only
+        # true because `normalize` reads the two payloads identically. The
+        # duplicate is discarded unexamined, so anything the two disagree
+        # about is decided by whichever arrived first.
         for name in ("app_mention", "message"):
             self._app.event(name)(listener)
 
