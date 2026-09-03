@@ -279,15 +279,27 @@ class Scheduler:
         return (await self.queue.enqueue(kind, payload)).id
 
     async def run_now(self, kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Queue it and run it here, rather than leaving it to the daemon.
+        """Queue it, run it here, and report on the row that was queued.
 
         What `kasa job run` does. The row is still a row, so a job run this way
-        retries and dead-letters exactly like one the scheduler picked up.
+        leases, retries and dead-letters exactly like one the scheduler picked
+        up — the difference is only who is waiting for it.
+
+        Which means draining until *this* row has been attempted, not draining
+        once. `lease` takes the oldest runnable rows of the kind, ordered by
+        `run_after`, so a row queued just now is behind anything of the same
+        kind already due: one pass need not reach it, and reporting on a row
+        nobody ran is worse than taking a moment longer. The rows ahead of it
+        run on the way past, which is a drainer doing its job.
         """
         job_id = await self.trigger(kind, payload)
-        await self._drainer.drain_once()
-        rows = await self._store.raw("SELECT * FROM jobs WHERE id = ?", (job_id,))
-        return rows[0]
+        while not await self._attempted(job_id):
+            if await self._drainer.drain_once() == 0:
+                # Nothing of this kind is runnable at all, so our row is not
+                # ours to run — held by another process, or not yet due. Say
+                # what is there rather than spin waiting for it.
+                break
+        return await self._row(job_id)
 
     async def schedule_due(self, *, now: datetime | None = None) -> list[str]:
         """Queue the next occurrence of every recurring job. Idempotent."""
@@ -314,6 +326,15 @@ class Scheduler:
         return queued
 
     # -- internals -----------------------------------------------------------
+
+    async def _row(self, job_id: str) -> dict[str, Any]:
+        rows = await self._store.raw("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        return rows[0]
+
+    async def _attempted(self, job_id: str) -> bool:
+        """Whether this row has been leased. A lease is what runs it, and a
+        drainer that leased it also waited for it, so the row is settled."""
+        return bool((await self._row(job_id))["attempts"])
 
     def _require(self, kind: str) -> JobSpec:
         if (spec := self._specs.get(kind)) is None:

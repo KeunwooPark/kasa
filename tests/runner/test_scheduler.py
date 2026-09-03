@@ -110,6 +110,64 @@ async def test_a_payload_reaches_the_handler(store: Store) -> None:
     assert row["state"] == "done"
 
 
+async def test_a_one_shot_runs_even_with_older_rows_of_its_kind_ahead_of_it(
+    store: Store,
+) -> None:
+    """`lease` is ordered by `run_after` and bounded by concurrency, so a row
+    queued just now is last in line. Reporting on a row nobody ran is how
+    `kasa job run` came to print `reindex pending: None` and exit 1."""
+    for n in range(5):
+        await store.enqueue_job(
+            job_id=f"older-{n}",
+            kind="reindex",
+            payload=None,
+            run_after="2020-01-01T00:00:00.000+00:00",
+        )
+    ran: list[Job] = []
+    scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records(ran))], concurrency=2)
+
+    row = await scheduler.run_now("reindex")
+
+    assert row["state"] == "done", "the job the user asked for is the one reported on"
+    assert row["id"] not in {f"older-{n}" for n in range(5)}
+    assert len(ran) == 6, "the rows it passed on the way ran too, which is a drainer's job"
+
+
+async def test_running_a_job_by_hand_leaves_nothing_queued_behind(store: Store) -> None:
+    """Every call inserts a row. One that is not drained is one that stays,
+    so a command retried four times used to grow the table by four."""
+    for n in range(5):
+        await store.enqueue_job(
+            job_id=f"older-{n}",
+            kind="reindex",
+            payload=None,
+            run_after="2020-01-01T00:00:00.000+00:00",
+        )
+    scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))], concurrency=2)
+
+    for _ in range(4):
+        await scheduler.run_now("reindex")
+
+    ran = await states(store)
+    assert len(ran) == 9, "five already due, one per call"
+    assert set(ran.values()) == {"done"}, "and not one of them left queued"
+
+
+async def test_a_job_it_cannot_reach_is_reported_rather_than_waited_for(store: Store) -> None:
+    """A row held by another process is not this one's to run. Reporting what
+    is there beats looping until the lease expires."""
+    scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))])
+
+    async def nothing_runnable(*, limit: int = 1) -> list[Job]:
+        return []
+
+    scheduler.queue.lease = nothing_runnable  # type: ignore[method-assign]
+
+    row = await asyncio.wait_for(scheduler.run_now("reindex"), timeout=5.0)
+
+    assert (row["state"], row["attempts"], row["last_error"]) == ("pending", 0, None)
+
+
 async def test_a_job_nobody_can_run_is_refused_at_the_edge(store: Store) -> None:
     """Better here, where a person typed the name, than as a dead letter."""
     scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records([]))])
