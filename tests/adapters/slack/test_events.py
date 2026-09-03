@@ -214,6 +214,38 @@ async def test_a_file_with_no_comment_still_says_what_arrived() -> None:
     assert event.text == "[attached, which Kasa cannot open: q3.pdf, an untitled file]"
 
 
+async def test_a_file_entry_that_is_not_an_object_is_still_an_attachment() -> None:
+    """Slack sends file objects, and #121 believed the payload's shape. The
+    judgement has to reach a decision for anything JSON can hold, because the
+    alternative is an exception on the path that has not written the inbox row
+    yet — and an entry we cannot read the name of is one we cannot open, which
+    is exactly what the note says."""
+    body = dm("what's in this?") | {
+        "subtype": "file_share",
+        "files": ["F0123456", {"name": "q3.pdf"}, None],
+    }
+
+    event = accepted(await normalize(body, context=context(), known_session=never)).event
+
+    assert event.text == (
+        "what's in this?\n\n"
+        "[attached, which Kasa cannot open: an untitled file, q3.pdf, an untitled file]"
+    )
+
+
+@pytest.mark.parametrize("files", ["F0123456", {"id": "F0123456"}, 7])
+async def test_a_files_field_that_is_not_a_list_is_not_iterated(files: Any) -> None:
+    """A string would be walked character by character and a mapping key by
+    key, both of which invent attachments that were never sent. Nothing is
+    said about a field nothing can be read from; the message still gets
+    through, which is the part that matters."""
+    body = dm("what's in this?") | {"subtype": "file_share", "files": files}
+
+    event = accepted(await normalize(body, context=context(), known_session=never)).event
+
+    assert event.text == "what's in this?"
+
+
 @pytest.mark.parametrize("subtype", ["file_share", "me_message", "thread_broadcast"])
 async def test_the_subtypes_that_are_somebody_talking_get_through(subtype: str) -> None:
     assert isinstance(
