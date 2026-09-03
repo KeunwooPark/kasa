@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from itertools import chain
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -35,6 +35,8 @@ from kasa.memory.index import MemoryIndex
 from kasa.memory.ltm import MemoryStore, MemoryStoreError
 from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
+from kasa.runner.jobs import default_specs
+from kasa.runner.scheduler import Scheduler, UnknownJob
 from kasa.store import Store
 
 app = typer.Typer(
@@ -47,6 +49,8 @@ db_app = typer.Typer(help="Database maintenance.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 inbox_app = typer.Typer(help="The durable ingress queue.", no_args_is_help=True)
 app.add_typer(inbox_app, name="inbox")
+job_app = typer.Typer(help="Background jobs.", no_args_is_help=True)
+app.add_typer(job_app, name="job")
 
 console = Console()
 #: Everything on stderr is a single diagnostic line, never a table, and it
@@ -315,6 +319,103 @@ def inbox_retry(config: ConfigOption = None) -> None:
     _run(main())
 
 
+JOB_STATES = ("pending", "leased", "done", "failed")
+
+
+@job_app.command("run")
+def job_run(
+    kind: Annotated[str, typer.Argument(help="Which job to run.")],
+    config: ConfigOption = None,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Run one job now, in this process.
+
+    It is still a row, so a job run this way leases, retries and dead-letters
+    exactly like one the daemon picked up — the difference is only who is
+    waiting for it.
+    """
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.ERROR,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            scheduler = Scheduler(store, default_specs(cfg, store))
+            try:
+                job = await scheduler.run_now(kind)
+            except UnknownJob as exc:
+                err.print(f"[red]error[/red]: {exc}")
+                raise typer.Exit(1) from exc
+        if job["state"] == "done":
+            console.print(f"{kind} finished")
+            return
+        err.print(f"[red]{kind} {job['state']}[/red]: {job['last_error']}")
+        raise typer.Exit(1)
+
+    _run(main())
+
+
+@job_app.command("list")
+def job_list(config: ConfigOption = None) -> None:
+    """Show what each job is doing, and when it last ran."""
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            rows = await store.job_overview()
+            failed = await store.failed_jobs()
+            known = Scheduler(store, default_specs(cfg, store)).kinds
+        if not rows:
+            console.print(
+                f"[dim]nothing queued yet; this build knows: {', '.join(known) or 'no jobs'}[/dim]"
+            )
+            return
+        table = Table(show_header=True)
+        table.add_column("kind", no_wrap=True)
+        for column in (*JOB_STATES, "last run"):
+            table.add_column(column, no_wrap=True)
+        for kind, states in _by_kind(rows).items():
+            table.add_row(
+                kind,
+                *(str(states.get(state, ("0", ""))[0]) for state in JOB_STATES),
+                max((last for _, last in states.values() if last), default="[dim]never[/dim]"),
+            )
+        console.print(table)
+        for row in failed:
+            err.print(
+                f"[red]![/red] {row['kind']} {row['id']} after {row['attempts']} attempt(s)"
+                f" — {row['last_error']}"
+            )
+
+    _run(main())
+
+
+@job_app.command("retry")
+def job_retry(config: ConfigOption = None) -> None:
+    """Put every dead-lettered job back in the queue, due now."""
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            revived = await store.revive_failed_jobs()
+        console.print(f"requeued {revived} job(s)" if revived else "[dim]no dead letters[/dim]")
+
+    _run(main())
+
+
+def _by_kind(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, tuple[str, str]]]:
+    """`{kind: {state: (count, last run)}}`, from one row per (kind, state)."""
+    grouped: dict[str, dict[str, tuple[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["kind"]), {})[str(row["state"])] = (
+            str(row["n"]),
+            str(row["last_run"] or ""),
+        )
+    return grouped
+
+
 @db_app.command("migrate")
 def db_migrate(config: ConfigOption = None) -> None:
     """Apply pending migrations."""
@@ -485,21 +586,29 @@ async def _serve_slack(cfg: Config) -> None:
 
     async with _agent(cfg) as agent:
         adapter = await SlackAdapter.connect(agent, cfg.slack)
+        # The daemon is where background work belongs: it is the process that
+        # stays up, and `kasa run` on a terminal is not.
+        scheduler = Scheduler(agent.store, default_specs(cfg, agent.store))
         console.print(
             f"[green]Connected[/green] to Slack as {adapter.context.bot_user_id}"
             f" in {adapter.context.team_id}. Ctrl-C to stop."
         )
+
+        def stop() -> None:
+            # A daemon is stopped by a signal, and `stop()` drains rather than
+            # dropping: in-flight turns and jobs finish, and their rows
+            # complete. Without this, systemd restarting Kasa replays
+            # everything that was running at the time.
+            adapter.runtime.stop()
+            scheduler.stop()
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            # A daemon is stopped by a signal, and `stop()` drains rather than
-            # dropping: in-flight turns finish and their inbox rows complete.
-            # Without this, systemd restarting Kasa replays every turn that was
-            # running at the time.
             with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, adapter.runtime.stop)
+                loop.add_signal_handler(sig, stop)
         try:
             await adapter.start()
-            await adapter.runtime.run()
+            await asyncio.gather(adapter.runtime.run(), scheduler.run())
         finally:
             await adapter.aclose()
 

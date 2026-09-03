@@ -583,7 +583,181 @@ class Store:
             await self._conn.commit()
             return int(cur.rowcount)
 
-        # -- leases --------------------------------------------------------------
+        # -- jobs ----------------------------------------------------------------
+
+    #
+    # The same state machine as `inbox` above, over a table that schedules
+    # instead of deduping. `run_after` carries both meanings a job needs — when
+    # it first becomes due and when a failed one may be tried again — so the
+    # drainer's query stays one statement.
+
+    async def enqueue_job(
+        self, *, job_id: str, kind: str, payload: str | None, run_after: str
+    ) -> bool:
+        """Queue a job. False when that exact id was already there.
+
+        The id is the idempotency: a scheduled run is `kind@fire-time`, so two
+        schedulers racing on the same tick — or one scheduler polling twice
+        within a minute — insert the same row and only the first counts.
+        """
+        async with self._serial:
+            cur = await self._conn.execute(
+                "INSERT INTO jobs (id, kind, payload, run_after, state, created_at)"
+                " VALUES (?, ?, ?, ?, 'pending', ?)"
+                " ON CONFLICT (id) DO NOTHING",
+                (job_id, kind, payload, run_after, _now()),
+            )
+            await self._conn.commit()
+            return bool(cur.rowcount)
+
+    async def lease_jobs(
+        self, *, kinds: Sequence[str], limit: int, now: str, lease_until: str
+    ) -> list[dict[str, Any]]:
+        """Claim up to `limit` runnable jobs of the kinds this worker knows.
+
+        The `kind` filter is what lets a second process take only the work it
+        has handlers for, which is the out-of-process worker the design asks
+        this model to reach without a redesign.
+        """
+        if not kinds:
+            return []
+        placeholders = ", ".join("?" for _ in kinds)
+        async with self._serial:
+            async with self._conn.execute(
+                "UPDATE jobs SET state = 'leased', lease_until = ?, attempts = attempts + 1"
+                " WHERE id IN ("
+                "   SELECT id FROM jobs"
+                f"   WHERE kind IN ({placeholders})"
+                "     AND ((state = 'pending' AND run_after <= ?)"
+                "          OR (state = 'leased' AND lease_until <= ?))"
+                "   ORDER BY run_after LIMIT ?"
+                " )"
+                " RETURNING id, kind, payload, attempts",
+                (lease_until, *kinds, now, now, limit),
+            ) as cur:
+                rows = [dict(row) for row in await cur.fetchall()]
+            await self._conn.commit()
+            return rows
+
+    async def renew_jobs(self, ids: Sequence[str], *, lease_until: str) -> None:
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE jobs SET lease_until = ? WHERE state = 'leased'"
+                f" AND id IN ({placeholders})",
+                (lease_until, *ids),
+            )
+            await self._conn.commit()
+
+    async def complete_job(self, job_id: str) -> None:
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE jobs SET state = 'done', lease_until = NULL, last_error = NULL,"
+                " finished_at = ? WHERE id = ?",
+                (_now(), job_id),
+            )
+            await self._conn.commit()
+
+    async def retry_job(self, job_id: str, *, error: str, not_before: str) -> None:
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE jobs SET state = 'pending', lease_until = NULL, run_after = ?,"
+                " last_error = ? WHERE id = ?",
+                (not_before, error, job_id),
+            )
+            await self._conn.commit()
+
+    async def fail_job(self, job_id: str, *, error: str) -> None:
+        """Dead-letter a job. Nothing retries it until somebody says so."""
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE jobs SET state = 'failed', lease_until = NULL, last_error = ?,"
+                " finished_at = ? WHERE id = ?",
+                (error, _now(), job_id),
+            )
+            await self._conn.commit()
+
+    async def release_jobs(self, ids: Sequence[str]) -> None:
+        """Hand jobs back unfinished, as a clean shutdown does, attempt included."""
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE jobs SET state = 'pending', lease_until = NULL,"
+                " attempts = MAX(attempts - 1, 0)"
+                f" WHERE state = 'leased' AND id IN ({placeholders})",
+                tuple(ids),
+            )
+            await self._conn.commit()
+
+    async def reclaim_jobs(self, *, now: str | None = None) -> list[dict[str, Any]]:
+        """Make jobs a stopped process was holding runnable again.
+
+        The attempt is not given back, for the reason `reclaim_inbox` gives:
+        a job that kills the process running it leaves no failure to count.
+        """
+        clause = " AND lease_until <= ?" if now is not None else ""
+        params: tuple[Any, ...] = (now,) if now is not None else ()
+        async with self._serial:
+            async with self._conn.execute(
+                "UPDATE jobs SET state = 'pending', lease_until = NULL"
+                f" WHERE state = 'leased'{clause}"
+                " RETURNING id, kind, attempts",
+                params,
+            ) as cur:
+                rows = [dict(row) for row in await cur.fetchall()]
+            await self._conn.commit()
+            return rows
+
+    async def job_overview(self) -> list[dict[str, Any]]:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT kind, state, COUNT(*) AS n, MAX(finished_at) AS last_run"
+                " FROM jobs GROUP BY kind, state ORDER BY kind, state"
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def failed_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT id, kind, attempts, last_error FROM jobs"
+                " WHERE state = 'failed' ORDER BY finished_at LIMIT ?",
+                (limit,),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def revive_failed_jobs(self) -> int:
+        async with self._serial:
+            cur = await self._conn.execute(
+                "UPDATE jobs SET state = 'pending', attempts = 0, lease_until = NULL,"
+                " run_after = ? WHERE state = 'failed'",
+                (_now(),),
+            )
+            await self._conn.commit()
+            return int(cur.rowcount)
+
+    async def purge_jobs(self, *, before: str) -> int:
+        """Drop finished jobs that ran before `before`.
+
+        Only `done` rows. A dead letter is a thing somebody has to look at, and
+        a scheduled id is not a dedupe record for anything once it has run —
+        the next occurrence has a different id.
+        """
+        async with self._serial:
+            cur = await self._conn.execute(
+                "DELETE FROM jobs WHERE state = 'done' AND finished_at < ?", (before,)
+            )
+            await self._conn.commit()
+            return int(cur.rowcount)
+
+    # -- leases --------------------------------------------------------------
 
     async def take_lease(
         self, name: str, *, holder: str, job: str | None, ttl_seconds: float
