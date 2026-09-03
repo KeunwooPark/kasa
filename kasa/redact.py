@@ -4,7 +4,8 @@ Two sources feed this. The first is exact: Kasa knows the names of the
 environment variables holding its own credentials, so it knows their values and
 can match them literally. The second is shape-based, for tokens Kasa was never
 told about — a key pasted into a chat message, or one echoed back inside a tool
-result — matched by the prefixes the major providers issue.
+result — matched by the prefixes the major providers issue and by the header a
+private key carries.
 
 Neither is a guarantee, and this is not a substitute for not putting secrets
 somewhere. It is the net under the times somebody does.
@@ -35,6 +36,32 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
     ("slack token", re.compile(r"\bxox[aborps]-[A-Za-z0-9-]{10,}")),
     ("slack app token", re.compile(r"\bxapp-[A-Za-z0-9-]{10,}")),
+    # Only the two prefixes AWS issues as *credentials*. The principal-id
+    # prefixes (AIDA, AROA, …) share the shape but are not secret, and they are
+    # the identifiers an IAM policy or a CloudTrail event is about — redacting
+    # them would cost the model the thing it was asked to read, and protect
+    # nothing. An access key id is not secret either, but it is the half of a
+    # pair whose other half is always nearby, and every scanner treats it as
+    # the leak signal for that reason.
+    ("aws access key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    # A PEM header is provider-agnostic and unambiguous, so there is no
+    # false-positive cost to matching it — and unlike every other pattern here
+    # the secret is the *body*, spread over the lines that follow.
+    (
+        "private key block",
+        re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+        ),
+    ),
+    # The same block with its END marker cut off, by a log truncation or a
+    # partial paste. Redacting the header alone would protect nothing: it is
+    # the base64 under it that is the key. Runs to the first character that
+    # cannot be part of a PEM body, so a truncated block in the middle of a log
+    # does not take the rest of the log with it.
+    (
+        "truncated private key",
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*"),
+    ),
     # A credential smuggled into a URL, which is how tokens usually end up in a
     # git remote or an error message.
     ("url credentials", re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)")),
