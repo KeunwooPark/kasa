@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Sequence
@@ -26,12 +27,62 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+class _Serial:
+    """Mutual exclusion over the connection, re-entrant within one task.
+
+    `aiosqlite` runs every statement on a single worker thread, which is easy
+    to mistake for serialization. It is not: a coroutine yields between
+    `execute` and `fetchall`, and again when a cursor closes, so two tasks
+    sharing a connection interleave *inside* each other's statements. SQLite
+    then refuses the commit that lands there —
+
+        OperationalError: cannot commit transaction - SQL statements in progress
+
+    — which is #101, and it is what a second concurrent conversation produced
+    within a couple of hundred messages.
+
+    It stayed hidden for as long as nothing ran two turns at once. It is also
+    not only about commits: `append_message` reads `MAX(seq) + 1` and then
+    inserts it, and that pair is correct only while nothing else appends to
+    the same session in between.
+
+    So the rule is the blunt one: every `Store` method is serialized against
+    every other. The statements are microseconds against a model call that
+    takes seconds, and WAL still lets a *separate* connection read throughout.
+
+    Re-entrant because the compound methods are written in terms of the simple
+    ones — `add_observation` looks up its session, `append_messages` appends
+    one at a time — and a plain lock would deadlock on the first of them.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._depth = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
 class Store:
     """Owns the connection. One instance per process."""
 
     def __init__(self, conn: aiosqlite.Connection, path: str) -> None:
         self._conn = conn
         self.path = path
+        self._serial = _Serial()
 
     @classmethod
     async def open(cls, path: str | Path) -> Self:
@@ -89,54 +140,62 @@ class Store:
 
     async def migrate(self) -> list[str]:
         """Apply pending migrations. Idempotent."""
-        await self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version ("
-            " name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        await self._conn.commit()
+        async with self._serial:
+            await self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                " name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            await self._conn.commit()
 
-        async with self._conn.execute("SELECT name FROM schema_version") as cur:
-            applied = {row["name"] for row in await cur.fetchall()}
+            async with self._conn.execute("SELECT name FROM schema_version") as cur:
+                applied = {row["name"] for row in await cur.fetchall()}
 
-        pending = sorted(p for p in MIGRATIONS_DIR.glob("*.sql") if p.name not in applied)
-        for migration in pending:
-            try:
-                await self._conn.executescript(migration.read_text())
-                await self._conn.execute(
-                    "INSERT INTO schema_version (name, applied_at) VALUES (?, ?)",
-                    (migration.name, _now()),
-                )
-                await self._conn.commit()
-            except Exception as exc:
-                await self._conn.rollback()
-                raise KasaError(f"migration {migration.name} failed: {exc}") from exc
-        return [p.name for p in pending]
+            pending = sorted(p for p in MIGRATIONS_DIR.glob("*.sql") if p.name not in applied)
+            for migration in pending:
+                try:
+                    await self._conn.executescript(migration.read_text())
+                    await self._conn.execute(
+                        "INSERT INTO schema_version (name, applied_at) VALUES (?, ?)",
+                        (migration.name, _now()),
+                    )
+                    await self._conn.commit()
+                except Exception as exc:
+                    await self._conn.rollback()
+                    raise KasaError(f"migration {migration.name} failed: {exc}") from exc
+            return [p.name for p in pending]
 
-    # -- sessions ------------------------------------------------------------
+        # -- sessions ------------------------------------------------------------
 
     async def ensure_session(
         self, session_id: str, *, surface: str, scope: str = "workspace"
     ) -> None:
-        now = _now()
-        await self._conn.execute(
-            "INSERT INTO sessions (id, surface, scope, created_at, last_active)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active",
-            (session_id, surface, scope, now, now),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            now = _now()
+            await self._conn.execute(
+                "INSERT INTO sessions (id, surface, scope, created_at, last_active)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active",
+                (session_id, surface, scope, now, now),
+            )
+            await self._conn.commit()
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
-        async with self._conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)) as cur:
-            row = await cur.fetchone()
-        return dict(row) if row else None
+        async with self._serial:
+            async with self._conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
 
     async def clear_session(self, session_id: str) -> int:
-        cur = await self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        await self._conn.commit()
-        return cur.rowcount
+        async with self._serial:
+            cur = await self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            await self._conn.commit()
+            return cur.rowcount
 
-    # -- messages ------------------------------------------------------------
+        # -- messages ------------------------------------------------------------
 
     async def append_message(
         self,
@@ -146,95 +205,101 @@ class Store:
         author: str | None = None,
         tokens: int | None = None,
     ) -> str:
-        message_id = str(ULID())
-        async with self._conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE session_id = ?",
-            (session_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        seq = int(row["next"]) if row else 1
+        async with self._serial:
+            message_id = str(ULID())
+            async with self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE session_id = ?",
+                (session_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            seq = int(row["next"]) if row else 1
 
-        await self._conn.execute(
-            "INSERT INTO messages"
-            " (id, session_id, seq, role, author, content, tokens, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                message_id,
-                session_id,
-                seq,
-                message.role,
-                author,
-                _BLOCKS.dump_json(message.content).decode(),
-                tokens,
-                _now(),
-            ),
-        )
-        await self._conn.execute(
-            "UPDATE sessions SET last_active = ? WHERE id = ?", (_now(), session_id)
-        )
-        await self._conn.commit()
-        return message_id
+            await self._conn.execute(
+                "INSERT INTO messages"
+                " (id, session_id, seq, role, author, content, tokens, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id,
+                    session_id,
+                    seq,
+                    message.role,
+                    author,
+                    _BLOCKS.dump_json(message.content).decode(),
+                    tokens,
+                    _now(),
+                ),
+            )
+            await self._conn.execute(
+                "UPDATE sessions SET last_active = ? WHERE id = ?", (_now(), session_id)
+            )
+            await self._conn.commit()
+            return message_id
 
     async def append_messages(self, session_id: str, messages: Sequence[Message]) -> list[str]:
-        return [await self.append_message(session_id, m) for m in messages]
+        async with self._serial:
+            return [await self.append_message(session_id, m) for m in messages]
 
     async def recent_messages(self, session_id: str, limit: int = 100) -> list[Message]:
         """Most recent `limit` messages, oldest first."""
-        async with self._conn.execute(
-            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
-            (session_id, limit),
-        ) as cur:
-            rows = list(await cur.fetchall())
-        return [
-            Message(role=row["role"], content=_BLOCKS.validate_json(row["content"]))
-            for row in reversed(rows)
-        ]
+        async with self._serial:
+            async with self._conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
+                (session_id, limit),
+            ) as cur:
+                rows = list(await cur.fetchall())
+            return [
+                Message(role=row["role"], content=_BLOCKS.validate_json(row["content"]))
+                for row in reversed(rows)
+            ]
 
     async def message_count(self, session_id: str) -> int:
-        async with self._conn.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?", (session_id,)
-        ) as cur:
-            row = await cur.fetchone()
-        return int(row["n"]) if row else 0
+        async with self._serial:
+            async with self._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?", (session_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            return int(row["n"]) if row else 0
 
-    # -- accounting ----------------------------------------------------------
+        # -- accounting ----------------------------------------------------------
 
     async def record_call(self, record: CallRecord) -> None:
-        await self._conn.execute(
-            "INSERT INTO llm_calls"
-            " (created_at, role, provider, model, tag, input_tokens, output_tokens,"
-            "  cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ok, error)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                _now(),
-                record.role,
-                record.provider,
-                record.model,
-                record.tag,
-                record.usage.input_tokens,
-                record.usage.output_tokens,
-                record.usage.cache_read_tokens,
-                record.usage.cache_write_tokens,
-                record.cost_usd,
-                record.latency_ms,
-                int(record.ok),
-                record.error,
-            ),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            await self._conn.execute(
+                "INSERT INTO llm_calls"
+                " (created_at, role, provider, model, tag, input_tokens, output_tokens,"
+                "  cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ok, error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _now(),
+                    record.role,
+                    record.provider,
+                    record.model,
+                    record.tag,
+                    record.usage.input_tokens,
+                    record.usage.output_tokens,
+                    record.usage.cache_read_tokens,
+                    record.usage.cache_write_tokens,
+                    record.cost_usd,
+                    record.latency_ms,
+                    int(record.ok),
+                    record.error,
+                ),
+            )
+            await self._conn.commit()
 
     async def cost_summary(self, *, since: str | None = None) -> list[dict[str, Any]]:
-        clause = "WHERE created_at >= ?" if since else ""
-        params: tuple[Any, ...] = (since,) if since else ()
-        async with self._conn.execute(
-            f"SELECT role, model, COUNT(*) AS calls,"
-            f" SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,"
-            f" SUM(cache_read_tokens) AS cache_read_tokens,"
-            f" SUM(cost_usd) AS cost_usd"
-            f" FROM llm_calls {clause} GROUP BY role, model ORDER BY calls DESC",
-            params,
-        ) as cur:
-            return [dict(row) for row in await cur.fetchall()]
+        async with self._serial:
+            clause = "WHERE created_at >= ?" if since else ""
+            params: tuple[Any, ...] = (since,) if since else ()
+            async with self._conn.execute(
+                f"SELECT role, model, COUNT(*) AS calls,"
+                f" SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,"
+                f" SUM(cache_read_tokens) AS cache_read_tokens,"
+                f" SUM(cost_usd) AS cost_usd"
+                f" FROM llm_calls {clause} GROUP BY role, model ORDER BY calls DESC",
+                params,
+            ) as cur:
+                return [dict(row) for row in await cur.fetchall()]
 
     async def raw(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         """Run a query and return its rows.
@@ -244,21 +309,23 @@ class Store:
         into this class. Durable state still goes through the typed methods
         above; these two are for the rebuildable half.
         """
-        async with self._conn.execute(sql, params) as cur:
+        async with self._serial, self._conn.execute(sql, params) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
     async def write(self, sql: str, params: tuple[Any, ...] = ()) -> int:
-        cur = await self._conn.execute(sql, params)
-        await self._conn.commit()
-        return int(cur.rowcount)
+        async with self._serial:
+            cur = await self._conn.execute(sql, params)
+            await self._conn.commit()
+            return int(cur.rowcount)
 
     async def write_many(self, sql: str, rows: Sequence[tuple[Any, ...]]) -> None:
-        if not rows:
-            return
-        await self._conn.executemany(sql, rows)
-        await self._conn.commit()
+        async with self._serial:
+            if not rows:
+                return
+            await self._conn.executemany(sql, rows)
+            await self._conn.commit()
 
-    # -- episodes ------------------------------------------------------------
+        # -- episodes ------------------------------------------------------------
 
     async def open_episode(self, session_id: str) -> dict[str, Any] | None:
         """The episode this session is currently accumulating into, if any.
@@ -268,15 +335,16 @@ class Store:
         only reports what is already there, and `None` is the normal answer
         until that job exists.
         """
-        async with self._conn.execute(
-            "SELECT * FROM episodes WHERE session_id = ? AND state = 'open'"
-            " ORDER BY started_at DESC LIMIT 1",
-            (session_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        return dict(row) if row else None
+        async with self._serial:
+            async with self._conn.execute(
+                "SELECT * FROM episodes WHERE session_id = ? AND state = 'open'"
+                " ORDER BY started_at DESC LIMIT 1",
+                (session_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
 
-    # -- observations --------------------------------------------------------
+        # -- observations --------------------------------------------------------
 
     async def add_observation(
         self,
@@ -291,46 +359,50 @@ class Store:
         source_refs: Sequence[str] = (),
     ) -> str:
         """Record a candidate fact. Nothing durable happens until `promote` runs."""
-        observation_id = str(ULID())
-        # An observation outlives the session that produced it, and losing the
-        # fact because the bookkeeping link is missing would be the wrong trade.
-        if session_id is not None and await self.get_session(session_id) is None:
-            session_id = None
-        await self._conn.execute(
-            "INSERT INTO observations"
-            " (id, episode_id, session_id, subject, claim, kind, confidence, scope,"
-            "  source_refs, state, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (
-                observation_id,
-                episode_id,
-                session_id,
-                subject,
-                claim,
-                kind,
-                confidence,
-                scope,
-                json_dumps(list(source_refs)),
-                _now(),
-            ),
-        )
-        await self._conn.commit()
-        return observation_id
+        async with self._serial:
+            observation_id = str(ULID())
+            # An observation outlives the session that produced it, and losing the
+            # fact because the bookkeeping link is missing would be the wrong trade.
+            if session_id is not None and await self.get_session(session_id) is None:
+                session_id = None
+            await self._conn.execute(
+                "INSERT INTO observations"
+                " (id, episode_id, session_id, subject, claim, kind, confidence, scope,"
+                "  source_refs, state, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (
+                    observation_id,
+                    episode_id,
+                    session_id,
+                    subject,
+                    claim,
+                    kind,
+                    confidence,
+                    scope,
+                    json_dumps(list(source_refs)),
+                    _now(),
+                ),
+            )
+            await self._conn.commit()
+            return observation_id
 
     async def pending_observations(self, limit: int = 100) -> list[dict[str, Any]]:
-        async with self._conn.execute(
-            "SELECT * FROM observations WHERE state = 'pending' ORDER BY created_at LIMIT ?",
-            (limit,),
-        ) as cur:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM observations WHERE state = 'pending' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ) as cur,
+        ):
             return [dict(row) for row in await cur.fetchall()]
 
-    # -- inbox ---------------------------------------------------------------
-    #
-    # The state machine, in one place, because every method below is a move in
-    # it: pending -> leased -> done, with leased -> pending on expiry or a
-    # retry, and pending -> failed once the attempts run out. `lease_until`
-    # means "not before" in every state it is set in, which is what lets one
-    # index answer "what is deliverable now".
+        # -- inbox ---------------------------------------------------------------
+        #
+        # The state machine, in one place, because every method below is a move in
+        # it: pending -> leased -> done, with leased -> pending on expiry or a
+        # retry, and pending -> failed once the attempts run out. `lease_until`
+        # means "not before" in every state it is set in, which is what lets one
+        # index answer "what is deliverable now".
 
     async def enqueue_inbox(
         self, *, source: str, external_id: str, payload: str
@@ -341,22 +413,23 @@ class Store:
         retry both end up here; one inserts, the other conflicts, and both are
         told which row won, so neither has to decide what to do about it.
         """
-        cur = await self._conn.execute(
-            "INSERT INTO inbox (source, external_id, payload, received_at, state)"
-            " VALUES (?, ?, ?, ?, 'pending')"
-            " ON CONFLICT (source, external_id) DO NOTHING",
-            (source, external_id, payload, _now()),
-        )
-        await self._conn.commit()
-        if cur.rowcount and cur.lastrowid is not None:
-            return int(cur.lastrowid), False
-        async with self._conn.execute(
-            "SELECT id FROM inbox WHERE source = ? AND external_id = ?", (source, external_id)
-        ) as existing:
-            row = await existing.fetchone()
-        if row is None:  # pragma: no cover - the conflict proves the row exists
-            raise StoreError(f"inbox row for {source}:{external_id} vanished mid-enqueue")
-        return int(row["id"]), True
+        async with self._serial:
+            cur = await self._conn.execute(
+                "INSERT INTO inbox (source, external_id, payload, received_at, state)"
+                " VALUES (?, ?, ?, ?, 'pending')"
+                " ON CONFLICT (source, external_id) DO NOTHING",
+                (source, external_id, payload, _now()),
+            )
+            await self._conn.commit()
+            if cur.rowcount and cur.lastrowid is not None:
+                return int(cur.lastrowid), False
+            async with self._conn.execute(
+                "SELECT id FROM inbox WHERE source = ? AND external_id = ?", (source, external_id)
+            ) as existing:
+                row = await existing.fetchone()
+            if row is None:  # pragma: no cover - the conflict proves the row exists
+                raise StoreError(f"inbox row for {source}:{external_id} vanished mid-enqueue")
+            return int(row["id"]), True
 
     async def lease_inbox(self, *, limit: int, now: str, lease_until: str) -> list[dict[str, Any]]:
         """Claim up to `limit` deliverable rows, oldest first.
@@ -368,53 +441,61 @@ class Store:
         that is answering it leaves no failure behind to count, and counting
         only failures is how such a message loops forever.
         """
-        async with self._conn.execute(
-            "UPDATE inbox SET state = 'leased', lease_until = ?, attempts = attempts + 1"
-            " WHERE id IN (("
-            "   SELECT id FROM inbox"
-            "   WHERE (state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
-            "      OR (state = 'leased' AND lease_until <= ?)"
-            "   ORDER BY id LIMIT ?"
-            " ))"
-            " RETURNING id, payload, attempts",
-            (lease_until, now, now, limit),
-        ) as cur:
-            rows = [dict(row) for row in await cur.fetchall()]
-        await self._conn.commit()
-        return rows
+        async with self._serial:
+            async with self._conn.execute(
+                "UPDATE inbox SET state = 'leased', lease_until = ?, attempts = attempts + 1"
+                " WHERE id IN ("
+                "   SELECT id FROM inbox"
+                "   WHERE (state = 'pending' AND (lease_until IS NULL OR lease_until <= ?))"
+                "      OR (state = 'leased' AND lease_until <= ?)"
+                "   ORDER BY id LIMIT ?"
+                " )"
+                " RETURNING id, payload, attempts",
+                (lease_until, now, now, limit),
+            ) as cur:
+                rows = [dict(row) for row in await cur.fetchall()]
+            await self._conn.commit()
+            return rows
 
     async def renew_inbox(self, ids: Sequence[int], *, lease_until: str) -> None:
         """Push the expiry out on rows still being worked on."""
-        if not ids:
-            return
-        placeholders = ", ".join("?" for _ in ids)
-        await self._conn.execute(
-            f"UPDATE inbox SET lease_until = ? WHERE state = 'leased' AND id IN ({placeholders})",
-            (lease_until, *ids),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            if not ids:
+                return
+            placeholders = ", ".join("?" for _ in ids)
+            await self._conn.execute(
+                "UPDATE inbox SET lease_until = ? WHERE state = 'leased'"
+                f" AND id IN ({placeholders})",
+                (lease_until, *ids),
+            )
+            await self._conn.commit()
 
     async def complete_inbox(self, inbox_id: int) -> None:
-        await self._conn.execute(
-            "UPDATE inbox SET state = 'done', lease_until = NULL, last_error = NULL WHERE id = ?",
-            (inbox_id,),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE inbox SET state = 'done', lease_until = NULL, last_error = NULL"
+                " WHERE id = ?",
+                (inbox_id,),
+            )
+            await self._conn.commit()
 
     async def retry_inbox(self, inbox_id: int, *, error: str, not_before: str) -> None:
-        await self._conn.execute(
-            "UPDATE inbox SET state = 'pending', lease_until = ?, last_error = ? WHERE id = ?",
-            (not_before, error, inbox_id),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE inbox SET state = 'pending', lease_until = ?, last_error = ? WHERE id = ?",
+                (not_before, error, inbox_id),
+            )
+            await self._conn.commit()
 
     async def fail_inbox(self, inbox_id: int, *, error: str) -> None:
         """Dead-letter a row. Nothing retries it until somebody says so."""
-        await self._conn.execute(
-            "UPDATE inbox SET state = 'failed', lease_until = NULL, last_error = ? WHERE id = ?",
-            (error, inbox_id),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE inbox SET state = 'failed', lease_until = NULL, last_error = ?"
+                " WHERE id = ?",
+                (error, inbox_id),
+            )
+            await self._conn.commit()
 
     async def release_inbox(self, ids: Sequence[int]) -> None:
         """Hand rows back unfinished, as a clean shutdown does.
@@ -423,16 +504,17 @@ class Store:
         message's fault, and a queue that dead-letters its backlog after five
         deploys is worse than no bound at all.
         """
-        if not ids:
-            return
-        placeholders = ", ".join("?" for _ in ids)
-        await self._conn.execute(
-            "UPDATE inbox SET state = 'pending', lease_until = NULL,"
-            " attempts = MAX(attempts - 1, 0)"
-            f" WHERE state = 'leased' AND id IN ({placeholders})",
-            tuple(ids),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            if not ids:
+                return
+            placeholders = ", ".join("?" for _ in ids)
+            await self._conn.execute(
+                "UPDATE inbox SET state = 'pending', lease_until = NULL,"
+                " attempts = MAX(attempts - 1, 0)"
+                f" WHERE state = 'leased' AND id IN ({placeholders})",
+                tuple(ids),
+            )
+            await self._conn.commit()
 
     async def reclaim_inbox(self, *, now: str | None = None) -> list[dict[str, Any]]:
         """Make rows a stopped process was holding deliverable again.
@@ -446,40 +528,46 @@ class Store:
         is the only record that it was tried, and giving it back is how such a
         message loops forever.
         """
-        clause = " AND lease_until <= ?" if now is not None else ""
-        params: tuple[Any, ...] = (now,) if now is not None else ()
-        async with self._conn.execute(
-            "UPDATE inbox SET state = 'pending', lease_until = NULL"
-            f" WHERE state = 'leased'{clause}"
-            " RETURNING id, source, external_id, attempts",
-            params,
-        ) as cur:
-            rows = [dict(row) for row in await cur.fetchall()]
-        await self._conn.commit()
-        return rows
+        async with self._serial:
+            clause = " AND lease_until <= ?" if now is not None else ""
+            params: tuple[Any, ...] = (now,) if now is not None else ()
+            async with self._conn.execute(
+                "UPDATE inbox SET state = 'pending', lease_until = NULL"
+                f" WHERE state = 'leased'{clause}"
+                " RETURNING id, source, external_id, attempts",
+                params,
+            ) as cur:
+                rows = [dict(row) for row in await cur.fetchall()]
+            await self._conn.commit()
+            return rows
 
     async def inbox_counts(self) -> dict[str, int]:
-        async with self._conn.execute(
-            "SELECT state, COUNT(*) AS n FROM inbox GROUP BY state"
-        ) as cur:
+        async with (
+            self._serial,
+            self._conn.execute("SELECT state, COUNT(*) AS n FROM inbox GROUP BY state") as cur,
+        ):
             return {row["state"]: int(row["n"]) for row in await cur.fetchall()}
 
     async def inbox_failed(self, limit: int = 20) -> list[dict[str, Any]]:
-        async with self._conn.execute(
-            "SELECT id, source, external_id, received_at, attempts, last_error FROM inbox"
-            " WHERE state = 'failed' ORDER BY id LIMIT ?",
-            (limit,),
-        ) as cur:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT id, source, external_id, received_at, attempts, last_error FROM inbox"
+                " WHERE state = 'failed' ORDER BY id LIMIT ?",
+                (limit,),
+            ) as cur,
+        ):
             return [dict(row) for row in await cur.fetchall()]
 
     async def revive_inbox_failed(self) -> int:
         """Put every dead letter back in the queue with a fresh attempt budget."""
-        cur = await self._conn.execute(
-            "UPDATE inbox SET state = 'pending', attempts = 0, lease_until = NULL"
-            " WHERE state = 'failed'"
-        )
-        await self._conn.commit()
-        return int(cur.rowcount)
+        async with self._serial:
+            cur = await self._conn.execute(
+                "UPDATE inbox SET state = 'pending', attempts = 0, lease_until = NULL"
+                " WHERE state = 'failed'"
+            )
+            await self._conn.commit()
+            return int(cur.rowcount)
 
     async def purge_inbox(self, *, before: str) -> int:
         """Drop delivered rows older than `before`.
@@ -488,44 +576,48 @@ class Store:
         dedupe record for its event id, so purging eagerly is how a late
         provider retry gets answered a second time.
         """
-        cur = await self._conn.execute(
-            "DELETE FROM inbox WHERE state = 'done' AND received_at < ?", (before,)
-        )
-        await self._conn.commit()
-        return int(cur.rowcount)
+        async with self._serial:
+            cur = await self._conn.execute(
+                "DELETE FROM inbox WHERE state = 'done' AND received_at < ?", (before,)
+            )
+            await self._conn.commit()
+            return int(cur.rowcount)
 
-    # -- leases --------------------------------------------------------------
+        # -- leases --------------------------------------------------------------
 
     async def take_lease(
         self, name: str, *, holder: str, job: str | None, ttl_seconds: float
     ) -> None:
         """Record that `holder` holds `name`. The flock is what enforces it."""
-        now = datetime.now(UTC)
-        await self._conn.execute(
-            "INSERT INTO leases (name, holder, job, acquired_at, expires_at)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(name) DO UPDATE SET"
-            " holder = excluded.holder, job = excluded.job,"
-            " acquired_at = excluded.acquired_at, expires_at = excluded.expires_at",
-            (
-                name,
-                holder,
-                job,
-                now.isoformat(timespec="milliseconds"),
-                (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="milliseconds"),
-            ),
-        )
-        await self._conn.commit()
+        async with self._serial:
+            now = datetime.now(UTC)
+            await self._conn.execute(
+                "INSERT INTO leases (name, holder, job, acquired_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET"
+                " holder = excluded.holder, job = excluded.job,"
+                " acquired_at = excluded.acquired_at, expires_at = excluded.expires_at",
+                (
+                    name,
+                    holder,
+                    job,
+                    now.isoformat(timespec="milliseconds"),
+                    (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="milliseconds"),
+                ),
+            )
+            await self._conn.commit()
 
     async def release_lease(self, name: str) -> bool:
-        cur = await self._conn.execute("DELETE FROM leases WHERE name = ?", (name,))
-        await self._conn.commit()
-        return cur.rowcount > 0
+        async with self._serial:
+            cur = await self._conn.execute("DELETE FROM leases WHERE name = ?", (name,))
+            await self._conn.commit()
+            return cur.rowcount > 0
 
     async def get_lease(self, name: str) -> dict[str, Any] | None:
-        async with self._conn.execute("SELECT * FROM leases WHERE name = ?", (name,)) as cur:
-            row = await cur.fetchone()
-        return dict(row) if row else None
+        async with self._serial:
+            async with self._conn.execute("SELECT * FROM leases WHERE name = ?", (name,)) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
 
 
 def json_dumps(value: Any) -> str:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
 
 import pytest
 
+from kasa.core.events import InboundEvent
+from kasa.core.inbox import Inbox
 from kasa.errors import StoreError
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
@@ -193,3 +196,59 @@ async def test_opening_a_good_database_still_works(tmp_path: Path) -> None:
         assert await store.raw("SELECT name FROM schema_version")
         assert sqlite_threads() == before + 1, "the fixture holds one open too"
     assert sqlite_threads() == before
+
+
+# -- concurrency -------------------------------------------------------------
+#
+# One connection, many coroutines. `aiosqlite` runs the statements on a single
+# worker thread, which is easy to mistake for serialization — it is not, and
+# these are the two ways that showed.
+
+
+async def test_a_drainer_and_an_adapter_do_not_interleave(store: Store) -> None:
+    """#101. `lease_inbox` holds an `UPDATE … RETURNING` cursor across an await,
+    and a commit landing there is an error rather than a wait:
+
+        OperationalError: cannot commit transaction - SQL statements in progress
+    """
+    inbox = Inbox(store, lease_ttl=0.0)
+
+    async def enqueue() -> None:
+        for n in range(200):
+            await inbox.enqueue(InboundEvent(source="slack", external_id=f"E{n}", session_id="s1"))
+
+    async def drain() -> None:
+        for _ in range(200):
+            await inbox.lease(limit=5)
+
+    await asyncio.gather(enqueue(), drain(), drain())
+
+
+async def test_two_appends_to_one_session_do_not_collide(store: Store) -> None:
+    """`append_message` reads `MAX(seq) + 1` and then inserts it. Actors keep a
+    session to one turn at a time, but background jobs (#26) will write while a
+    turn is running, and `messages` has `UNIQUE (session_id, seq)`."""
+    await store.ensure_session("s1", surface="cli")
+
+    await asyncio.gather(*(store.append_message("s1", Message.user(f"m{n}")) for n in range(50)))
+
+    rows = await store.raw("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq")
+    assert [row["seq"] for row in rows] == list(range(1, 51))
+
+
+async def test_a_method_may_call_another_one(store: Store) -> None:
+    """The lock is re-entrant because the compound methods are written in terms
+    of the simple ones. A plain lock deadlocks on the first of them."""
+    await store.ensure_session("s1", surface="cli")
+
+    await store.append_messages("s1", [Message.user("a"), Message.assistant("b")])
+    observation = await store.add_observation(
+        subject="jane",
+        claim="owns the deploy pipeline",
+        kind="fact",
+        scope="workspace",
+        session_id="s1",
+    )
+
+    assert await store.message_count("s1") == 2
+    assert [row["id"] for row in await store.pending_observations()] == [observation]
