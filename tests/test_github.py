@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -77,6 +79,33 @@ async def test_a_repo_under_another_namespace_is_an_org_repo() -> None:
     async with client(handler) as gh:
         await gh.create_repo("acme/kasa-memory")
     assert "/orgs/acme/repos" in seen
+
+
+async def test_create_pull_request_sends_the_review_branch_and_body() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.read().decode()
+        return httpx.Response(201, json={"number": 42, "html_url": "https://github.test/pr/42"})
+
+    async with client(handler) as gh:
+        pr = await gh.create_pull_request(
+            "someone/kasa-memory",
+            head="kasa/forget-2026-09-04",
+            base="main",
+            title="memory: forget stale facts",
+            body="Delete old facts because their grace period elapsed.",
+        )
+
+    assert seen["path"] == "/repos/someone/kasa-memory/pulls"
+    assert json.loads(str(seen["body"])) == {
+        "head": "kasa/forget-2026-09-04",
+        "base": "main",
+        "title": "memory: forget stale facts",
+        "body": "Delete old facts because their grace period elapsed.",
+    }
+    assert pr.number == 42 and pr.html_url.endswith("/42")
 
 
 @pytest.mark.parametrize(

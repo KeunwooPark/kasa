@@ -12,12 +12,14 @@ rather than only a command somebody remembers to type.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from kasa.config import Config
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LeaseError
 from kasa.memory.ltm import MemoryStore
+from kasa.runner.cron import Cron
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
 
@@ -28,7 +30,9 @@ def default_specs(cfg: Config, store: Store) -> list[JobSpec]:
     """Everything this build can run, given what is configured."""
     if not cfg.ltm.configured:
         return []
-    return [JobSpec(kind="reindex", handler=_reindex(cfg, store))]
+    # Polling the private repo is how a supervised PR becomes visible after a
+    # human merges it. The job syncs first and then rebuilds both derived views.
+    return [JobSpec(kind="reindex", handler=_reindex(cfg, store), cron=Cron.parse("* * * * *"))]
 
 
 def _reindex(cfg: Config, store: Store) -> JobHandler:
@@ -37,6 +41,7 @@ def _reindex(cfg: Config, store: Store) -> JobHandler:
         # SQLite one is what let the index and the manifest disagree about
         # which memories exist.
         memory = await MemoryStore.open(cfg, store)
+        changed = await asyncio.to_thread(memory.sync_default)
         try:
             result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(
                 full=bool(job.payload.get("full"))
@@ -68,6 +73,11 @@ def _reindex(cfg: Config, store: Store) -> JobHandler:
             )
             return
         manifest = await memory.refresh_manifest()
-        log.info("reindex: %s; %s", result.summary(), manifest.summary())
+        log.info(
+            "reindex%s: %s; %s",
+            " after pulling a merged review" if changed else "",
+            result.summary(),
+            manifest.summary(),
+        )
 
     return run

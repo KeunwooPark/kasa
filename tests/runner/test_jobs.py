@@ -52,6 +52,12 @@ def only_spec(cfg: Config, store: Store) -> JobSpec:
     return specs[0]
 
 
+def test_reindex_polls_for_merged_supervised_prs(clone: Path, store: Store) -> None:
+    spec = only_spec(config_for(clone), store)
+    assert spec.cron is not None
+    assert spec.cron.expression == "* * * * *"
+
+
 async def test_a_reindex_that_loses_the_lease_is_done_rather_than_failed(
     clone: Path, store: Store
 ) -> None:
@@ -132,7 +138,10 @@ async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
     task = asyncio.create_task(scheduler.run())
     try:
         for _ in range(2000):
-            states = [row["state"] for row in await store.raw("SELECT state FROM jobs")]
+            states = [
+                row["state"]
+                for row in await store.raw("SELECT state FROM jobs WHERE id NOT LIKE 'reindex@%'")
+            ]
             if all(state in TERMINAL for state in states):
                 break
             await asyncio.sleep(0.01)
@@ -140,7 +149,7 @@ async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
         scheduler.stop()
         await asyncio.wait_for(task, timeout=10.0)
 
-    rows = await store.raw("SELECT state, last_error FROM jobs")
+    rows = await store.raw("SELECT state, last_error FROM jobs WHERE id NOT LIKE 'reindex@%'")
     assert [row["state"] for row in rows] == ["done", "done"]
     assert [row["last_error"] for row in rows] == [None, None]
 

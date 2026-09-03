@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from kasa.config import Config
+from kasa.github import PullRequestInfo
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo, run_git
@@ -49,10 +50,15 @@ def clone(tmp_path: Path, remote: Path) -> Path:
     return path
 
 
-def config_for(clone: Path, tmp_path: Path) -> Config:
+def config_for(clone: Path, tmp_path: Path, *, supervised: list[str] | None = None) -> Config:
     return Config.model_validate(
         {
-            "ltm": {"repo": "someone/mem", "clone_path": str(clone), "branch": "main"},
+            "ltm": {
+                "repo": "someone/mem",
+                "clone_path": str(clone),
+                "branch": "main",
+                "supervised": supervised or [],
+            },
             "store": {"path": str(tmp_path / "kasa.db")},
         }
     )
@@ -117,6 +123,56 @@ async def test_delete_is_git_rm_so_the_blob_stays_in_history(memory: MemoryStore
     assert not (memory.path / path).exists()
     # The whole undo story rests on this: the content is still reachable.
     assert content.splitlines()[2] in memory._repo.run("show", f"HEAD~1:{path}")
+
+
+class FakeGitHub:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def create_pull_request(
+        self, full_name: str, *, head: str, base: str, title: str, body: str
+    ) -> PullRequestInfo:
+        self.calls.append(
+            {"full_name": full_name, "head": head, "base": base, "title": title, "body": body}
+        )
+        return PullRequestInfo(number=7, html_url="https://github.test/mem/pull/7")
+
+
+async def test_a_supervised_destructive_job_opens_a_pr_without_changing_main(
+    memory: MemoryStore, remote: Path, store: Store
+) -> None:
+    path, content = a_memory()
+    await memory.apply([Write(path, content)], META)
+    github = FakeGitHub()
+    supervised = MemoryStore(
+        memory._repo,
+        store,
+        branch="main",
+        push=True,
+        supervised=["forget"],
+        repo_name="someone/mem",
+        github=github,
+    )
+
+    result = await supervised.apply(
+        [Remove(path)], CommitMeta(summary="delete Jane after the retention period", job="forget")
+    )
+
+    assert result.branch and result.branch.startswith("kasa/forget-")
+    assert result.pull_request_url == "https://github.test/mem/pull/7"
+    assert result.pushed
+    assert path in run_git("ls-tree", "-r", "--name-only", "main", cwd=remote).stdout
+    assert path not in run_git("ls-tree", "-r", "--name-only", result.branch, cwd=remote).stdout
+    assert (memory.path / path).exists(), "the local clone returns to unchanged main"
+    call = github.calls[0]
+    assert call["base"] == "main" and call["head"] == result.branch
+    assert f"**Delete:** `{path}`" in call["body"]
+    assert "Why: delete Jane after the retention period" in call["body"]
+    assert "Merging this pull request makes the changes effective" in call["body"]
+
+    run_git("update-ref", "refs/heads/main", result.sha or "", cwd=remote)
+    assert supervised.sync_default()
+    assert not (memory.path / path).exists(), "the merged review becomes real on sync"
 
 
 async def test_removing_something_absent_is_an_error_not_a_silent_pass(
