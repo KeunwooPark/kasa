@@ -8,6 +8,7 @@ writes before it validates fails in a way no unit test sees.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -160,3 +161,54 @@ def test_an_error_about_a_long_path_stays_on_one_line(deep: Path) -> None:
     assert result.exit_code == 1
     assert len(str(broken)) > 80
     assert str(broken) in result.stderr, "the path was split across two lines"
+
+
+# -- one line per broken file (#77) -------------------------------------------
+
+
+def broken(clone: Path, name: str = "broken.md") -> str:
+    (clone / "memory" / "facts").mkdir(parents=True, exist_ok=True)
+    (clone / "memory" / "facts" / name).write_text("no frontmatter here at all")
+    return f"memory/facts/{name}"
+
+
+def test_an_unreadable_file_is_named_once_with_its_reason(rig: tuple[Path, Path]) -> None:
+    """#77. The index reported bare paths and the manifest reported reasons, so
+    a file both halves refused was named twice — once uselessly."""
+    config, clone = rig
+    bootstrap(clone)
+    Manifest.rebuild(clone)[0].save(clone)
+    GitRepo.at(clone).commit("memory: seed")
+    path = broken(clone)
+
+    result = runner.invoke(app, ["reindex", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    named = [line for line in result.output.splitlines() if path in line]
+    assert len(named) == 1, f"one line per file, got:\n{result.output}"
+    assert "no YAML frontmatter" in named[0]
+
+
+def test_the_log_record_names_the_file_once_too(
+    rig: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """`str(exc)` already carries the source, so `"index: %s: %s", path, exc`
+    printed it twice — the defect #70 fixed one line away from this one.
+
+    Asserted on the record rather than on stdout: `reindex` now configures
+    logging to keep these out of its own report at default verbosity, and
+    pytest owns the root logger, so what reaches stdout here is pytest's
+    choice rather than the command's. The quiet default is checked by hand.
+    """
+    config, clone = rig
+    bootstrap(clone)
+    Manifest.rebuild(clone)[0].save(clone)
+    GitRepo.at(clone).commit("memory: seed")
+    path = broken(clone)
+
+    with caplog.at_level(logging.WARNING, logger="kasa.memory.index"):
+        runner.invoke(app, ["reindex", "--config", str(config)])
+
+    message = next(r.getMessage() for r in caplog.records if r.name == "kasa.memory.index")
+    assert message.count(path) == 1, message
+    assert "no YAML frontmatter" in message

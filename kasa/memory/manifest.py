@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kasa.memory.document import MemoryDoc, MemoryError_, is_memory_id
+from kasa.memory.document import MemoryDoc, MemoryError_, Problem, is_memory_id
 from kasa.memory.layout import MANIFEST_PATH, MEMORY_DIR, is_memory_path
 from kasa.memory.schema import SCHEMA_VERSION
 
@@ -44,18 +43,6 @@ class ManifestEntry(BaseModel):
     #: Denormalized from the document so a link to a merged-away memory can be
     #: followed without opening every file in the repo.
     supersedes: list[str] = Field(default_factory=list)
-
-
-@dataclass(frozen=True, slots=True)
-class Problem:
-    """A file the manifest could not account for.
-
-    `reason` is the bare reason. The path is the other field, and every caller
-    renders the two together in its own shape.
-    """
-
-    path: str
-    reason: str
 
 
 class Manifest(BaseModel):

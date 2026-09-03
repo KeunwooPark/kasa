@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from kasa.memory.chunk import Chunk, chunk_document
-from kasa.memory.document import MemoryDoc, MemoryError_
+from kasa.memory.document import MemoryDoc, MemoryError_, Problem
 from kasa.memory.layout import MEMORY_DIR, is_memory_path
 from kasa.store import Store
 
@@ -33,7 +33,11 @@ class IndexResult:
     indexed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
-    problems: list[str] = field(default_factory=list)
+    #: Files the parser refused, each with the reason. Reasons rather than bare
+    #: paths because the caller prints these next to the manifest's problems,
+    #: which have always carried one — so a file both halves refused was named
+    #: twice, once uselessly (#77).
+    problems: list[Problem] = field(default_factory=list)
     chunks: int = 0
 
     def summary(self) -> str:
@@ -112,8 +116,9 @@ class MemoryIndex:
                 # `UnicodeDecodeError` because a `.md` that is not text at all —
                 # a stray binary, a bad `git add` — used to take the command
                 # down before it reported any of the work it had already done.
-                log.warning("index: %s: %s", relative, exc)
-                result.problems.append(relative)
+                reason = exc.reason if isinstance(exc, MemoryError_) else str(exc)
+                log.warning("index: %s: %s", relative, reason)
+                result.problems.append(Problem(relative, reason))
                 continue
 
             chunks = chunk_document(doc, relative)

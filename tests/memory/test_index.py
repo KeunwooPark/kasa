@@ -152,7 +152,7 @@ async def test_a_broken_file_is_reported_and_skipped(repo: Path, store: Store) -
     result = await MemoryIndex(store, repo).reindex()
 
     assert result.indexed == ["memory/people/jane.md"]
-    assert result.problems == ["memory/facts/broken.md"]
+    assert [p.path for p in result.problems] == ["memory/facts/broken.md"]
 
 
 # -- acceptance: incremental work --------------------------------------------
@@ -292,7 +292,7 @@ async def test_a_file_the_indexer_refuses_is_not_staleness(repo: Path, store: St
     (repo / "memory" / "facts" / "broken.md").write_text("no frontmatter here at all")
 
     for _ in range(3):
-        assert (await index.reindex()).problems == ["memory/facts/broken.md"]
+        assert [p.path for p in (await index.reindex()).problems] == ["memory/facts/broken.md"]
         fresh = await index.freshness()
         assert fresh.stale is False, "reindex cannot fix it, so it is not staleness"
         assert fresh.unreadable == ["memory/facts/broken.md"]
@@ -338,7 +338,7 @@ async def test_a_markdown_file_that_is_not_text_does_not_take_the_run_down(
     result = await MemoryIndex(store, repo).reindex()
 
     assert result.indexed, "the readable file was still indexed"
-    assert result.problems == ["memory/facts/binary.md"]
+    assert [p.path for p in result.problems] == ["memory/facts/binary.md"]
     assert (await MemoryIndex(store, repo).freshness()).stale is False
 
 
