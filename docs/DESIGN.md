@@ -134,6 +134,15 @@ mid-turn must queue, not interleave into one context window.
 
 Sessions are cheap and idle out; state lives in SQLite, so eviction is free.
 
+Free is a claim an actor has to keep earning, so an actor caches nothing: it
+re-reads the session row and its open episode at the start of every turn, and
+the turns themselves it never holds at all — the agent reads those from SQLite
+each time. A cached copy would be a second source of truth that goes stale the
+moment a background job touches the same session.
+
+This is the only ordering guarantee in the system. Within a session, strictly
+in arrival order; across sessions, everything at once.
+
 ---
 
 ## 4. Data model

@@ -6,7 +6,6 @@ import asyncio
 import signal
 import sys
 import textwrap
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,21 +14,11 @@ from kasa.core import inbox as inbox_module
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Dispatcher, Inbox
 from kasa.store import Store
+from tests.conftest import until
 
 
 def event(external_id: str, *, text: str = "hello", session: str = "cli:s1") -> InboundEvent:
     return InboundEvent(source="cli", external_id=external_id, session_id=session, text=text)
-
-
-async def until(predicate: Callable[[], bool], *, within: float = 5.0) -> None:
-    """Wait for a background loop to get somewhere, without sleeping blind."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + within
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.005)
-    raise AssertionError("timed out waiting for the dispatcher")
 
 
 async def running(dispatcher: Dispatcher) -> asyncio.Task[None]:
@@ -338,6 +327,7 @@ import asyncio, os, signal, sys
 
 from kasa.core.inbox import Inbox
 from kasa.store import Store
+from tests.conftest import until
 
 
 async def main() -> None:

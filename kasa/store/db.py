@@ -258,6 +258,24 @@ class Store:
         await self._conn.executemany(sql, rows)
         await self._conn.commit()
 
+    # -- episodes ------------------------------------------------------------
+
+    async def open_episode(self, session_id: str) -> dict[str, Any] | None:
+        """The episode this session is currently accumulating into, if any.
+
+        Read when an actor wakes for a session, so a turn knows what it is part
+        of. Opening and closing episodes belongs to `episode_close` (#27); this
+        only reports what is already there, and `None` is the normal answer
+        until that job exists.
+        """
+        async with self._conn.execute(
+            "SELECT * FROM episodes WHERE session_id = ? AND state = 'open'"
+            " ORDER BY started_at DESC LIMIT 1",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
     # -- observations --------------------------------------------------------
 
     async def add_observation(
