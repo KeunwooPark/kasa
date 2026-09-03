@@ -22,6 +22,7 @@ from kasa.memory.patch import (
     Archive,
     Create,
     Delete,
+    MemoryPatch,
     Merge,
     PatchCompiler,
     PatchError,
@@ -291,6 +292,47 @@ def test_narrowing_visibility_is_allowed(corpus: Corpus) -> None:
         [Update(id=doc.id, frontmatter={"visibility": "channel:C01"})], job="promote"
     )
     assert MemoryDoc.parse(changes[0].content).frontmatter.visibility == "channel:C01"  # type: ignore[union-attr]
+
+
+def test_no_patch_type_can_widen_visibility(corpus: Corpus) -> None:
+    """Every route to an existing memory, checked in one place.
+
+    #41 in spirit and #42 in fact: `supersede` was the one patch type with no
+    visibility check, and a private memory could be restated as a workspace one
+    and archived out of sight. A parametrized-by-construction test rather than
+    three separate ones, so that the next patch type that touches an existing
+    document has an obvious place to fail.
+    """
+    private = corpus.add(
+        MemoryDoc.new(type="fact", title="Salary review", visibility="private:U01")
+    )
+    public = corpus.add(MemoryDoc.new(type="fact", title="Public thing"))
+    widened = MemoryDoc.new(type="fact", title="Salary review cycle", body="Second week of Nov.")
+
+    plans: dict[str, list[MemoryPatch]] = {
+        "update": [Update(id=private.id, frontmatter={"visibility": "workspace"})],
+        "merge": [Merge(into=public.id, from_ids=[private.id], body="both")],
+        "supersede": [Supersede(old_id=private.id, new=widened)],
+    }
+    for name, plan in plans.items():
+        with pytest.raises(PatchError) as caught:
+            corpus.compiler().compile(plan, job="promote")
+        assert "visibility" in str(caught.value), f"{name} widened visibility"
+
+
+def test_supersede_may_still_narrow_or_keep_visibility(corpus: Corpus) -> None:
+    """The check refuses widening, not the operation."""
+    private = corpus.add(MemoryDoc.new(type="fact", title="Old note", visibility="private:U01"))
+    successor = MemoryDoc.new(
+        type="fact", title="New note", body="Restated.", visibility="private:U01"
+    )
+
+    changes = corpus.compiler().compile(
+        [Supersede(old_id=private.id, new=successor)], job="promote"
+    )
+    written = MemoryDoc.parse(changes[0].content)  # type: ignore[union-attr]
+    assert written.frontmatter.visibility == "private:U01"
+    assert private.id in written.frontmatter.supersedes
 
 
 def test_merging_across_visibility_scopes_is_refused(corpus: Corpus) -> None:
