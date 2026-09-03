@@ -304,6 +304,52 @@ async def test_a_supplied_rewriter_is_used(
 
 
 @pytest.mark.parametrize(
+    ("question", "unwanted"),
+    [
+        # #47: one generic word surviving into an OR is enough to drag a whole
+        # unrelated memory into the pool — and, at the time, into the prompt.
+        ("Who owns the deploy pipeline, and how should they be contacted?", "should"),
+        ("What do we know about postgres?", "know"),
+        ("Can you tell me more about the rota?", "tell"),
+        ("What else needs to happen before the cutover?", "else"),
+    ],
+)
+def test_generic_words_do_not_survive_into_the_query(question: str, unwanted: str) -> None:
+    assert unwanted not in build_match(question)
+
+
+async def test_a_generic_verb_does_not_drag_in_an_unrelated_memory(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The exact pair from #47, reduced to the two memories involved."""
+    bootstrap(tmp_path)
+    wanted = write(
+        tmp_path,
+        MemoryDoc.new(
+            type="person",
+            title="Jane Okafor",
+            body="Jane owns the deploy pipeline and prefers to be paged on Signal.",
+        ),
+    )
+    unrelated = write(
+        tmp_path,
+        MemoryDoc.new(
+            type="topic",
+            title="Postgres",
+            body="MySQL is legacy and no new service should use it.",
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve(
+        "Who owns the deploy pipeline, and how should they be contacted?"
+    )
+
+    assert wanted.id in retrieval.memory_ids
+    assert unrelated.id not in retrieval.memory_ids
+
+
+@pytest.mark.parametrize(
     "text",
     ["it's a NEAR thing", 'say "hello"', "a AND b OR c", "^caret *star", "", "-- dashes"],
 )

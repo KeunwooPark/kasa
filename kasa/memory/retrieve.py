@@ -82,9 +82,15 @@ _ANAPHORA = frozenset(
     }
 )
 
+#: Words too common to discriminate. A lexicon of function words and the
+#: generic verbs conversation is made of, not a frequency list — `build_match`
+#: ORs whatever survives, so one word like "should" in a question is enough to
+#: pull in a memory that happens to contain it (#47). Morphology is FTS's job:
+#: these are matched literally, and the porter tokenizer stems what is left.
 _STOPWORDS = frozenset(
     {
         "a",
+        "about",
         "an",
         "and",
         "any",
@@ -95,9 +101,11 @@ _STOPWORDS = frozenset(
         "but",
         "by",
         "can",
+        "could",
         "did",
         "do",
         "does",
+        "else",
         "for",
         "from",
         "get",
@@ -110,13 +118,21 @@ _STOPWORDS = frozenset(
         "in",
         "is",
         "it",
+        "know",
         "me",
+        "might",
+        "more",
+        "must",
         "my",
+        "need",
         "of",
         "on",
         "or",
         "our",
+        "say",
+        "should",
         "so",
+        "tell",
         "than",
         "that",
         "the",
@@ -130,6 +146,7 @@ _STOPWORDS = frozenset(
         "to",
         "up",
         "us",
+        "want",
         "was",
         "we",
         "were",
@@ -142,6 +159,7 @@ _STOPWORDS = frozenset(
         "why",
         "will",
         "with",
+        "would",
         "you",
         "your",
     }
@@ -259,6 +277,15 @@ def build_match(query: str) -> str:
     Every term is quoted and OR-ed. Quoting matters for correctness, not
     tidiness: an unquoted apostrophe or a bare `NEAR` in someone's message is a
     syntax error inside FTS5, and a syntax error here is a failed turn.
+
+    OR rather than AND, deliberately, even though #47 makes the case that ORing
+    generic terms drags in unrelated memories. AND would make one unusual word
+    in a question zero the whole result, and the golden set exists because
+    people do not phrase questions in the words the note was written in. The
+    discrimination belongs downstream: `bm25` scores a chunk matching three
+    terms above one matching one, and `_score` fuses on that ranking. What ORing
+    could not survive was a stopword list that let "should" through — so the
+    list is the fix, not the operator.
     """
     terms = [t for t in _WORD.findall(query.lower()) if t not in _STOPWORDS and len(t) > 1]
     seen = list(dict.fromkeys(terms))
