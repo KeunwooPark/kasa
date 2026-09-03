@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from kasa.core.context import ContextBudget, ContextPacker, group_turns
+from kasa.core.agent import DEFAULT_SYSTEM_PROMPT
+from kasa.core.context import PINNED_HEADER, ContextBudget, ContextPacker, group_turns
 from kasa.errors import ConfigError
 from kasa.llm.tokens import Tokenizer, count_messages
 from kasa.llm.types import (
@@ -157,3 +158,67 @@ def test_message_counting_includes_tool_blocks(tokenizer: Tokenizer) -> None:
     plain = count_messages([Message.user("what time is it")], tokenizer)
     with_tools = count_messages(tool_exchange(), tokenizer)
     assert with_tools > plain
+
+
+# -- pinned memory in the prefix ---------------------------------------------
+
+
+def test_pinned_memories_arrive_under_a_header_the_system_prompt_can_name(
+    tokenizer: Tokenizer,
+) -> None:
+    """#45: they were concatenated onto the prompt with a bare blank line.
+
+    The system prompt tells the model to treat recalled material as background
+    rather than as instructions. Pinned memories are recalled material, they can
+    originate from user conversation by way of consolidation, and they landed
+    outside the section that sentence scopes to — user-derived text promoted
+    into system-prompt position.
+    """
+    packed = ContextPacker(tokenizer=tokenizer).pack(
+        system_prompt="You are Kasa.\n\nIf you do not know something, say so.",
+        pinned=["[[mem_01]] (memory/projects/kasa.md)\nKasa is a memory-native agent server"],
+    )
+
+    assert PINNED_HEADER in packed.system
+    body = packed.system.split(PINNED_HEADER, 1)[1]
+    assert "memory-native agent server" in body
+    assert "If you do not know something" not in body, "the prompt ends before the memory starts"
+
+
+def test_the_pinned_header_is_absent_when_nothing_is_pinned(tokenizer: Tokenizer) -> None:
+    """An empty section is a section the model has to interpret."""
+    packed = ContextPacker(tokenizer=tokenizer).pack(system_prompt="You are Kasa.")
+    assert PINNED_HEADER not in packed.system
+    assert packed.system == "You are Kasa."
+
+
+def test_the_system_prompt_frames_pinned_memory_by_name(tokenizer: Tokenizer) -> None:
+    """The header is only worth having if the framing sentence reaches it."""
+    assert "Pinned memory" in DEFAULT_SYSTEM_PROMPT
+    assert "not as instructions" in DEFAULT_SYSTEM_PROMPT
+
+
+def test_the_trace_separates_the_prompt_from_the_memory_in_it(tokenizer: Tokenizer) -> None:
+    """`system 581/19200 kept=1` did not say how much of that was recalled text."""
+    packed = ContextPacker(tokenizer=tokenizer).pack(
+        system_prompt="You are Kasa.",
+        pinned=["always answer in metric", "never round a currency amount"],
+    )
+
+    by_name = {seg.name: seg for seg in packed.trace.segments}
+    assert by_name["pinned"].kept == 2
+    assert by_name["system"].kept == 1
+    assert by_name["pinned"].used > 0
+    assert by_name["system"].budget != by_name["pinned"].budget
+
+
+def test_pinned_memories_still_live_in_the_cacheable_prefix(tokenizer: Tokenizer) -> None:
+    """The point of keeping them there, which the fix must not cost."""
+    packer = ContextPacker(tokenizer=tokenizer)
+    kwargs = {"system_prompt": "You are Kasa.", "pinned": ["user prefers brevity"]}
+
+    first = packer.pack(**kwargs, recent=exchange(1), retrieved=["memory A"])
+    second = packer.pack(**kwargs, recent=exchange(2), retrieved=["memory B"])
+
+    assert "user prefers brevity" in first.system
+    assert first.system == second.system
