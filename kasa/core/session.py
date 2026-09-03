@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from kasa.core.events import InboundEvent
+from kasa.core.supervise import keep_running
 from kasa.errors import KasaError
 from kasa.store import Store
 
@@ -273,9 +274,7 @@ class SessionRouter:
         # attach a task to, and because a router that never delivers anything
         # has nothing to sweep.
         if self._sweeper is None:
-            self._sweeper = asyncio.create_task(self._sweep_forever(), name="session-sweeper")
-
-    async def _sweep_forever(self) -> None:
-        while True:
-            await asyncio.sleep(self._sweep_interval)
-            await self.evict_idle()
+            self._sweeper = asyncio.create_task(
+                keep_running(self.evict_idle, every=self._sweep_interval, name="session sweeper"),
+                name="session-sweeper",
+            )

@@ -9,6 +9,7 @@ import pytest
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Dispatcher, Inbox
 from kasa.core.session import SessionActor, SessionOverflow, SessionRouter, Turn
+from kasa.errors import StoreError
 from kasa.llm.types import Message
 from kasa.store import Store
 from tests.conftest import until
@@ -345,3 +346,25 @@ async def test_a_turn_that_raises_leaves_its_inbox_row_for_a_retry(store: Store)
         await router.aclose()
 
     assert await inbox.counts() == {"pending": 1}
+
+
+async def test_a_sweep_that_fails_does_not_end_the_sweeper(store: Store) -> None:
+    """`evict_idle` closes actors, which touches the store. The sweeper used to
+    stop on the first failure, and `_actors` then grows without bound for the
+    life of the process."""
+    sweeps = 0
+
+    async def handler(turn: Turn) -> None:
+        pass
+
+    router = SessionRouter(store, handler, sweep_interval=0.01)
+
+    async def failing_sweep() -> int:
+        nonlocal sweeps
+        sweeps += 1
+        raise StoreError("database is locked")
+
+    router.evict_idle = failing_sweep  # type: ignore[method-assign]
+    await router.deliver(event("E1"))  # the first delivery starts the sweeper
+    await until(lambda: sweeps >= 5)
+    await router.aclose()

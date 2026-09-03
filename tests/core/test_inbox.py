@@ -6,11 +6,13 @@ import asyncio
 import signal
 import sys
 import textwrap
+from collections.abc import Sequence
 from pathlib import Path
 
 from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Dispatcher, Inbox, LeasedEvent
+from kasa.errors import StoreError
 from kasa.store import Store
 from tests.conftest import until
 
@@ -283,6 +285,33 @@ async def test_a_batch_of_only_our_own_rows_polls_rather_than_spins(store: Store
     await asyncio.sleep(0.2)  # ten polls' worth
 
     assert leases < 40, f"{leases} leases in 0.2s is a spin, not a poll"
+    gate.set()
+    await stop(dispatcher, task)
+
+
+async def test_a_renewal_that_fails_does_not_end_the_keepalive(store: Store) -> None:
+    """`renew` reaches the store, so a locked database is enough to raise. The
+    keepalive used to stop there — no more renewals, no more purging, and no
+    warning, because the shutdown `gather` retrieves the exception."""
+    inbox = Inbox(store, lease_ttl=3.0)  # renewed every second
+    gate = asyncio.Event()
+    renewals = 0
+
+    async def failing_renew(ids: Sequence[int]) -> None:
+        nonlocal renewals
+        renewals += 1
+        raise StoreError("database is locked")
+
+    inbox.renew = failing_renew  # type: ignore[method-assign]
+
+    async def handler(inbound: InboundEvent) -> None:
+        await gate.wait()
+
+    dispatcher = Dispatcher(inbox, handler, poll_interval=0.01)
+    await inbox.enqueue(event("E1"))
+    task = await running(dispatcher)
+    await until(lambda: renewals >= 2, within=8.0)
+
     gate.set()
     await stop(dispatcher, task)
 
