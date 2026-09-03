@@ -24,7 +24,9 @@ from kasa.memory.retrieve import (
     build_match,
     is_self_contained,
     permits,
+    render_snippet,
 )
+from kasa.redact import Redactor
 from kasa.store import Store
 
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
@@ -769,3 +771,102 @@ async def test_a_smaller_limit_still_takes_the_best_ones(
     narrow = await search.retrieve("who owns the deploy pipeline", limit=2)
     assert len(narrow.kept) == 2
     assert corpus["Jane Okafor"] in narrow.memory_ids
+
+
+# -- redaction (#67) ---------------------------------------------------------
+
+
+LEAKY = {
+    "type": "topic",
+    "title": "Staging deploy key rotation",
+    "tags": ["infra", "credentials"],
+    "body": "The staging runner authenticates with AKIAIOSFODNN7EXAMPLE and the "
+    "deploy key below.\n\n"
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "MIIEpAIBAAKCAQEA1n2Xa9wZk3v4Qb8sT0pLmNoPqRsTuVwXyZ0123456789abcd\n"
+    "-----END RSA PRIVATE KEY-----\n\n"
+    "Rotate it when the migration lands.",
+}
+
+
+@pytest.fixture
+async def leaky(tmp_path: Path, store: Store) -> str:
+    """A single memory carrying credentials, indexed. Returns its id."""
+    bootstrap(tmp_path)
+    doc = MemoryDoc.new(**LEAKY)  # type: ignore[arg-type]
+    write(tmp_path, doc)
+    await MemoryIndex(store, tmp_path).reindex()
+    return doc.id
+
+
+async def test_a_credential_in_memory_never_reaches_the_prompt(
+    leaky: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """#67. The injection path is the default path, and it was the unscrubbed one."""
+    retrieval = await retriever(store, tokenizer, scrub=Redactor().scrub).retrieve(
+        "how does the staging runner authenticate", explain=True
+    )
+
+    assert retrieval.memory_ids == [leaky], "the memory has to actually be found"
+    packed = "\n".join([*retrieval.pinned, *retrieval.snippets])
+    assert "AKIAIOSFODNN7EXAMPLE" not in packed
+    assert "MIIEpAIB" not in packed
+    assert "Rotate it when the migration lands." in packed, "the useful text survives"
+
+
+async def test_every_view_of_a_candidate_is_scrubbed_not_just_the_snippet(
+    leaky: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """`memory_search` renders from `kept`, and `kasa why` from the trace.
+
+    Scrubbing only where snippets are built would leave both of those reading
+    the raw text off the same candidate — which is the shape of the original
+    bug, one funnel short.
+    """
+    retrieval = await retriever(store, tokenizer, scrub=Redactor().scrub).retrieve(
+        "staging runner deploy key", explain=True
+    )
+    assert retrieval.trace is not None
+
+    surfaces = [
+        *(render_snippet(c) for c in retrieval.kept),
+        *(c.text for c in retrieval.trace.candidates),
+        render_trace(retrieval),
+    ]
+    for text in surfaces:
+        assert "AKIAIOSFODNN7EXAMPLE" not in text
+        assert "MIIEpAIB" not in text
+
+
+async def test_redaction_does_not_change_what_ranks(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """Scrubbing runs after scoring, so a corpus with no secrets ranks identically."""
+    question = "who owns the deploy pipeline"
+    plain = await retriever(store, tokenizer).retrieve(question)
+    scrubbed = await retriever(store, tokenizer, scrub=Redactor().scrub).retrieve(question)
+
+    assert scrubbed.memory_ids == plain.memory_ids
+    assert scrubbed.snippets == plain.snippets
+
+
+async def test_the_budget_is_charged_for_the_redacted_text(
+    leaky: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """A token budget counted before redaction would be counting text nobody sends."""
+    retrieval = await retriever(store, tokenizer, scrub=Redactor().scrub).retrieve(
+        "how does the staging runner authenticate"
+    )
+    assert retrieval.trace is not None
+    assert retrieval.trace.used_tokens == sum(
+        tokenizer.count(s) for s in [*retrieval.pinned, *retrieval.snippets]
+    )
+
+
+async def test_a_retriever_with_no_scrubber_is_unchanged(
+    leaky: str, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The default stays raw: a retriever built without a config is still usable,
+    and every caller that builds a prompt passes one."""
+    retrieval = await retriever(store, tokenizer).retrieve("staging runner deploy key")
+    assert "AKIAIOSFODNN7EXAMPLE" in "\n".join(retrieval.snippets)

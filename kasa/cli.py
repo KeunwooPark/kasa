@@ -154,6 +154,11 @@ def why(
                 store,
                 tokenizer=default_tokenizer(),
                 budget_tokens=cfg.context.tokens_for_retrieval(),
+                # Scrubbed here too, even though this prints to a terminal
+                # rather than to a model. `kasa why` output is what gets pasted
+                # into a bug report; the file itself is one `cat` away for an
+                # operator who actually needs the raw value.
+                scrub=Redactor.from_config(cfg).scrub,
             )
             retrieval = await retriever.retrieve(question, scope=scope, explain=True)
         # markup=False because a memory id arrives as `[[mem_01...]]`, and rich
@@ -299,6 +304,10 @@ async def _repl(cfg: Config) -> None:
     # registry: aiosqlite holds a non-daemon thread per connection, so leaking
     # one leaves the process alive after the error has already been printed.
     tokenizer = default_tokenizer()
+    # One redactor for the whole session: it reads the environment once, and
+    # both places that send text onwards — recalled memory and tool results —
+    # have to agree about what counts as a secret.
+    scrub = Redactor.from_config(cfg).scrub
     async with await Store.open(cfg.store.resolved()) as store:
         registry = cfg.build_registry(store=store)
         tools = builtin_tools()
@@ -316,6 +325,7 @@ async def _repl(cfg: Config) -> None:
                     store,
                     tokenizer=tokenizer,
                     budget_tokens=cfg.context.tokens_for_retrieval(),
+                    scrub=scrub,
                 )
                 tools += memory_tools(retriever=retriever, memory=memory, store=store)
 
@@ -324,7 +334,7 @@ async def _repl(cfg: Config) -> None:
                 Agent(
                     registry=registry,
                     store=store,
-                    tools=ToolRegistry(tools, scrub=Redactor.from_config(cfg).scrub),
+                    tools=ToolRegistry(tools, scrub=scrub),
                     packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
                     config=cfg.agent_config(),
                     retriever=retriever,

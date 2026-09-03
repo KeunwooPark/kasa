@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -25,6 +26,11 @@ from kasa.llm.types import (
     ToolUseStop,
     Usage,
 )
+from kasa.memory.bootstrap import bootstrap
+from kasa.memory.document import MemoryDoc
+from kasa.memory.index import MemoryIndex
+from kasa.memory.retrieve import Retriever
+from kasa.redact import Redactor
 from kasa.store import Store
 
 SCHEMA: dict[str, Any] = {"type": "object", "properties": {"city": {"type": "string"}}}
@@ -106,6 +112,7 @@ def build(
     *,
     tools: list[Tool] | None = None,
     config: AgentConfig | None = None,
+    retriever: Retriever | None = None,
 ) -> tuple[Agent, ScriptedProvider]:
     provider = ScriptedProvider(script)
     agent = Agent(
@@ -116,6 +123,7 @@ def build(
         ),
         packer=ContextPacker(tokenizer=tokenizer),
         config=config,
+        retriever=retriever,
     )
     return agent, provider
 
@@ -337,3 +345,41 @@ def test_an_ordinary_answer_says_nothing_extra() -> None:
 def test_an_empty_reply_that_ended_normally_is_still_worth_naming() -> None:
     """Same symptom from the user's side: a prompt that answered nothing."""
     assert AgentResult(text="   ").note == "the model returned nothing."
+
+
+# -- retrieval reaches the prompt scrubbed (#67) ------------------------------
+
+
+async def test_a_credential_in_memory_does_not_reach_the_provider(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """End to end, the way `kasa run` wires it: corpus -> retriever -> prompt.
+
+    The pre-injected path is the one every turn takes, and it was the one
+    nothing scrubbed. Asserting on the request the provider actually received,
+    because that is the only place the question "was it sent?" has an answer.
+    """
+    bootstrap(tmp_path)
+    doc = MemoryDoc.new(
+        type="topic",
+        title="Staging deploy key rotation",
+        tags=["infra"],
+        body="The staging runner authenticates with AKIAIOSFODNN7EXAMPLE. "
+        "Rotate it when the migration lands.",
+    )
+    (tmp_path / doc.suggested_path()).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / doc.suggested_path()).write_text(doc.render())
+    await MemoryIndex(store, tmp_path).reindex()
+
+    agent, provider = build(
+        store,
+        tokenizer,
+        [says("noted")],
+        retriever=Retriever(store, tokenizer=tokenizer, scrub=Redactor().scrub),
+    )
+    await agent.respond("s1", "how does the staging runner authenticate?")
+
+    sent = provider.requests[0]
+    everything = f"{sent.system}\n{sent.context}"
+    assert "Rotate it when the migration lands." in everything, "memory was retrieved"
+    assert "AKIAIOSFODNN7EXAMPLE" not in everything
