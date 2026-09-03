@@ -465,6 +465,96 @@ async def test_results_are_deduped_by_memory(
     assert retrieval.memory_ids.count(doc.id) == 1
 
 
+async def test_a_title_hit_injects_the_body_not_the_title(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The header chunk locates a memory; it is not what gets injected.
+
+    Regression for #41: the synthetic title/tag chunk matched both source
+    queries, fused twice, and beat its own prose into the one slot `_pack`
+    allows each memory — so the model received a file name where the answer
+    should have been.
+    """
+    bootstrap(tmp_path)
+    write(
+        tmp_path,
+        MemoryDoc.new(
+            type="person",
+            title="Jane owns the deploy pipeline",
+            tags=["infra", "ownership", "deploy"],
+            body="Jane Kowalski owns the deploy pipeline and the release runbook. "
+            "She prefers to be paged on Signal rather than by phone.",
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve(
+        "Who owns the deploy pipeline, and how should they be contacted?"
+    )
+
+    injected = "\n".join(retrieval.snippets)
+    assert "Signal" in injected, "the question is answerable from what was injected"
+    assert "infra ownership deploy" not in injected, "the tag list is not content"
+
+
+async def test_a_memory_found_only_by_its_title_still_arrives_with_its_prose(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """The header exists for exactly this case, and must not be the answer to it."""
+    bootstrap(tmp_path)
+    write(
+        tmp_path,
+        MemoryDoc.new(
+            type="topic",
+            title="Deploy pipeline ownership",
+            body="Ask Jane. She reviews everything that touches it.",
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve("deploy pipeline ownership")
+
+    assert "Ask Jane" in "\n".join(retrieval.snippets)
+
+
+async def test_a_pinned_memory_arrives_as_its_body(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """A standing instruction is in every prompt. Its title is not the instruction."""
+    bootstrap(tmp_path)
+    write(
+        tmp_path,
+        MemoryDoc.new(
+            type="fact",
+            title="Standing instruction",
+            tags=["style"],
+            body="Always answer in metric units, and never round a currency amount.",
+            pinned=True,
+        ),
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve("a question about nothing in particular")
+
+    assert "Always answer in metric units" in "\n".join(retrieval.pinned)
+
+
+async def test_a_memory_with_no_body_falls_back_to_its_header(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    """A title-only memory has nothing else to give, and is still worth finding."""
+    bootstrap(tmp_path)
+    titled = write(
+        tmp_path, MemoryDoc.new(type="fact", title="The wifi password is on the whiteboard")
+    )
+    await MemoryIndex(store, tmp_path).reindex()
+
+    retrieval = await retriever(store, tokenizer).retrieve("what is the wifi password")
+
+    assert titled.id in retrieval.memory_ids
+    assert "whiteboard" in "\n".join(retrieval.snippets)
+
+
 async def test_the_retrieval_budget_is_respected(
     corpus: dict[str, str], store: Store, tokenizer: Tokenizer
 ) -> None:

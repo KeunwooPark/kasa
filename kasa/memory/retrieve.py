@@ -45,6 +45,14 @@ RRF_K = 60
 #: memory is supposed to be long-term; recency breaks ties, it does not rank.
 RECENCY_HALF_LIFE_DAYS = 120.0
 
+#: How much a title/tag hit outweighs one buried in prose. The header list is a
+#: separate ranking over a much smaller field, and a memory whose *title* is
+#: about the question is usually the memory that was wanted. Until #41 this
+#: weight was an accident — the header chunk matched both source queries and so
+#: fused twice — and 2.0 keeps the ranking it produced now that the hit is
+#: carried by the body instead.
+HEADER_WEIGHT = 2.0
+
 #: How many chunks each candidate source contributes before fusion.
 SOURCE_LIMIT = 30
 
@@ -325,14 +333,37 @@ class Retriever:
                 row, lexical_rank=rank, bm25=float(str(row["score"]))
             )
         for rank, row in enumerate(header, start=1):
-            chunk_id = str(row["id"])
-            existing = found.get(chunk_id)
-            found[chunk_id] = (
-                replace(existing, header_rank=rank)
-                if existing is not None
-                else _candidate(row, header_rank=rank, bm25=float(str(row["score"])))
-            )
+            await self._carry_header_rank(found, row, rank, scope)
         return [self._score(c) for c in found.values()]
+
+    async def _carry_header_rank(
+        self, found: dict[str, Candidate], row: Row, rank: int, scope: str
+    ) -> None:
+        """Attach a title/tag hit to the memory's prose rather than to itself.
+
+        The header chunk is a locator. It exists so that a memory titled "Deploy
+        pipeline ownership" can be found by that phrase, and it holds the title
+        and the tags — which is to say, nothing the model could not already
+        guess from the file path. Packing it in place of the body was the bug in
+        #41: because the header matched both source queries it fused twice and
+        outranked its own prose, and `_pack` keeps one chunk per memory.
+
+        So the rank lands on every body chunk of the memory, boosting the file
+        the way a title hit should, and the header itself is packed only by a
+        memory that has no prose to offer instead.
+        """
+        memory_id = str(row["memory_id"])
+        bodies = [c for c in found.values() if c.memory_id == memory_id and c.ordinal > 0]
+        if bodies:
+            for candidate in bodies:
+                found[candidate.chunk_id] = replace(candidate, header_rank=rank)
+            return
+
+        lead = await self._lead_body(memory_id, scope)
+        source = lead if lead is not None else row
+        found[str(source["id"])] = _candidate(
+            source, header_rank=rank, bm25=float(str(row["score"]))
+        )
 
     async def _match(self, match: str, scope: str, *, header_only: bool) -> list[Row]:
         # The scope filter is part of the query, not a later pass. A memory the
@@ -343,10 +374,21 @@ class Retriever:
             " FROM chunks_fts f JOIN chunks c ON c.rowid = f.rowid"
             " WHERE chunks_fts MATCH ?"
             "   AND (c.scope = 'workspace' OR c.scope = ?)"
-            + ("   AND c.ordinal = 0" if header_only else "")
+            + ("   AND c.ordinal = 0" if header_only else "   AND c.ordinal > 0")
             + " ORDER BY score LIMIT ?",
             (match, scope, SOURCE_LIMIT),
         )
+
+    async def _lead_body(self, memory_id: str, scope: str) -> Row | None:
+        """The first prose chunk of a memory located by its title or tags."""
+        rows = await self._store.raw(
+            "SELECT id, memory_id, path, ordinal, text, scope, salience, pinned, updated_at"
+            " FROM chunks WHERE memory_id = ? AND ordinal > 0"
+            "   AND (scope = 'workspace' OR scope = ?)"
+            " ORDER BY ordinal LIMIT 1",
+            (memory_id, scope),
+        )
+        return rows[0] if rows else None
 
     async def _pinned(self, scope: str) -> list[Candidate]:
         rows = await self._store.raw(
@@ -355,7 +397,10 @@ class Retriever:
             " ORDER BY memory_id, ordinal",
             (scope,),
         )
-        return [self._score(_candidate(row)) for row in rows]
+        # Pinned chunks all score alike, so packing takes the first one listed.
+        # Without this that is always the header, and a standing instruction
+        # arrives in every single prompt as its own title.
+        return [self._score(_candidate(row)) for row in _prefer_body(rows)]
 
     async def _denied(self, match: str, scope: str) -> list[Candidate]:
         """What the scope filter excluded. Explanation only — never packed."""
@@ -381,9 +426,10 @@ class Retriever:
         if candidate.lexical_rank is not None:
             fused += 1.0 / (RRF_K + candidate.lexical_rank)
         if candidate.header_rank is not None:
-            # A hit on the title or tags is a stronger signal than one buried in
-            # prose, so the header list fuses in as its own ranking.
-            fused += 1.0 / (RRF_K + candidate.header_rank)
+            # The memory's title or tags matched, which is a stronger signal
+            # than a hit buried in prose, so that list fuses in as its own
+            # ranking. It is carried by the body — see `_carry_header_rank`.
+            fused += HEADER_WEIGHT / (RRF_K + candidate.header_rank)
         if candidate.pinned:
             fused += 1.0 / RRF_K
 
@@ -461,6 +507,17 @@ def _candidate(
         bm25=bm25,
         denied=denied,
     )
+
+
+def _prefer_body(rows: Sequence[Row]) -> list[Row]:
+    """Drop each memory's header row when it has prose to offer instead."""
+    by_memory: dict[str, list[Row]] = {}
+    for row in rows:
+        by_memory.setdefault(str(row["memory_id"]), []).append(row)
+    kept: list[Row] = []
+    for group in by_memory.values():
+        kept.extend([r for r in group if int(str(r["ordinal"])) > 0] or group)
+    return kept
 
 
 def _merge(candidates: Sequence[Candidate]) -> list[Candidate]:
