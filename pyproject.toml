@@ -1,0 +1,62 @@
+[project]
+name = "kasa"
+version = "0.0.1"
+description = "A long-running, memory-native AI agent server reachable over chat"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+    "jsonschema>=4.21",
+    "platformdirs>=4.2",
+    "pydantic>=2.7",
+    "python-ulid>=2.7",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+tiktoken = ["tiktoken>=0.7"]
+
+[project.scripts]
+kasa = "kasa.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "types-jsonschema>=4.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kasa"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+ignore = ["B008"]  # typer relies on defaults that call functions
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = []
+
+[[tool.mypy.overrides]]
+module = ["ulid.*", "tiktoken.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
