@@ -17,6 +17,7 @@ from kasa.adapters.cli import run_repl
 from kasa.config import Config, config_path, load_config
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
+from kasa.core.memory_tools import memory_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
@@ -24,6 +25,7 @@ from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
 from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
+from kasa.memory.ltm import MemoryStore, MemoryStoreError
 from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.store import Store
@@ -285,16 +287,36 @@ async def _repl(cfg: Config) -> None:
     # The store must be closed on every path, including a failure to build the
     # registry: aiosqlite holds a non-daemon thread per connection, so leaking
     # one leaves the process alive after the error has already been printed.
+    tokenizer = default_tokenizer()
     async with await Store.open(cfg.store.resolved()) as store:
         registry = cfg.build_registry(store=store)
+        tools = builtin_tools()
+        retriever = None
+
+        if cfg.ltm.configured:
+            try:
+                memory = await MemoryStore.open(cfg, store)
+            except MemoryStoreError as exc:
+                # Running without memory beats not running: the conversation
+                # still works, and `kasa doctor` says what is wrong.
+                err.print(f"[yellow]![/yellow] long-term memory unavailable — {exc}")
+            else:
+                retriever = Retriever(
+                    store,
+                    tokenizer=tokenizer,
+                    budget_tokens=cfg.context.tokens_for_retrieval(),
+                )
+                tools += memory_tools(retriever=retriever, memory=memory, store=store)
+
         try:
             await run_repl(
                 Agent(
                     registry=registry,
                     store=store,
-                    tools=ToolRegistry(builtin_tools(), scrub=Redactor.from_config(cfg).scrub),
-                    packer=ContextPacker(cfg.context.to_budget(), tokenizer=default_tokenizer()),
+                    tools=ToolRegistry(tools, scrub=Redactor.from_config(cfg).scrub),
+                    packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
                     config=cfg.agent_config(),
+                    retriever=retriever,
                 ),
                 console,
             )

@@ -11,10 +11,14 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**v0 — it talks.** Terminal adapter, agent turn loop, tool dispatch, and both
-provider families. **v1 — it remembers on purpose** is in progress: `kasa init`
-now sets up the private memory repo, and retrieval follows. See the
+**v1 — it remembers on purpose.** Long-term memory lives in a private git repo
+of Markdown files. Retrieval is lexical (FTS5 + BM25, scope-filtered) and runs
+on every turn; the agent can also search, read, and propose memories with tools.
+Consolidation is still manual — background jobs arrive in v3. See the
 [milestones](https://github.com/KeunwooPark/kasa/milestones).
+
+Nothing writes to the memory repo without going through a typed patch plan that
+deterministic code validates first, and no delete is ever a force-push.
 
 ## Quick start
 
@@ -52,6 +56,24 @@ kasa db migrate   apply pending migrations
 `kasa doctor` exits non-zero if any check failed, so it works as a health check.
 Kasa also re-checks on every start that the memory repo is still private, and
 refuses to run if it is not.
+
+## Memory
+
+Every memory is a Markdown file with YAML frontmatter, under `memory/` in the
+repo `kasa init` set up. Correct a belief by editing the file; the agent reads
+your version. See what it decided to believe with `git log`; undo it with
+`git revert`.
+
+During a conversation the agent can:
+
+- `memory_search` — look for something the pre-injected context did not carry
+- `memory_read` — read one memory in full, by id
+- `memory_write` — *propose* something worth remembering
+
+`memory_write` does not write a file. It queues a candidate fact that the
+consolidation job reviews, so the interactive path and the background path share
+one validated write path. Anything scoped to a DM or a private channel stays
+there: retrieval filters on visibility before it ranks.
 
 ## Development
 

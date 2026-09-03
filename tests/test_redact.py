@@ -6,7 +6,7 @@ import logging
 import pytest
 
 from kasa.config import Config
-from kasa.core.tools import Tool, ToolRegistry
+from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.types import ToolUseBlock
 from kasa.redact import MIN_SECRET_LENGTH, Redactor
 
@@ -115,7 +115,7 @@ def test_log_records_are_scrubbed() -> None:
 
 
 async def test_tool_results_are_scrubbed_before_reaching_the_model() -> None:
-    async def leaky(args: dict[str, object]) -> str:
+    async def leaky(args: dict[str, object], context: ToolContext) -> str:
         return "fetched with token ghp_averylongtokenvalue000"
 
     registry = ToolRegistry(
@@ -136,7 +136,7 @@ async def test_tool_results_are_scrubbed_before_reaching_the_model() -> None:
 
 
 async def test_tool_error_messages_are_scrubbed_too() -> None:
-    async def explode(args: dict[str, object]) -> str:
+    async def explode(args: dict[str, object], context: ToolContext) -> str:
         raise RuntimeError("bad remote https://x:ghp_averylongtokenvalue@github.com/a/b")
 
     registry = ToolRegistry(
@@ -157,7 +157,7 @@ async def test_tool_error_messages_are_scrubbed_too() -> None:
 
 
 async def test_dispatch_without_a_scrubber_is_unchanged() -> None:
-    async def plain(args: dict[str, object]) -> str:
+    async def plain(args: dict[str, object], context: ToolContext) -> str:
         return "just text"
 
     registry = ToolRegistry(

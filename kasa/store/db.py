@@ -232,6 +232,54 @@ class Store:
         await self._conn.executemany(sql, rows)
         await self._conn.commit()
 
+    # -- observations --------------------------------------------------------
+
+    async def add_observation(
+        self,
+        *,
+        subject: str,
+        claim: str,
+        kind: str,
+        scope: str,
+        session_id: str | None = None,
+        episode_id: str | None = None,
+        confidence: float = 0.7,
+        source_refs: Sequence[str] = (),
+    ) -> str:
+        """Record a candidate fact. Nothing durable happens until `promote` runs."""
+        observation_id = str(ULID())
+        # An observation outlives the session that produced it, and losing the
+        # fact because the bookkeeping link is missing would be the wrong trade.
+        if session_id is not None and await self.get_session(session_id) is None:
+            session_id = None
+        await self._conn.execute(
+            "INSERT INTO observations"
+            " (id, episode_id, session_id, subject, claim, kind, confidence, scope,"
+            "  source_refs, state, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                observation_id,
+                episode_id,
+                session_id,
+                subject,
+                claim,
+                kind,
+                confidence,
+                scope,
+                json_dumps(list(source_refs)),
+                _now(),
+            ),
+        )
+        await self._conn.commit()
+        return observation_id
+
+    async def pending_observations(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self._conn.execute(
+            "SELECT * FROM observations WHERE state = 'pending' ORDER BY created_at LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
     # -- leases --------------------------------------------------------------
 
     async def take_lease(

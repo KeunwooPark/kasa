@@ -21,7 +21,22 @@ from kasa.llm.types import ToolDef, ToolResultBlock, ToolUseBlock
 
 log = logging.getLogger(__name__)
 
-ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
+
+@dataclass(frozen=True, slots=True)
+class ToolContext:
+    """Who is calling, and what they are allowed to see.
+
+    Passed explicitly rather than carried in a context variable. `scope` decides
+    whether a tool call may read a private memory, and a security-relevant value
+    hidden in ambient state is one that eventually gets read from the wrong
+    place. The model never supplies it; the session does.
+    """
+
+    session_id: str = "cli"
+    scope: str = "workspace"
+
+
+ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[str]]
 
 #: Applied to every tool result before it re-enters the transcript. Tool output
 #: is the one part of a prompt Kasa does not write itself, so it is the one part
@@ -68,7 +83,9 @@ class ToolRegistry:
         # keeps it inside the cacheable prefix.
         return tuple(t.to_def() for t in sorted(self._tools.values(), key=lambda t: t.name))
 
-    async def dispatch(self, use: ToolUseBlock) -> ToolResultBlock:
+    async def dispatch(
+        self, use: ToolUseBlock, context: ToolContext | None = None
+    ) -> ToolResultBlock:
         tool = self._tools.get(use.name)
         if tool is None:
             known = ", ".join(sorted(self._tools)) or "none"
@@ -81,7 +98,7 @@ class ToolRegistry:
 
         try:
             async with asyncio.timeout(tool.timeout):
-                result = await tool.handler(use.input)
+                result = await tool.handler(use.input, context or ToolContext())
         except TimeoutError:
             return self._error(use, f"tool timed out after {tool.timeout:g}s")
         except asyncio.CancelledError:
@@ -102,7 +119,7 @@ class ToolRegistry:
 # -- built-ins ---------------------------------------------------------------
 
 
-async def _current_time(args: dict[str, Any]) -> str:
+async def _current_time(args: dict[str, Any], context: ToolContext) -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
@@ -115,9 +132,5 @@ CURRENT_TIME = Tool(
 
 
 def builtin_tools() -> list[Tool]:
-    """Tools available in every session.
-
-    Kept deliberately thin at v0. The memory tools land in v1 (#16), where they
-    enqueue observations rather than writing anything directly.
-    """
+    """Tools available in every session, with or without a memory repo."""
     return [CURRENT_TIME]
