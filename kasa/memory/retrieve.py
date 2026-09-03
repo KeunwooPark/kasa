@@ -224,13 +224,18 @@ class RetrievalTrace:
 
 @dataclass(slots=True)
 class Retrieval:
+    #: Split for the context packer, which files pinned material into the
+    #: cacheable prefix and the rest into the per-turn block. The split is a
+    #: destination, not an order — read `kept` when rank is what matters.
     snippets: list[str] = field(default_factory=list)
     pinned: list[str] = field(default_factory=list)
+    #: Everything packed, best first, whichever block it went to.
+    kept: list[Candidate] = field(default_factory=list)
     trace: RetrievalTrace | None = None
 
     @property
     def memory_ids(self) -> list[str]:
-        return [c.memory_id for c in (self.trace.kept if self.trace else [])]
+        return [c.memory_id for c in self.kept]
 
 
 def permits(requester_scope: str, memory_scope: str) -> bool:
@@ -317,7 +322,17 @@ class Retriever:
         scope: str = "workspace",
         recent: Sequence[str] = (),
         explain: bool = False,
+        include_pinned: bool = True,
     ) -> Retrieval:
+        """Rank memories against `question`.
+
+        `include_pinned` adds every pinned memory to the pool whether or not it
+        matched, which is what the context packer wants: standing instructions
+        should arrive in the prompt unasked. A caller that is answering an
+        explicit query wants the opposite — see `memory_search`. Pinned
+        memories that *do* match are found by the lexical query either way, and
+        keep their pinned bonus.
+        """
         query, rewritten = await self._build_query(question, recent)
         match = build_match(query)
         trace = RetrievalTrace(
@@ -330,7 +345,7 @@ class Retriever:
         )
 
         candidates = await self._candidates(match, scope)
-        pinned = await self._pinned(scope)
+        pinned = await self._pinned(scope) if include_pinned else []
         merged = _merge(candidates + pinned)
         for candidate in merged:
             trace.candidates.append(candidate)
@@ -513,9 +528,10 @@ class Retriever:
                 continue
             seen.add(candidate.memory_id)
             used += cost
-            trace.kept.append(candidate)
+            result.kept.append(candidate)
             (result.pinned if candidate.pinned else result.snippets).append(snippet)
 
+        trace.kept = result.kept
         trace.used_tokens = used
         return result
 

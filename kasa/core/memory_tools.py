@@ -24,7 +24,7 @@ from typing import Any
 from kasa.core.tools import Tool, ToolContext
 from kasa.memory.document import MemoryDoc, MemoryError_, is_memory_id
 from kasa.memory.ltm import MemoryStore, MemoryStoreError
-from kasa.memory.retrieve import Retriever, permits
+from kasa.memory.retrieve import Retriever, permits, render_snippet
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
@@ -66,11 +66,16 @@ def _search_tool(retriever: Retriever) -> Tool:
                 return f"This conversation cannot search the scope {hint!r}."
             scope = str(hint)
 
-        retrieval = await retriever.retrieve(query, scope=scope)
-        found = retrieval.pinned + retrieval.snippets
-        if not found:
+        # Pinned memories are excluded from the pool and the results are read
+        # in rank order. Both matter here and nowhere else: an explicit search
+        # asked for what matches, and every pinned memory is already in the
+        # prompt under `# Pinned memory`. Leading with one answered a question
+        # nobody asked, and spent a result slot doing it. A pinned memory that
+        # does match the query still ranks, and still gets its pinned bonus.
+        retrieval = await retriever.retrieve(query, scope=scope, include_pinned=False)
+        if not retrieval.kept:
             return f"No memories matched {query!r}."
-        return "\n\n".join(found[:limit])
+        return "\n\n".join(render_snippet(c) for c in retrieval.kept[:limit])
 
     return Tool(
         name="memory_search",
