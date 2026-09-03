@@ -140,7 +140,10 @@ def test_fallback_provider_keys_are_covered(monkeypatch: pytest.MonkeyPatch) -> 
     assert "fallbacksecret" not in Redactor.from_config(cfg).scrub("sk-fallbacksecretvalue")
 
 
-# -- the two places it is installed -------------------------------------------
+# -- the three places it is installed -----------------------------------------
+#
+# Logging handlers, `ToolRegistry`, and `Retriever` — the last added by #67,
+# and tested in `tests/memory/test_retrieve.py` because it needs a corpus.
 
 
 def test_log_records_are_scrubbed() -> None:

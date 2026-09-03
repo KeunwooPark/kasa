@@ -21,6 +21,11 @@ report what was excluded — and marks those rows so they cannot be packed.
 **Every step is recorded.** Retrieval you cannot debug is retrieval you cannot
 improve, and essentially every complaint about this system will arrive as "why
 did it not remember X". `kasa why` prints what this module recorded.
+
+**Recalled text is scrubbed on the way out.** A secret that reaches long-term
+memory is replayed to the provider on every turn that retrieves it, so the
+redactor belongs on this boundary and not only on the tool path — see `scrub`
+on `Retriever` and #67.
 """
 
 from __future__ import annotations
@@ -36,6 +41,9 @@ from kasa.llm.tokens import Tokenizer
 from kasa.store import Store
 
 Row = dict[str, Any]
+
+#: Replaces secret material in recalled text. `kasa.redact.Redactor.scrub`.
+Scrubber = Callable[[str], str]
 
 #: Reciprocal-rank-fusion constant. 60 is the value from the original paper and
 #: is not worth tuning until there is a second list to fuse with.
@@ -309,6 +317,7 @@ class Retriever:
         budget_tokens: int = 4_000,
         limit: int = DEFAULT_LIMIT,
         rewriter: Rewriter | None = None,
+        scrub: Scrubber | None = None,
         now: datetime | None = None,
     ) -> None:
         self._store = store
@@ -316,6 +325,10 @@ class Retriever:
         self._budget = budget_tokens
         self._limit = limit
         self._rewriter = rewriter
+        # Defaulting to no scrubbing keeps the retriever usable without a
+        # config — every caller that builds a prompt passes one, and there is a
+        # test that says so.
+        self._scrub = scrub
         self._now = now
 
     async def retrieve(
@@ -343,6 +356,10 @@ class Retriever:
         retrieval every turn pays for. A caller that has decided the prompt did
         not have enough is asking a different question, and gets to say how many
         answers it wants. The token budget still caps both.
+
+        Every candidate's text is scrubbed before it is ranked into anything a
+        caller can read, so the trace, the snippets and `kept` all carry the
+        same redacted text.
         """
         query, rewritten = await self._build_query(question, recent)
         match = build_match(query)
@@ -357,7 +374,7 @@ class Retriever:
 
         candidates = await self._candidates(match, scope)
         pinned = await self._pinned(scope) if include_pinned else []
-        merged = _merge(candidates + pinned)
+        merged = [self._redact(c) for c in _merge(candidates + pinned)]
         for candidate in merged:
             trace.candidates.append(candidate)
 
@@ -517,6 +534,33 @@ class Retriever:
         now = self._now or datetime.now(UTC)
         age_days = max((now - updated).total_seconds() / 86_400, 0.0)
         return math.exp(-age_days * math.log(2) / RECENCY_HALF_LIFE_DAYS)
+
+    # -- redaction -----------------------------------------------------------
+
+    def _redact(self, candidate: Candidate) -> Candidate:
+        """Scrub a candidate's text once, before anything downstream reads it.
+
+        Here rather than in `render_snippet` or in the context packer because
+        this is the single point every consumer of recalled text passes
+        through: the pre-injected snippets, `memory_search`, `kept`, and the
+        trace `kasa why` prints. #67 was that the redactor sat only on
+        `ToolRegistry`, so the same memory was scrubbed when the model *asked*
+        for it and sent verbatim when the model was *given* it — and being
+        given it is the path every turn takes.
+
+        After scoring, so redaction cannot change what ranks; before packing,
+        so the token budget is charged for the text actually sent.
+
+        The conversation itself is deliberately not scrubbed here. A key the
+        user just pasted is theirs, sent to the provider in that turn by their
+        own act; a key sitting in long-term memory is replayed unbidden on
+        every turn that retrieves it, forever. Only the second is this
+        module's to fix.
+        """
+        if self._scrub is None:
+            return candidate
+        scrubbed = self._scrub(candidate.text)
+        return candidate if scrubbed == candidate.text else replace(candidate, text=scrubbed)
 
     # -- packing -------------------------------------------------------------
 

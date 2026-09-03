@@ -9,6 +9,11 @@ private key carries.
 
 Neither is a guarantee, and this is not a substitute for not putting secrets
 somewhere. It is the net under the times somebody does.
+
+Installed in three places, each of them a boundary where text Kasa did not just
+receive from the user leaves for somewhere it cannot be taken back from:
+logging handlers, `ToolRegistry` (tool results), and `Retriever` (recalled
+memory, which is replayed into the prompt on every turn that retrieves it).
 """
 
 from __future__ import annotations
