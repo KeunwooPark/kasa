@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 from ulid import ULID
 
+from kasa import __version__
 from kasa.core.agent import Agent, AgentResult
 from kasa.llm.types import Delta, TextDelta
 
@@ -31,6 +32,20 @@ HELP = """\
 """
 
 
+def banner() -> str:
+    """The first line of output a new user sees.
+
+    The version is read from the package rather than written into the string,
+    which is how this greeted a build that remembers with the words "v0,
+    conversation only. No memory yet." (#48). A label maintained by hand is a
+    label that goes stale silently.
+    """
+    return (
+        f"[bold]kasa[/bold] [dim]{__version__}[/dim] — conversation, with long-term memory.\n"
+        "[dim]/help for commands[/dim]"
+    )
+
+
 @dataclass
 class Repl:
     agent: Agent
@@ -39,13 +54,7 @@ class Repl:
     last_result: AgentResult | None = None
 
     async def run(self) -> None:
-        self.console.print(
-            Panel.fit(
-                "[bold]kasa[/bold] — v0, conversation only. No memory yet.\n"
-                "[dim]/help for commands[/dim]",
-                border_style="cyan",
-            )
-        )
+        self.console.print(Panel.fit(banner(), border_style="cyan"))
         while True:
             try:
                 line = (await asyncio.to_thread(input, PROMPT)).strip()
