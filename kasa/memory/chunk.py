@@ -38,6 +38,7 @@ class Chunk:
     text: str
     scope: str
     salience: float
+    pinned: bool
     updated_at: str
 
 
@@ -57,6 +58,7 @@ def chunk_document(doc: MemoryDoc, path: str) -> list[Chunk]:
             text=text,
             scope=frontmatter.visibility,
             salience=frontmatter.salience,
+            pinned=frontmatter.pinned,
             updated_at=updated,
         )
         for ordinal, text in enumerate(texts)

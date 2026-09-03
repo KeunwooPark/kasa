@@ -169,6 +169,11 @@ class ContextSettings(BaseModel):
     def to_budget(self) -> ContextBudget:
         return ContextBudget(**self.model_dump())
 
+    def tokens_for_retrieval(self) -> int:
+        """The share retrieval may fill. Retrieval truncates to this itself, so
+        that what `kasa why` reports is what the packer would have received."""
+        return self.to_budget().tokens_for(self.retrieved)
+
 
 class StoreSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")

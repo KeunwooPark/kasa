@@ -140,10 +140,20 @@ class MemoryIndex:
         await self._store.write("DELETE FROM chunks WHERE path = ?", (path,))
         await self._store.write_many(
             "INSERT INTO chunks"
-            " (id, memory_id, path, ordinal, text, scope, salience, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " (id, memory_id, path, ordinal, text, scope, salience, pinned, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (c.id, c.memory_id, c.path, c.ordinal, c.text, c.scope, c.salience, c.updated_at)
+                (
+                    c.id,
+                    c.memory_id,
+                    c.path,
+                    c.ordinal,
+                    c.text,
+                    c.scope,
+                    c.salience,
+                    int(c.pinned),
+                    c.updated_at,
+                )
                 for c in chunks
             ],
         )

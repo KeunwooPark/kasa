@@ -22,7 +22,9 @@ from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import KasaError
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
+from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
+from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.store import Store
 
@@ -112,6 +114,39 @@ def reindex(
         console.print(result.summary())
         for problem in result.problems:
             err.print(f"[yellow]![/yellow] could not index {problem}")
+
+    _run(main())
+
+
+@app.command()
+def why(
+    question: Annotated[str, typer.Argument(help="The question to trace retrieval for.")],
+    config: ConfigOption = None,
+    scope: Annotated[str, typer.Option(help="Answer as a session in this scope.")] = "workspace",
+) -> None:
+    """Show the full retrieval trace for a question.
+
+    Every complaint about this system arrives as "why did it not remember X".
+    This is the answer: the query, every candidate and its scores, what scope
+    filtering removed, and what actually fitted in the budget.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        if not cfg.ltm.configured:
+            err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
+            raise typer.Exit(1)
+        async with await Store.open(cfg.store.resolved()) as store:
+            retriever = Retriever(
+                store,
+                tokenizer=default_tokenizer(),
+                budget_tokens=cfg.context.tokens_for_retrieval(),
+            )
+            retrieval = await retriever.retrieve(question, scope=scope, explain=True)
+        # markup=False because a memory id arrives as `[[mem_01...]]`, and rich
+        # reads square brackets as style tags — it renders the ids away entirely.
+        # soft_wrap because the score table is meant to be read in columns.
+        console.print(render_trace(retrieval), highlight=False, markup=False, soft_wrap=True)
 
     _run(main())
 
