@@ -224,17 +224,33 @@ async def _index(cfg: Config, store: Store) -> Check:
 
     index = MemoryIndex(store, root)
     stats = await index.stats()
-    if await index.is_stale():
+    fresh = await index.freshness()
+    if fresh.stale:
         return Check(
             "index freshness",
             Status.WARN,
             f"{stats['chunks']} chunk(s) indexed, but the repo has moved on — run `kasa reindex`",
         )
-    return Check(
-        "index freshness",
-        Status.OK,
-        f"{stats['chunks']} chunk(s) across {stats['memories']} memories",
-    )
+    counted = f"{stats['chunks']} chunk(s) across {stats['memories']} memories"
+    if fresh.unreadable:
+        # Deliberately not "run `kasa reindex`". Reindex has already refused
+        # these and will refuse them again; the fix is to the file. The
+        # `manifest` check below says why each one failed.
+        return Check(
+            "index freshness",
+            Status.WARN,
+            f"{counted}; {len(fresh.unreadable)} file(s) cannot be indexed: "
+            + _listed(fresh.unreadable),
+        )
+    return Check("index freshness", Status.OK, counted)
+
+
+def _listed(paths: list[str], limit: int = 3) -> str:
+    """Name the first few and admit to the rest. One broken file is the common
+    case and deserves its name; forty should not fill the terminal."""
+    shown = ", ".join(paths[:limit])
+    extra = len(paths) - limit
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
 def _manifest(cfg: Config) -> Check:

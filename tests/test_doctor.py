@@ -13,6 +13,7 @@ from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo
+from kasa.memory.index import MemoryIndex
 from kasa.memory.manifest import Manifest
 from kasa.store import Store
 from tests.conftest import mock_client
@@ -269,3 +270,44 @@ async def test_a_manifest_in_step_with_the_repo_passes(tmp_path: Path, clone: Pa
 
     assert status_of(report, "manifest") is Status.OK
     assert "1 memories resolvable" in detail_of(report, "manifest")
+
+
+# -- index freshness ---------------------------------------------------------
+
+
+async def test_a_stale_index_says_to_reindex(tmp_path: Path, clone: Path) -> None:
+    doc = MemoryDoc.new(type="fact", title="Never indexed", body="Written by hand.")
+    target = clone / doc.suggested_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(doc.render())
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "index freshness") is Status.WARN
+    assert "run `kasa reindex`" in detail_of(report, "index freshness")
+
+
+async def test_an_unreadable_file_is_not_reported_as_staleness(tmp_path: Path, clone: Path) -> None:
+    """#69. `kasa reindex` had already run three times and could not clear it,
+    because a file the parser refuses never reaches `index_state`."""
+    async with await Store.open(tmp_path / "kasa.db") as store:
+        await MemoryIndex(store, clone).reindex()
+    (clone / "memory" / "facts" / "broken.md").write_text("no frontmatter here at all")
+
+    report = await diagnose(config_for(tmp_path), github=github())
+    detail = detail_of(report, "index freshness")
+
+    assert status_of(report, "index freshness") is Status.WARN
+    assert "the repo has moved on" not in detail
+    assert "run `kasa reindex`" not in detail, "it has, and it cannot fix this"
+    assert "memory/facts/broken.md" in detail
+    assert "cannot be indexed" in detail
+
+
+async def test_a_clean_index_says_what_it_holds(tmp_path: Path, clone: Path) -> None:
+    async with await Store.open(tmp_path / "kasa.db") as store:
+        await MemoryIndex(store, clone).reindex()
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "index freshness") is Status.OK

@@ -281,6 +281,67 @@ async def test_staleness_is_detected(repo: Path, store: Store) -> None:
     assert await index.is_stale() is True
 
 
+async def test_a_file_the_indexer_refuses_is_not_staleness(repo: Path, store: Store) -> None:
+    """#69. A broken file is never written to `index_state`, so hash comparison
+    alone said the repo had moved on — forever, and `kasa reindex` could not
+    change it."""
+    index = MemoryIndex(store, repo)
+    add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    await index.reindex()
+
+    (repo / "memory" / "facts" / "broken.md").write_text("no frontmatter here at all")
+
+    for _ in range(3):
+        assert (await index.reindex()).problems == ["memory/facts/broken.md"]
+        fresh = await index.freshness()
+        assert fresh.stale is False, "reindex cannot fix it, so it is not staleness"
+        assert fresh.unreadable == ["memory/facts/broken.md"]
+        assert fresh.changed == []
+
+
+async def test_a_file_that_was_indexed_and_then_broken_is_still_not_staleness(
+    repo: Path, store: Store
+) -> None:
+    """The index keeps the old chunks, and a reindex would not replace them —
+    which is exactly why the answer has to name the file rather than the index."""
+    index = MemoryIndex(store, repo)
+    path = add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    await index.reindex()
+
+    (repo / path).write_text("mangled by hand")
+    fresh = await index.freshness()
+
+    assert fresh.stale is False
+    assert fresh.unreadable == [path]
+
+
+async def test_a_deleted_file_is_staleness(repo: Path, store: Store) -> None:
+    index = MemoryIndex(store, repo)
+    path = add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    await index.reindex()
+
+    (repo / path).unlink()
+    fresh = await index.freshness()
+
+    assert fresh.stale is True
+    assert fresh.removed == [path]
+
+
+async def test_a_markdown_file_that_is_not_text_does_not_take_the_run_down(
+    repo: Path, store: Store
+) -> None:
+    """A stray binary or a bad `git add`. It used to raise `UnicodeDecodeError`
+    out of `reindex`, losing the report of everything already indexed."""
+    add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    (repo / "memory" / "facts" / "binary.md").write_bytes(b"\xff\xfe\x00not utf-8")
+
+    result = await MemoryIndex(store, repo).reindex()
+
+    assert result.indexed, "the readable file was still indexed"
+    assert result.problems == ["memory/facts/binary.md"]
+    assert (await MemoryIndex(store, repo).freshness()).stale is False
+
+
 async def test_stats_report_what_is_indexed(repo: Path, store: Store) -> None:
     add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
     await MemoryIndex(store, repo).reindex()
