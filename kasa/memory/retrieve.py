@@ -4,6 +4,12 @@ Hybrid retrieval arrives in #31. This is the lexical half, and it has to be
 good enough to be useful on its own, because a memory system that only works
 once embeddings are configured is a memory system that does not work.
 
+It has one known blind spot, and it is the ordinary one for lexical search:
+derivational morphology. Porter stemming turns "deploying" into "deploy" but
+leaves "deployments" alone, so a memory about the "deploy pipeline" does not
+answer "who handles deployments?". Inflection is handled; word formation is not.
+That gap is the case for #31 rather than for a bigger stopword list.
+
 Two things here are not merely engineering preferences:
 
 **The scope filter runs in SQL, before ranking.** Not after fusion, not during

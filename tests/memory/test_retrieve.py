@@ -198,6 +198,26 @@ async def test_questions_do_not_have_to_match_the_notes_word_for_word(
     assert corpus["Staging credentials rotate monthly"] in inflected.memory_ids[:5]
 
 
+async def test_derivational_morphology_is_a_known_gap(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """A characterization test, not an endorsement.
+
+    Porter stems "deploying" to "deploy" but leaves "deployments" alone, so this
+    question misses a memory that is plainly about it. Inflection is handled;
+    word formation is not, and no amount of stopword tuning fixes that — it is
+    the case for hybrid retrieval in #31.
+
+    When #31 lands this test should start failing. Delete it then.
+    """
+    found = await retriever(store, tokenizer).retrieve("Who handles deployments?")
+    assert corpus["Jane Okafor"] not in found.memory_ids
+
+    # The same question in the words the memory uses works fine.
+    rephrased = await retriever(store, tokenizer).retrieve("Who handles deploying?")
+    assert corpus["Jane Okafor"] in rephrased.memory_ids[:5]
+
+
 # -- query construction ------------------------------------------------------
 
 
