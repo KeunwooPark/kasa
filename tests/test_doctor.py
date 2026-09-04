@@ -6,8 +6,8 @@ from typing import Any
 import httpx
 import pytest
 
-from kasa.config import Config, SlackSettings, write_config
-from kasa.doctor import Check, Report, Status, _slack, diagnose, verify_repo_visibility
+from kasa.config import Config, SearchSettings, SlackSettings, write_config
+from kasa.doctor import Check, Report, Status, _search, _slack, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
@@ -519,3 +519,52 @@ async def test_an_exported_variable_shadowing_the_vault_warns(
     assert status_of(report, "vault shadowed") is Status.WARN
     assert "TEST_KEY" in detail_of(report, "vault shadowed")
     assert "the-stored-one" not in detail_of(report, "vault shadowed")
+
+
+# -- web search --------------------------------------------------------------
+
+
+async def test_search_is_skipped_when_it_is_not_configured() -> None:
+    """Skip rather than warn. Most installs will never want the agent reading
+    the open web, and nagging about it trains people to ignore the report."""
+    check = _search(Config())
+
+    assert check.status is Status.SKIP
+    assert "cannot search" in check.detail
+
+
+async def test_a_missing_search_key_fails_rather_than_waiting_for_a_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KASA_BRAVE", raising=False)
+    cfg = Config(search=SearchSettings(kind="brave", key_env="KASA_BRAVE"))
+
+    check = _search(cfg)
+
+    assert check.status is Status.FAIL
+    assert check.detail == "brave — KASA_BRAVE is not set"
+
+
+async def test_a_configured_search_says_where_its_key_came_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KASA_BRAVE", "bsa-1")
+    cfg = Config(search=SearchSettings(kind="brave", key_env="KASA_BRAVE"))
+
+    check = _search(cfg)
+
+    assert check.status is Status.OK
+    assert check.detail == "brave via KASA_BRAVE"
+
+
+async def test_the_key_is_resolved_from_the_vault_as_well_as_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same resolution order as every other credential: env, then vault."""
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    stored(tmp_path, monkeypatch, BRAVE_SEARCH_API_KEY="bsa-1")
+
+    check = _search(Config(search=SearchSettings(kind="brave")))
+
+    assert check.status is Status.OK
+    assert check.detail == "brave via BRAVE_SEARCH_API_KEY"

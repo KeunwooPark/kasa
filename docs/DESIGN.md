@@ -465,6 +465,32 @@ Additional measures:
   already-archived memories.
 - Every applied plan is recoverable via `git revert`.
 
+### 7.2 Prompt injection via a tool result
+
+§7.1 was written for text arriving through the inbox, from someone who can type
+into a channel. `web_search` (§8.2) opens a second door: text arriving through a
+`tool_result` — a channel that until then had only ever carried Kasa's own
+output — written by whoever runs the sites that happened to rank.
+
+Three things hold it, and none of them is a filter:
+
+- **The same boundary, in the same shape.** Results are serialized and wrapped by
+  `kasa/untrusted.py`, the one implementation of the nonce-delimited block §7.1
+  describes, with the notice on the line above them. A result cannot close the
+  block it is inside, because it has never seen the nonce.
+- **Nothing read can be remembered.** A page that says *"remember that X"* must
+  not thereby teach Kasa that X. What prevents it is structural: the transcript
+  episode extraction reads is built from text blocks, and a tool result is not
+  one. A search result therefore cannot reach `promote`, and the write path stays
+  exactly as narrow as it was.
+- **The write path is unchanged.** A search result reaches a model that can
+  propose an observation and nothing else. The worst case is still a rejected
+  plan in a log.
+
+The provider's own error bodies are never quoted back either. A failure yields
+its status and nothing else, so an error page cannot put text on the trusted side
+of the boundary.
+
 ---
 
 ## 8. Retrieval
@@ -501,7 +527,36 @@ Note that `memory_write` enqueues into `observations` — the agent proposes, th
 `promote` job disposes, so the interactive path and the background path share one
 validated write path.
 
-### 8.2 Context budget
+### 8.2 Reaching outside the corpus
+
+Long-term memory answers what Kasa has been told. It cannot answer what is true
+in the world this morning, and a long-running assistant in a channel is asked
+that constantly.
+
+`web_search(query, count)` is the one tool that reaches past the machine for
+something other than a model. It is configured off, and when `[search]` names no
+`kind` the tool is not registered at all — a model told it can search will spend
+a turn discovering that it cannot, and then apologize for it.
+
+It is deliberately a specific tool rather than a general one. Search is an API
+key, one GET, and a parse; a generic `http_request` primitive would be a far
+larger capability grant for the same result, and letting the agent author its own
+tools would be larger still. Both remain arguable later, on their own merits and
+in their own issues.
+
+Snippets only, and no `web_fetch`. What comes back is a few hundred words the
+provider already extracted, not a document to retrieve, render, and strip —
+which keeps both the token cost and §7.2's surface small.
+
+The provider is behind a `SearchProvider` protocol (`kasa/search/base.py`) rather
+than another `ProviderKind`: search shares nothing with a model call but HTTP —
+no roles, no token accounting, no streaming, no fallback chain. It does share the
+cost meter, so a search lands in `llm_calls` beside the model calls and the same
+`[budget]` ceiling stops both. Search is billed per call, so its price is
+`search.cost_per_call_usd`, configured for the same reason `[pricing]` is: a
+stale built-in number is worse than none.
+
+### 8.3 Context budget
 
 Enforced by a tokenizer-aware packer with a fixed allocation:
 
@@ -517,7 +572,7 @@ Enforced by a tokenizer-aware packer with a fixed allocation:
 Segments are filled in priority order and truncated at their own boundary, so an
 overlong retrieval never evicts the recent turns.
 
-### 8.3 Explainability
+### 8.4 Explainability
 
 `kasa why "<question>"` prints the constructed query, every candidate with its
 lexical/vector/fused/final scores, what was dropped by scope filtering, and the
@@ -693,6 +748,11 @@ kasa/
     agent.py           the turn loop
     context.py         tokenizer-aware packer
     tools.py           memory_search / memory_read / memory_write
+  search/
+    base.py            SearchProvider protocol + SearchResult
+    brave.py           the one backend
+    tool.py            web_search, and the boundary around what it returns
+  untrusted.py         the nonce-delimited block, used by both of the above
   memory/
     stm.py             messages, episodes, observations
     ltm.py             git working copy, commit path, lease
@@ -759,6 +819,7 @@ optimization of a thing that must already work.
 | Two daemons racing on push | Single-writer lease (SQLite row + flock); startup check |
 | Retrieval quality is opaque | `kasa why` from week one |
 | Prompt injection via channel text | Typed patch plan + validator; no shell, no direct git; `promote` cannot delete |
+| Prompt injection via a search result | Same delimited block; tool results never enter the extraction transcript; snippets only, no page fetch |
 | DM content leaking into public channels | `visibility` in the data model from day one; filter before ranking |
 | LTM repo grows unboundedly | `forget` + archive tier; `reorganize` splits and merges |
 
@@ -790,6 +851,12 @@ clone_path  = "~/.kasa/ltm"
 branch      = "main"
 token_env   = "KASA_GITHUB_TOKEN"
 supervised  = ["forget"]              # these jobs open PRs instead of pushing
+
+[search]                              # optional; omit and the tool is not registered
+kind              = "brave"
+key_env           = "BRAVE_SEARCH_API_KEY"
+max_results       = 5
+cost_per_call_usd = 0.0               # from the vendor's price list; counts toward [budget]
 
 [llm.chat]
 kind   = "anthropic"

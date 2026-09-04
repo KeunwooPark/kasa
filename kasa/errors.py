@@ -94,6 +94,15 @@ class ToolError(KasaError):
     """A tool could not be dispatched, or failed in a way the agent should see."""
 
 
+class SearchError(KasaError):
+    """A web search could not be performed.
+
+    Not an `LLMError`: nothing retries or falls back over it. It travels up to
+    the tool dispatcher, which turns it into an `is_error` tool result for the
+    model to read and work around.
+    """
+
+
 class StoreError(KasaError):
     """The database could not be opened or read.
 

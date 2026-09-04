@@ -27,10 +27,12 @@ from kasa.config import (
     LTMSettings,
     ProviderConfig,
     ProviderKind,
+    SearchSettings,
     SlackSettings,
     anchored,
     config_path,
     default_key_env,
+    default_search_key_env,
     load_config,
     write_config,
 )
@@ -124,6 +126,7 @@ async def run_init(
         prompter, cfg.llm, model_discovery=model_discovery or discover_models
     )
     slack = _configure_slack(prompter, cfg.slack)
+    search = _configure_search(prompter, cfg.search)
 
     cfg = Config(
         ltm=ltm,
@@ -133,6 +136,7 @@ async def run_init(
         context=cfg.context,
         store=cfg.store,
         retry=cfg.retry,
+        search=search,
         budget=cfg.budget,
         pricing=cfg.pricing,
     )
@@ -422,4 +426,31 @@ def _configure_slack(prompter: Prompter, current: SlackSettings) -> SlackSetting
         app_token_env=app_token_env or None,
         bot_token_env=bot_token_env or None,
         allowed_channels=[c.strip() for c in channels.split(",") if c.strip()],
+    )
+
+
+def _configure_search(prompter: Prompter, current: SearchSettings) -> SearchSettings:
+    """The optional web-search step.
+
+    Off by default, and said plainly rather than sold: letting an agent read the
+    open web is a decision about what may enter its prompts, not a convenience,
+    and someone setting Kasa up should make it on purpose.
+    """
+    prompter.say(
+        "Web search is optional. It needs a Brave Search API key, and it lets "
+        "text from the open web into Kasa's context — always delimited and "
+        "never treated as instructions, but there."
+    )
+    if not prompter.confirm("Configure web search?", default=current.configured):
+        return SearchSettings()
+
+    key_env = prompter.ask(
+        "Env var holding the Brave Search API key",
+        default=current.key_env or default_search_key_env("brave"),
+    ).strip()
+    return SearchSettings(
+        kind="brave",
+        key_env=key_env or None,
+        max_results=current.max_results,
+        cost_per_call_usd=current.cost_per_call_usd,
     )

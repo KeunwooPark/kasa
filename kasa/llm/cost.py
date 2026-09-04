@@ -122,8 +122,12 @@ class CostMeter:
         ok: bool = True,
         error: str | None = None,
         session_id: str | None = None,
+        cost_usd: float | None = None,
     ) -> CallRecord:
-        cost = self._prices.cost_usd(model, usage)
+        # An explicit cost wins over the token table. Not everything metered
+        # here is priced per token — web search is billed per call — and a
+        # per-call price looked up by token count would always come back zero.
+        cost = cost_usd if cost_usd is not None else self._prices.cost_usd(model, usage)
         self.total = self.total + usage
         if session_id is not None:
             self._sessions[session_id] = self.session_usage(session_id) + usage

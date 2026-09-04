@@ -152,13 +152,15 @@ class _RedactingFilter(logging.Filter):
 
 
 def _referenced_env_names(cfg: Config) -> set[str]:
-    from kasa.config import default_key_env
+    from kasa.config import default_key_env, default_search_key_env
 
     names = {cfg.ltm.token_env}
     names |= {n for n in (cfg.slack.app_token_env, cfg.slack.bot_token_env) if n}
     for provider in cfg.llm.values():
         for entry in (provider, *provider.fallbacks):
             names.add(entry.key_env or default_key_env(entry.kind))
+    if cfg.search.kind is not None:
+        names.add(cfg.search.key_env or default_search_key_env(cfg.search.kind))
     return names
 
 

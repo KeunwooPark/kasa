@@ -29,10 +29,13 @@ from kasa.llm.cost import CostMeter, Price, PriceBook
 from kasa.llm.openai_compat import OpenAICompatProvider
 from kasa.llm.registry import ModelRole, ProviderRegistry, RetryPolicy
 from kasa.memory.salience import Decay
+from kasa.search.base import SearchProvider
+from kasa.search.brave import BraveSearch
 from kasa.store import Store
 from kasa.vault import resolve
 
 ProviderKind = Literal["openai", "anthropic"]
+SearchKind = Literal["brave"]
 
 NO_CHAT_PROVIDER = (
     "no model configured for the 'chat' role.\n"
@@ -436,6 +439,54 @@ class PriceSettings(BaseModel):
     cache_write: float = 0.0
 
 
+class SearchSettings(BaseModel):
+    """Web search, off unless a `kind` is set.
+
+    Absent configuration means the tool is never registered, rather than
+    registered and failing on use. A model told it can search will spend a turn
+    finding out that it cannot, and then apologize for it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: SearchKind | None = None
+    key_env: str | None = None
+    base_url: str | None = None
+    #: Well under `DEFAULT_TOOL_TIMEOUT`. A search is a detour on a turn
+    #: somebody is waiting through, and a slow one should be abandoned rather
+    #: than spend the whole budget for the reply.
+    timeout_seconds: float = Field(default=10.0, gt=0)
+    max_results: int = Field(default=5, ge=1, le=10)
+    #: USD per call, from the vendor's price list. Zero — the default — still
+    #: counts calls; it just cannot contribute to the daily ceiling. Same
+    #: bargain as `[pricing]`: a stale built-in number is worse than none.
+    cost_per_call_usd: float = Field(default=0.0, ge=0)
+
+    @property
+    def configured(self) -> bool:
+        return self.kind is not None
+
+    def api_key(self) -> str:
+        if self.kind is None:
+            raise ConfigError("web search is not configured; set `kind` under [search]")
+        env = self.key_env or default_search_key_env(self.kind)
+        key = resolve(env)
+        if not key:
+            raise ConfigError(
+                f"{env} is not set and is not in the vault "
+                f"(needed for {self.kind} web search).\n"
+                f"Export it, or run `kasa vault set {env}`."
+            )
+        return key
+
+    def build(self) -> SearchProvider:
+        return BraveSearch(
+            api_key=self.api_key(),
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+        )
+
+
 class BudgetSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -470,6 +521,7 @@ class Config(BaseModel):
     context: ContextSettings = Field(default_factory=ContextSettings)
     store: StoreSettings = Field(default_factory=StoreSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
     #: USD per million tokens, keyed by model-name prefix. Empty by default:
     #: a stale built-in price table is worse than an absent one.
@@ -521,6 +573,10 @@ async def _null_sink(record: Any) -> None:
 
 def default_key_env(kind: ProviderKind) -> str:
     return "ANTHROPIC_API_KEY" if kind == "anthropic" else "OPENAI_API_KEY"
+
+
+def default_search_key_env(kind: SearchKind) -> str:
+    return {"brave": "BRAVE_SEARCH_API_KEY"}[kind]
 
 
 def anchored(value: str, *, base: Path) -> Path:
@@ -684,6 +740,14 @@ def render_toml(cfg: Config) -> str:
             "slack",
             cfg.slack,
             comment="# Socket Mode: the connection is outbound, so there is no ingress.",
+        )
+
+    if cfg.search.configured:
+        lines += _table(
+            "search",
+            cfg.search,
+            comment="# Web search. Results are untrusted text; see docs/DESIGN.md.",
+            full=True,
         )
 
     for name, section in (

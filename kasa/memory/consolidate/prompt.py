@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from kasa.llm.types import ChatRequest, Message
 from kasa.memory.patch import MemoryPatch, PatchError, Rejection, parse_plan
+from kasa.untrusted import delimit
 
 log = logging.getLogger(__name__)
 
@@ -43,11 +43,7 @@ def untrusted_block(content: ConsolidationInput) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
-    while True:
-        marker = f"KASA_UNTRUSTED_{secrets.token_hex(16).upper()}"
-        if marker not in payload:
-            break
-    return f"<<<BEGIN {marker}>>>\n{payload}\n<<<END {marker}>>>"
+    return delimit(payload)
 
 
 def build_request(*, job: str, task: str, content: ConsolidationInput) -> ChatRequest:

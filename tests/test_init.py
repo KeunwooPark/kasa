@@ -477,3 +477,62 @@ async def test_a_relative_clone_answer_is_stored_absolutely(
     assert cfg.ltm.resolved_clone_path() == tmp_path / "ltm-here"
     assert (tmp_path / "ltm-here" / SCHEMA_PATH).exists(), "and that is where it cloned"
     assert not (elsewhere / "ltm-here").exists(), "not next to the shell it was run from"
+
+
+# -- web search --------------------------------------------------------------
+
+
+async def test_web_search_is_off_unless_it_is_asked_for(tmp_path: Path, remote: str) -> None:
+    """Reading the open web is a decision about what may enter Kasa's prompts,
+    so it is made on purpose rather than arrived at by pressing enter."""
+    prompter = ScriptedPrompter(
+        {"memory repo": "someone/kasa-memory", "clone path": str(tmp_path / "ltm")},
+        confirms={"web search": False},
+    )
+    _, config, _ = await do_init(tmp_path, remote, prompter=prompter)
+
+    assert not load_config(config).search.configured
+
+
+async def test_web_search_records_the_key_by_name(tmp_path: Path, remote: str) -> None:
+    prompter = ScriptedPrompter(
+        {
+            "memory repo": "someone/kasa-memory",
+            "clone path": str(tmp_path / "ltm"),
+            "Brave Search API key": "KASA_BRAVE",
+        },
+        confirms={"web search": True},
+    )
+    _, config, _ = await do_init(tmp_path, remote, prompter=prompter)
+
+    search = load_config(config).search
+    assert search.kind == "brave"
+    assert search.key_env == "KASA_BRAVE"
+
+
+async def test_the_search_step_says_what_it_lets_in(tmp_path: Path, remote: str) -> None:
+    prompter = ScriptedPrompter(
+        {"memory repo": "someone/kasa-memory", "clone path": str(tmp_path / "ltm")},
+        confirms={"web search": False},
+    )
+    await do_init(tmp_path, remote, prompter=prompter)
+
+    assert any("open web" in said for said in prompter.said)
+
+
+async def test_turning_search_off_again_clears_the_section(tmp_path: Path, remote: str) -> None:
+    """Declining on a re-run must remove it, not leave a stale key behind."""
+    enabling = ScriptedPrompter(
+        {"memory repo": "someone/kasa-memory", "clone path": str(tmp_path / "ltm")},
+        confirms={"web search": True},
+    )
+    _, config, _ = await do_init(tmp_path, remote, prompter=enabling)
+    assert load_config(config).search.configured
+
+    disabling = ScriptedPrompter(
+        {"memory repo": "someone/kasa-memory", "clone path": str(tmp_path / "ltm")},
+        confirms={"web search": False},
+    )
+    await do_init(tmp_path, remote, prompter=disabling)
+
+    assert not load_config(config).search.configured

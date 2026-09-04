@@ -20,7 +20,8 @@ import pytest
 from typer.testing import CliRunner
 
 from kasa import __version__
-from kasa.cli import app
+from kasa.cli import _agent, app
+from kasa.config import Config, ProviderConfig, SearchSettings, StoreSettings
 from kasa.core.backoff import Backoff
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import Inbox
@@ -519,3 +520,54 @@ def test_job_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
     result = runner.invoke(app, ["job", "retry", "--config", str(config)])
     assert result.exit_code == 0, result.output
     assert "requeued 1 job(s)" in result.output
+
+
+# -- the web_search tool is registered only when it is configured -------------
+
+
+async def _tool_names(cfg: Config) -> set[str]:
+    async with _agent(cfg) as agent:
+        return {d.name for d in agent.tools.defs()}
+
+
+def _searchable(tmp_path: Path, **search: object) -> Config:
+    return Config(
+        llm={"chat": ProviderConfig(kind="anthropic", model="claude-opus-5")},
+        store=StoreSettings(path=str(tmp_path / "kasa.db")),
+        search=SearchSettings(**search),  # type: ignore[arg-type]
+    )
+
+
+async def test_no_search_configured_means_no_web_search_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not a tool that fails on use. A model told it can search will spend a
+    turn finding out that it cannot, and then apologize for it."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    assert "web_search" not in await _tool_names(_searchable(tmp_path))
+
+
+async def test_a_configured_search_registers_the_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KASA_BRAVE", "bsa-1")
+
+    names = await _tool_names(_searchable(tmp_path, kind="brave", key_env="KASA_BRAVE"))
+
+    assert "web_search" in names
+
+
+async def test_a_search_key_that_will_not_resolve_does_not_stop_the_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same posture as an unavailable memory repo: answer without the
+    capability rather than refuse to start, and let `kasa doctor` say why."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.delenv("KASA_BRAVE", raising=False)
+
+    names = await _tool_names(_searchable(tmp_path, kind="brave", key_env="KASA_BRAVE"))
+
+    assert "web_search" not in names
+    assert "current_time" in names, "and the rest of the session still works"
