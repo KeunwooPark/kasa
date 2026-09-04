@@ -6,6 +6,7 @@ import asyncio
 import errno
 import fcntl
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,14 +49,14 @@ TERMINAL = frozenset({"done", "failed"})
 
 
 def only_spec(cfg: Config, store: Store) -> JobSpec:
-    """The reindex spec, from a config that registers nothing else.
+    """The reindex spec.
 
-    `config_for` deliberately has no model configured, so `episode_close` does
-    not register and this stays the one spec these tests are about.
+    `config_for` deliberately has no model configured, so the only other thing
+    that registers alongside it is `forget`, which needs no model either.
     """
-    specs = default_specs(cfg, store)
-    assert [spec.kind for spec in specs] == ["reindex"]
-    return specs[0]
+    specs = {spec.kind: spec for spec in default_specs(cfg, store)}
+    assert sorted(specs) == ["forget", "reindex"]
+    return specs["reindex"]
 
 
 def test_reindex_polls_for_merged_supervised_prs(clone: Path, store: Store) -> None:
@@ -189,7 +190,7 @@ async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
         for _ in range(2000):
             states = [
                 row["state"]
-                for row in await store.raw("SELECT state FROM jobs WHERE id NOT LIKE 'reindex@%'")
+                for row in await store.raw("SELECT state FROM jobs WHERE id NOT LIKE '%@%'")
             ]
             if all(state in TERMINAL for state in states):
                 break
@@ -198,7 +199,7 @@ async def test_two_reindex_jobs_at_once_do_not_dead_letter_each_other(
         scheduler.stop()
         await asyncio.wait_for(task, timeout=10.0)
 
-    rows = await store.raw("SELECT state, last_error FROM jobs WHERE id NOT LIKE 'reindex@%'")
+    rows = await store.raw("SELECT state, last_error FROM jobs WHERE id NOT LIKE '%@%'")
     assert [row["state"] for row in rows] == ["done", "done"]
     assert [row["last_error"] for row in rows] == [None, None]
 
@@ -249,3 +250,28 @@ def test_reorganize_runs_weekly(clone: Path, store: Store) -> None:
     assert specs["reorganize"].cron is not None
     assert specs["reorganize"].cron.expression == WEEKLY
     assert "reorganize" not in [spec.kind for spec in default_specs(config_for(clone), store)]
+
+
+def test_forget_needs_no_model(clone: Path, store: Store) -> None:
+    """The one job that removes things has no judgement in it: salience is a
+    number, age is a number, and `pinned` is a boolean. It registers on the
+    repo alone, and a build with no API key still collects."""
+    kinds = [spec.kind for spec in default_specs(config_for(clone), store)]
+
+    assert "forget" in kinds
+
+
+def test_forget_and_reorganize_do_not_fire_on_the_same_minute(clone: Path, store: Store) -> None:
+    """Both take the memory write lease. Queued together, one waits out the
+    other's lease every week for no reason."""
+    specs = {spec.kind: spec for spec in default_specs(with_model(config_for(clone)), store)}
+    moment = datetime(2026, 9, 4, tzinfo=UTC)
+
+    assert specs["forget"].cron is not None and specs["reorganize"].cron is not None
+    assert specs["forget"].cron.next_after(moment) != specs["reorganize"].cron.next_after(moment)
+
+
+def test_forget_is_supervised_by_default() -> None:
+    """`docs/DESIGN.md` §5.1: it opens a pull request rather than pushing, and
+    somebody reads it before anything leaves the branch."""
+    assert Config().ltm.supervised == ["forget"]
