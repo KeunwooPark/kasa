@@ -2,7 +2,10 @@
 
 `SlackAdapter` needs `slack_bolt`, which is the `slack` extra: `uv sync --extra
 slack`. Nothing else here does — every judgement that can leak a private
-conversation lives in `events.py`, and none of it needs a socket.
+conversation lives in `events.py`, the workspace directory lives in
+`identity.py`, and neither needs a socket. `identity.py` is why `kasa.runner`
+can import from this package at all: the `identity` job writes what the
+directory saw, on a build that may have no Slack extra installed.
 
 So the adapter is resolved lazily and the judgements are not. Importing this
 package on an install that never asked for Slack therefore costs nothing until
@@ -26,6 +29,7 @@ from kasa.adapters.slack.events import (
     scope_for,
     session_id,
 )
+from kasa.adapters.slack.identity import Directory, SlackUser, user_ref
 
 if TYPE_CHECKING:
     from kasa.adapters.slack.app import SlackAdapter
@@ -33,13 +37,16 @@ if TYPE_CHECKING:
 __all__ = [
     "Accepted",
     "Decision",
+    "Directory",
     "Ignored",
     "SlackAdapter",
     "SlackContext",
+    "SlackUser",
     "message_id",
     "normalize",
     "scope_for",
     "session_id",
+    "user_ref",
 ]
 
 

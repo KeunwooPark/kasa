@@ -1062,6 +1062,96 @@ class Store:
             await self._conn.commit()
             return int(cur.rowcount)
 
+    # -- slack identities ------------------------------------------------------
+
+    async def upsert_slack_user(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        display_name: str,
+        real_name: str = "",
+        is_bot: bool = False,
+        deleted: bool = False,
+    ) -> None:
+        """Record what `users.info` said about somebody, now.
+
+        The link to a `people/` memory is not written here and not cleared
+        here. A person who changed their display name is the same person, and
+        an upsert that dropped `memory_id` would have the identity job write a
+        second file for them every time they edited their profile — which is
+        the one outcome #23 exists to prevent.
+        """
+        async with self._serial:
+            await self._conn.execute(
+                """
+                INSERT INTO slack_users (
+                    team_id, user_id, display_name, real_name, is_bot, deleted, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (team_id, user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    real_name    = excluded.real_name,
+                    is_bot       = excluded.is_bot,
+                    deleted      = excluded.deleted,
+                    fetched_at   = excluded.fetched_at
+                """,
+                (
+                    team_id,
+                    user_id,
+                    display_name,
+                    real_name,
+                    int(is_bot),
+                    int(deleted),
+                    _now(),
+                ),
+            )
+            await self._conn.commit()
+
+    async def get_slack_user(self, team_id: str, user_id: str) -> dict[str, Any] | None:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM slack_users WHERE team_id = ? AND user_id = ?",
+                (team_id, user_id),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def slack_users_awaiting_memory(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Everyone the identity job still owes the corpus a write for.
+
+        Two cases, one query: never linked at all, and linked under a name they
+        no longer go by. Deleted accounts are included — somebody who has left
+        is still who they were in every conversation already recorded.
+
+        Bots are not, and not by filtering downstream: an app is nobody to
+        remember, so a caller that skipped them would be handed the same rows
+        every sweep for the life of the workspace.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM slack_users WHERE is_bot = 0"
+                " AND (memory_id IS NULL OR memory_name IS NOT display_name)"
+                " ORDER BY fetched_at LIMIT ?",
+                (limit,),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def link_slack_user(
+        self, *, team_id: str, user_id: str, memory_id: str, memory_name: str
+    ) -> None:
+        """Point a uid at the `people/` memory that now records it."""
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE slack_users SET memory_id = ?, memory_name = ?, linked_at = ?"
+                " WHERE team_id = ? AND user_id = ?",
+                (memory_id, memory_name, _now(), team_id, user_id),
+            )
+            await self._conn.commit()
+
     # -- leases --------------------------------------------------------------
 
     async def take_lease(

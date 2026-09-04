@@ -33,6 +33,7 @@ from kasa.redact import Redactor
 from kasa.runner.cron import HOURLY, NIGHTLY, WEEKLY, Cron
 from kasa.runner.episodes import EpisodeCloser
 from kasa.runner.forget import Collector
+from kasa.runner.identity import Registrar
 from kasa.runner.promote import Promoter
 from kasa.runner.reflect import Notifier, Reflector
 from kasa.runner.reorganize import Librarian
@@ -56,6 +57,13 @@ PROMOTE_CRON = HOURLY
 #: write lease, and two jobs queued for the same minute means one of them waits
 #: out a lease for no reason every week.
 FORGET_CRON = "0 5 * * 0"
+
+#: Often enough that somebody who spoke this morning is a `people/` memory by
+#: the time `promote` runs and has something to say about them, and rarely
+#: enough that a workspace joining in bursts is a few commits rather than one
+#: per person. Offset off the hour so it is not queued against `promote`, which
+#: wants the same write lease.
+IDENTITY_CRON = "7,22,37,52 * * * *"
 
 
 def default_specs(
@@ -109,6 +117,19 @@ def default_specs(
         # views.
         specs.append(
             JobSpec(kind="reindex", handler=_reindex(cfg, store), cron=Cron.parse("* * * * *"))
+        )
+    if cfg.ltm.configured and cfg.slack.configured:
+        # A repo and a Slack install, and no model: what it writes is a uid and
+        # a name that `users.info` already handed us. Registered on the Slack
+        # settings rather than run unconditionally because a build with no
+        # Slack has nobody to map, and an empty sweep every five minutes is
+        # still a query every five minutes.
+        specs.append(
+            JobSpec(
+                kind="identity",
+                handler=_identity(cfg, store),
+                cron=Cron.parse(IDENTITY_CRON),
+            )
         )
     return specs
 
@@ -227,6 +248,15 @@ def _forget(cfg: Config, store: Store) -> JobHandler:
             store, memory, settings=cfg.forget, policy=cfg.memory, job_id=job.id
         ).run()
         log.info("forget: %s", result.summary())
+
+    return run
+
+
+def _identity(cfg: Config, store: Store) -> JobHandler:
+    async def run(job: Job) -> None:
+        memory = await MemoryStore.open(cfg, store)
+        result = await Registrar(store, memory, policy=cfg.memory, job_id=job.id).run()
+        log.info("identity: %s", result.summary())
 
     return run
 

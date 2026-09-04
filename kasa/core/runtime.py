@@ -24,6 +24,17 @@ log = logging.getLogger(__name__)
 #: whose posting can fail transiently should retry inside this, not through it.
 ReplySink = Callable[[InboundEvent, AgentResult], Awaitable[None]]
 
+#: A last look at an event after it leaves the queue and before a session sees
+#: it, for whatever a surface could not do at ingress. Slack's is resolving
+#: `<@U0456>` to a name (#23): it needs a network call, and ingress has three
+#: seconds and spends them on one INSERT.
+#:
+#: Off the ack path but *on* the turn path, so it inherits the turn's failure
+#: semantics — raising here re-delivers the message. A hook whose work is an
+#: improvement rather than a requirement should swallow its own failures and
+#: return the event it was given, which is what `Directory.hydrate` does.
+EventPreparer = Callable[[InboundEvent], Awaitable[InboundEvent]]
+
 #: How many turns may be in flight at once, across all conversations.
 DEFAULT_CONCURRENCY = 8
 
@@ -39,12 +50,14 @@ class Runtime:
         concurrency: int = DEFAULT_CONCURRENCY,
         lease_ttl: float = DEFAULT_LEASE_TTL,
         idle_after: float = IDLE_AFTER,
+        prepare: EventPreparer | None = None,
     ) -> None:
         self._agent = agent
         self._reply = reply
+        self._prepare = prepare
         self.inbox = Inbox(agent.store, lease_ttl=lease_ttl)
         self._router = SessionRouter(agent.store, self._turn, idle_after=idle_after)
-        self.dispatcher = Dispatcher(self.inbox, self._router.deliver, concurrency=concurrency)
+        self.dispatcher = Dispatcher(self.inbox, self._deliver, concurrency=concurrency)
 
     @property
     def store(self) -> Store:
@@ -65,6 +78,17 @@ class Runtime:
 
     def stop(self) -> None:
         self.dispatcher.stop()
+
+    async def _deliver(self, event: InboundEvent) -> None:
+        """Between the queue and the conversation.
+
+        Before the router rather than inside the turn, so the session actor
+        serializes an event that already says what it means — and so what is
+        stored as the user's message is the text the model was actually shown.
+        """
+        if self._prepare is not None:
+            event = await self._prepare(event)
+        await self._router.deliver(event)
 
     async def _turn(self, turn: Turn) -> None:
         result = await self._agent.respond(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Self
 
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
@@ -18,6 +19,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
 from kasa.adapters.slack.events import Ignored, SlackContext, normalize
+from kasa.adapters.slack.identity import Directory
 from kasa.config import SlackSettings
 from kasa.core.agent import Agent, AgentResult
 from kasa.core.events import InboundEvent
@@ -47,7 +49,10 @@ class SlackAdapter:
         self._app = app
         self._context = context
         self._app_token = app_token
-        self.runtime = Runtime(agent, self.reply, concurrency=concurrency)
+        self.directory = Directory(agent.store, self._users_info, team_id=context.team_id)
+        self.runtime = Runtime(
+            agent, self.reply, concurrency=concurrency, prepare=self.directory.hydrate
+        )
         self._handler: AsyncSocketModeHandler | None = None
         self._register()
 
@@ -128,6 +133,17 @@ class SlackAdapter:
 
     async def _known_session(self, session_id: str) -> bool:
         return await self.runtime.store.get_session(session_id) is not None
+
+    async def _users_info(self, user_id: str) -> Mapping[str, Any]:
+        """One profile, unwrapped from the envelope Slack puts it in.
+
+        `Directory` is given this rather than the client so that it needs no
+        `slack_sdk` — and so the thing under test is the caching, not a mock of
+        somebody else's response object.
+        """
+        response = await self.client.users_info(user=user_id)
+        user = response.get("user")
+        return user if isinstance(user, Mapping) else {}
 
     # -- egress --------------------------------------------------------------
 
