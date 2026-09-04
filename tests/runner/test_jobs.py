@@ -18,7 +18,7 @@ from kasa.memory.gitcmd import GitRepo
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import INDEX_LEASE_NAME, Lease
 from kasa.memory.manifest import Manifest
-from kasa.runner.cron import HOURLY, NIGHTLY
+from kasa.runner.cron import HOURLY, NIGHTLY, WEEKLY
 from kasa.runner.jobs import EVERY_FIVE_MINUTES, default_specs
 from kasa.runner.scheduler import Job, JobSpec, Scheduler
 from kasa.store import Store
@@ -239,3 +239,13 @@ def test_reflect_runs_nightly(clone: Path, store: Store) -> None:
     specs = {spec.kind: spec for spec in default_specs(with_model(config_for(clone)), store)}
     assert specs["reflect"].cron is not None
     assert specs["reflect"].cron.expression == NIGHTLY
+
+
+def test_reorganize_runs_weekly(clone: Path, store: Store) -> None:
+    """The librarian pass is the slowest rhythm in the system: it is the one
+    that produces a diff somebody has to read."""
+    specs = {spec.kind: spec for spec in default_specs(with_model(config_for(clone)), store)}
+
+    assert specs["reorganize"].cron is not None
+    assert specs["reorganize"].cron.expression == WEEKLY
+    assert "reorganize" not in [spec.kind for spec in default_specs(config_for(clone), store)]
