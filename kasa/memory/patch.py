@@ -28,12 +28,13 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from kasa.config import MemorySettings
+from kasa.config import Config, MemorySettings
 from kasa.errors import KasaError
 from kasa.memory.document import MemoryDoc, MemoryError_, slugify
 from kasa.memory.layout import ARCHIVE_DIR, MEMORY_DIR, is_memory_path
 from kasa.memory.ltm import Change, Remove, Write
 from kasa.memory.manifest import Manifest
+from kasa.redact import Redactor
 
 log = logging.getLogger(__name__)
 
@@ -159,11 +160,13 @@ class PatchCompiler:
         *,
         policy: MemorySettings | None = None,
         now: datetime | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._root = root.expanduser()
         self._manifest = manifest
         self._policy = policy or MemorySettings()
         self._now = now or datetime.now(UTC)
+        self._redactor = redactor or Redactor.from_config(Config())
 
     def compile(self, plan: Sequence[MemoryPatch], *, job: str) -> list[Change]:
         """Return the writes `plan` means, or raise `PatchError` having written nothing."""
@@ -181,6 +184,7 @@ class PatchCompiler:
 
         rejections.extend(self._check_plan_limits(changes))
         rejections.extend(self._check_links(plan, changes, projected))
+        rejections.extend(self._check_secrets(changes))
 
         if rejections:
             # The full plan goes in the log: a rejection nobody can inspect is a
@@ -190,7 +194,7 @@ class PatchCompiler:
                 job,
                 len(rejections),
                 "\n".join(f"  - {r}" for r in rejections),
-                [p.model_dump(mode="json") for p in plan],
+                self._redactor.scrub(str([p.model_dump(mode="json") for p in plan])),
             )
             raise PatchError(rejections)
         return changes
@@ -375,6 +379,13 @@ class PatchCompiler:
                 )
             ]
         return []
+
+    def _check_secrets(self, changes: Sequence[Change]) -> list[Rejection]:
+        return [
+            Rejection(f"{change.path} contains secret material")
+            for change in changes
+            if isinstance(change, Write) and self._redactor.scrub(change.content) != change.content
+        ]
 
     def _check_links(
         self, plan: Sequence[MemoryPatch], changes: Sequence[Change], projected: Manifest

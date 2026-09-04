@@ -10,7 +10,7 @@ behind the queue, where taking a minute costs nothing.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Self
 
@@ -70,6 +70,7 @@ class SlackAdapter:
         stream: bool = True,
         interval: float = DEFAULT_INTERVAL,
         reactions: Mapping[str, str] | None = None,
+        scrub: Callable[[str], str] | None = None,
     ) -> None:
         self._app = app
         self._context = context
@@ -85,13 +86,19 @@ class SlackAdapter:
             self.open_reply if stream else one_message(self.reply),
             concurrency=concurrency,
             prepare=self.directory.hydrate,
+            scrub=scrub,
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._register()
 
     @classmethod
     async def connect(
-        cls, agent: Agent, settings: SlackSettings, *, concurrency: int = DEFAULT_CONCURRENCY
+        cls,
+        agent: Agent,
+        settings: SlackSettings,
+        *,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        scrub: Callable[[str], str] | None = None,
     ) -> Self:
         """Build an adapter, having asked Slack who it is.
 
@@ -123,6 +130,7 @@ class SlackAdapter:
             ),
             app_token=_token(settings.app_token_env, "app"),
             concurrency=concurrency,
+            scrub=scrub,
             stream=settings.stream,
             reactions=settings.reactions,
         )

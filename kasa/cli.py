@@ -782,7 +782,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
     # both places that send text onwards — recalled memory and tool results —
     # have to agree about what counts as a secret.
     scrub = Redactor.from_config(cfg).scrub
-    async with await Store.open(cfg.store.resolved()) as store:
+    async with await Store.open(cfg.store.resolved(), scrub=scrub) as store:
         registry = cfg.build_registry(store=store)
         tools = builtin_tools()
         retriever = None
@@ -820,6 +820,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
                 packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
                 config=cfg.agent_config(),
                 retriever=retriever,
+                inbound_scrub=scrub,
             )
         finally:
             await registry.aclose()
@@ -836,7 +837,9 @@ async def _serve_slack(cfg: Config) -> None:
     from kasa.adapters.slack import SlackAdapter
 
     async with _agent(cfg) as agent:
-        adapter = await SlackAdapter.connect(agent, cfg.slack)
+        adapter = await SlackAdapter.connect(
+            agent, cfg.slack, scrub=Redactor.from_config(cfg).scrub
+        )
         # The daemon is where background work belongs: it is the process that
         # stays up, and `kasa run` on a terminal is not.
         scheduler = Scheduler(

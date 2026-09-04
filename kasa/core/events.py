@@ -47,6 +47,10 @@ class InboundEvent(BaseModel):
 
     text: str = ""
 
+    #: Ingress persisted a scrubbed form and retained the original only in
+    #: process memory for this immediate turn.
+    credential_scrubbed: bool = False
+
     #: The visibility scope anything learned here inherits. `workspace` is the
     #: widest and the default; a DM or a private channel narrows it. Retrieval
     #: filters on this before it ranks, so an adapter that gets it wrong leaks.

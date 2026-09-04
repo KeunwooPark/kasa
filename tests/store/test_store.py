@@ -12,6 +12,7 @@ from kasa.errors import StoreError
 from kasa.llm.cost import CallRecord
 from kasa.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
 from kasa.memory.observation import ObservationDraft
+from kasa.redact import Redactor
 from kasa.store import Store
 
 
@@ -54,6 +55,27 @@ async def test_message_round_trip_preserves_every_block_type(store: Store) -> No
     restored = await store.recent_messages("s1")
     assert restored[0] == original
     assert restored[1].tool_results_in[0].tool_use_id == "t1"
+
+
+async def test_store_scrubs_every_message_block_before_persistence(tmp_path: Path) -> None:
+    secret = "sk-ant-this-is-a-persisted-secret"
+    async with await Store.open(tmp_path / "scrubbed.db", scrub=Redactor().scrub) as guarded:
+        await guarded.ensure_session("s1", surface="slack")
+        await guarded.append_message(
+            "s1",
+            Message(
+                role="assistant",
+                content=(
+                    TextBlock(text=f"saw {secret}"),
+                    ToolUseBlock(id="t1", name="call", input={"authorization": secret}),
+                ),
+            ),
+        )
+        raw = await guarded.raw("SELECT content FROM messages WHERE session_id = ?", ("s1",))
+        restored = await guarded.recent_messages("s1")
+
+    assert secret not in raw[0]["content"]
+    assert secret not in restored[0].model_dump_json()
 
 
 async def test_recent_messages_returns_oldest_first_within_the_limit(store: Store) -> None:

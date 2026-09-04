@@ -30,6 +30,7 @@ from kasa.memory.patch import (
     Update,
     parse_plan,
 )
+from kasa.redact import Redactor
 from kasa.store import Store
 
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
@@ -75,6 +76,43 @@ def aged(doc: MemoryDoc, when: datetime = LONG_AGO) -> MemoryDoc:
             "frontmatter": doc.frontmatter.model_copy(update={"created": when, "updated": when})
         }
     )
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-ant-abcdefghijklmnop",
+        "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "xoxb-1234567890-abcdefghij",
+        "xapp-1-A0123456789-abcdef",
+        "AKIAIOSFODNN7EXAMPLE",
+        "Bearer arbitrarySaaSToken_1234567890",
+        "eyJabcdefghijk.eyJabcdefghijklmnop.abcdefghijklmnopqrstuv",
+        "https://user:credential-value-123456@example.com/repo",
+        "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n"
+        "-----END PRIVATE KEY-----",
+    ],
+)
+def test_every_secret_shape_rejects_the_entire_patch_plan(corpus: Corpus, secret: str) -> None:
+    plan = [Create(memory=MemoryDoc.new(type="project", title="Unsafe", body=f"Value: {secret}"))]
+    before = corpus.snapshot()
+
+    with pytest.raises(PatchError, match="contains secret material"):
+        corpus.compiler().compile(plan, job="promote")
+
+    assert corpus.snapshot() == before
+
+
+def test_known_secret_rejects_a_patch_even_without_a_recognized_shape(corpus: Corpus) -> None:
+    value = "opaque value with spaces 12345"
+    compiler = PatchCompiler(
+        corpus.root, Manifest(), now=NOW, redactor=Redactor({"SAAS_TOKEN": value})
+    )
+    plan = [Create(memory=MemoryDoc.new(type="project", title="Unsafe", body=value))]
+    with pytest.raises(PatchError, match="contains secret material"):
+        compiler.compile(plan, job="promote")
 
 
 # -- parsing the model's output ----------------------------------------------
