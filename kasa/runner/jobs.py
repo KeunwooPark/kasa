@@ -1,14 +1,15 @@
 """The jobs Kasa actually knows how to run.
 
-The rest of `docs/DESIGN.md` §6 arrives later: `promote` (#29), `reflect`
-(#32), `reorganize` (#33), `forget` (#34). Each is a `JobSpec` registered here,
-and nothing else about the machinery changes when they do.
+The rest of `docs/DESIGN.md` §6 arrives later: `reflect` (#32), `reorganize`
+(#33), `forget` (#34). Each is a `JobSpec` registered here, and nothing else
+about the machinery changes when they do.
 
-What a spec is registered *on* is what this module decides, and the two
-conditions are different. `episode_close` needs a model and no repo — it writes
-to SQLite, and it is what fills the queue `promote` will later drain.
-`reindex` needs a repo and no model. A build with neither registers nothing,
-which is why `kasa job list` still works on a machine with no API key.
+What a spec is registered *on* is what this module decides, and the conditions
+differ. `episode_close` needs a model and no repo — it writes to SQLite, and it
+is what fills the queue `promote` drains. `reindex` needs a repo and no model.
+`promote` is the one that needs both, because it is the step that crosses
+between them. A build with neither registers nothing, which is why `kasa job
+list` still works on a machine with no API key.
 """
 
 from __future__ import annotations
@@ -20,11 +21,15 @@ from contextlib import asynccontextmanager
 
 from kasa.config import Config
 from kasa.llm.registry import ProviderRegistry
+from kasa.llm.tokens import default_tokenizer
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LeaseError
 from kasa.memory.ltm import MemoryStore
-from kasa.runner.cron import Cron
+from kasa.memory.retrieve import Retriever
+from kasa.redact import Redactor
+from kasa.runner.cron import HOURLY, Cron
 from kasa.runner.episodes import EpisodeCloser
+from kasa.runner.promote import Promoter
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
 
@@ -35,6 +40,11 @@ log = logging.getLogger(__name__)
 #: itself a cost. The idle threshold is what decides when an episode is over;
 #: this only decides how promptly that is noticed.
 EVERY_FIVE_MINUTES = "*/5 * * * *"
+
+#: What the design asks for (§6). Hourly is the rhythm the whole product runs
+#: at: it is how long after a conversation ends before what was said in it is
+#: something a later conversation can recall.
+PROMOTE_CRON = HOURLY
 
 
 def default_specs(
@@ -55,6 +65,14 @@ def default_specs(
                 kind="episode_close",
                 handler=_episode_close(cfg, store, models),
                 cron=Cron.parse(EVERY_FIVE_MINUTES),
+            )
+        )
+    if cfg.ltm.configured and "chat" in cfg.llm:
+        specs.append(
+            JobSpec(
+                kind="promote",
+                handler=_promote(cfg, store, models),
+                cron=Cron.parse(PROMOTE_CRON),
             )
         )
     if cfg.ltm.configured:
@@ -107,6 +125,34 @@ def _episode_close(cfg: Config, store: Store, models: Models) -> JobHandler:
             else:
                 result = await closer.sweep()
         log.info("episode_close: %s", result.summary())
+
+    return run
+
+
+def _promote(cfg: Config, store: Store, models: Models) -> JobHandler:
+    async def run(job: Job) -> None:
+        memory = await MemoryStore.open(cfg, store)
+        # Scrubbed, like every other path that sends memory text onwards. The
+        # competition offered to the planner is read out of the corpus, and a
+        # secret that got into a memory file must not get back out through a
+        # prompt.
+        retriever = Retriever(
+            store,
+            tokenizer=default_tokenizer(),
+            budget_tokens=cfg.context.tokens_for_retrieval(),
+            scrub=Redactor.from_config(cfg).scrub,
+        )
+        async with models.use() as registry:
+            result = await Promoter(
+                store,
+                memory,
+                retriever,
+                registry,
+                policy=cfg.memory,
+                settings=cfg.promote,
+                job_id=job.id,
+            ).run()
+        log.info("promote: %s", result.summary())
 
     return run
 

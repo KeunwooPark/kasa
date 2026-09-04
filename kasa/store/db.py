@@ -560,14 +560,52 @@ class Store:
         return observation_id
 
     async def pending_observations(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Candidate facts nobody has decided about yet, oldest first.
+
+        Ordered by `(scope, subject)` before age so that `promote`'s grouping
+        falls out of the read: the pair is what it reconciles in one call, and
+        two visibility scopes must never meet inside one. `created_at` breaks
+        the tie, so the limit still takes the oldest of whatever is waiting.
+        """
         async with (
             self._serial,
             self._conn.execute(
-                "SELECT * FROM observations WHERE state = 'pending' ORDER BY created_at LIMIT ?",
+                "SELECT * FROM observations WHERE state = 'pending'"
+                " ORDER BY scope, subject, created_at LIMIT ?",
                 (limit,),
             ) as cur,
         ):
             return [dict(row) for row in await cur.fetchall()]
+
+    async def note_observation_attempt(self, ids: Sequence[str]) -> None:
+        """Record that promotion was tried on these and did not land."""
+        if not ids:
+            return
+        async with self._serial:
+            await self._conn.execute(
+                f"UPDATE observations SET attempts = attempts + 1 WHERE id IN ({_marks(ids)})",
+                tuple(ids),
+            )
+            await self._conn.commit()
+
+    async def resolve_observations(self, ids: Sequence[str], *, state: str, reason: str) -> int:
+        """Move observations out of `pending`, recording why.
+
+        The reason is not decoration. An observation that was discarded is a
+        thing Kasa decided not to remember, and a person reading the table
+        later has no other way to find out whether that was a judgement or a
+        rejected patch plan.
+        """
+        if not ids:
+            return 0
+        async with self._serial:
+            cur = await self._conn.execute(
+                f"UPDATE observations SET state = ?, reason = ?, resolved_at = ?"
+                f" WHERE id IN ({_marks(ids)}) AND state = 'pending'",
+                (state, reason, _now(), *ids),
+            )
+            await self._conn.commit()
+            return int(cur.rowcount)
 
         # -- inbox ---------------------------------------------------------------
         #
@@ -1008,3 +1046,9 @@ class Store:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _marks(values: Sequence[Any]) -> str:
+    """Placeholders for an `IN` clause. The values are still bound, never
+    interpolated — this only sizes the list."""
+    return ", ".join("?" * len(values))
