@@ -598,6 +598,15 @@ class ConsolePrompter:
                 return answer
             self.warn(f"Pick one of: {options}")
 
+    def select(self, question: str, options: tuple[str, ...], *, default: str) -> str:
+        console.print(f"{question}:")
+        for number, option in enumerate(options, start=1):
+            console.print(f"  {number}. {option}")
+        answer = str(typer.prompt("Number or model name", default=default)).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return options[int(answer) - 1]
+        return answer
+
     def confirm(self, question: str, *, default: bool = False) -> bool:
         return bool(typer.confirm(question, default=default))
 
