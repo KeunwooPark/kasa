@@ -86,7 +86,12 @@ class ProviderRegistry:
     # -- calls ---------------------------------------------------------------
 
     async def complete(
-        self, role: ModelRole, req: ChatRequest, *, tag: str | None = None
+        self,
+        role: ModelRole,
+        req: ChatRequest,
+        *,
+        tag: str | None = None,
+        session_id: str | None = None,
     ) -> ChatResponse:
         async def call(provider: LLMProvider) -> ChatResponse:
             started = time.monotonic()
@@ -102,6 +107,7 @@ class ProviderRegistry:
                     tag=tag,
                     ok=False,
                     error=type(exc).__name__,
+                    session_id=session_id,
                 )
                 raise
             await self._meter.record(
@@ -111,13 +117,19 @@ class ProviderRegistry:
                 usage=resp.usage,
                 latency_ms=_ms_since(started),
                 tag=tag,
+                session_id=session_id,
             )
             return resp
 
         return await self._with_fallback(role, call)
 
     async def stream(
-        self, role: ModelRole, req: ChatRequest, *, tag: str | None = None
+        self,
+        role: ModelRole,
+        req: ChatRequest,
+        *,
+        tag: str | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[Delta]:
         """Stream from the first provider that gets a delta out of the door.
 
@@ -144,6 +156,7 @@ class ProviderRegistry:
                                 usage=delta.usage,
                                 latency_ms=_ms_since(started),
                                 tag=tag,
+                                session_id=session_id,
                             )
                         yield delta
                     return
@@ -157,6 +170,7 @@ class ProviderRegistry:
                         tag=tag,
                         ok=False,
                         error=type(exc).__name__,
+                        session_id=session_id,
                     )
                     if emitted or _is_terminal(exc):
                         raise

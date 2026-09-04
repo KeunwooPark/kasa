@@ -116,6 +116,34 @@ async def test_call_records_aggregate(store: Store) -> None:
     assert summary[0]["cost_usd"] == 0.002
 
 
+async def test_call_records_report_cache_hit_rate_per_session(store: Store) -> None:
+    await store.ensure_session("s1", surface="cli")
+    await store.ensure_session("s2", surface="cli")
+    for session_id, usage in (
+        ("s1", Usage(cache_write_tokens=100)),
+        ("s1", Usage(cache_read_tokens=900)),
+        ("s2", Usage(cache_write_tokens=50)),
+    ):
+        await store.record_call(
+            CallRecord(
+                role="chat",
+                provider="p",
+                model="m",
+                usage=usage,
+                latency_ms=1,
+                cost_usd=0.0,
+                tag="agent.turn",
+                ok=True,
+                session_id=session_id,
+            )
+        )
+
+    summary = await store.session_cost_summary("s1")
+    assert summary["calls"] == 2
+    assert summary["cache_hit_rate"] == pytest.approx(0.9)
+    assert (await store.session_cost_summary("s2"))["cache_hit_rate"] == 0.0
+
+
 async def test_failed_calls_record_their_error(store: Store) -> None:
     await store.record_call(
         CallRecord(

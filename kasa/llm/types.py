@@ -151,6 +151,17 @@ class Usage(BaseModel):
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def cache_hit_rate(self) -> float:
+        """Share of cache-eligible prefix tokens served from cache.
+
+        Providers report cache reads and cache creations separately from
+        ordinary input.  Using only those two counters keeps changing,
+        deliberately-uncached turn context out of the cache-health signal.
+        """
+        eligible = self.cache_read_tokens + self.cache_write_tokens
+        return self.cache_read_tokens / eligible if eligible else 0.0
+
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             input_tokens=self.input_tokens + other.input_tokens,

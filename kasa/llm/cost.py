@@ -60,6 +60,7 @@ class CallRecord:
     tag: str | None
     ok: bool
     error: str | None = None
+    session_id: str | None = None
 
 
 #: Where a completed call goes. The store supplies the real one; tests and the
@@ -77,6 +78,13 @@ class CostMeter:
         self._sink = sink
         self.total = Usage()
         self.total_usd = 0.0
+        self._sessions: dict[str, Usage] = {}
+
+    def session_usage(self, session_id: str) -> Usage:
+        return self._sessions.get(session_id, Usage())
+
+    def session_cache_hit_rate(self, session_id: str) -> float:
+        return self.session_usage(session_id).cache_hit_rate
 
     async def record(
         self,
@@ -89,9 +97,12 @@ class CostMeter:
         tag: str | None = None,
         ok: bool = True,
         error: str | None = None,
+        session_id: str | None = None,
     ) -> CallRecord:
         cost = self._prices.cost_usd(model, usage)
         self.total = self.total + usage
+        if session_id is not None:
+            self._sessions[session_id] = self.session_usage(session_id) + usage
         if cost is not None:
             self.total_usd += cost
         record = CallRecord(
@@ -104,6 +115,7 @@ class CostMeter:
             tag=tag,
             ok=ok,
             error=error,
+            session_id=session_id,
         )
         await self._sink(record)
         return record
