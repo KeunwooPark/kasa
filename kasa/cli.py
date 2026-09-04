@@ -676,7 +676,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
 
 async def _repl(cfg: Config) -> None:
     async with _agent(cfg) as agent:
-        await run_repl(agent, console)
+        await run_repl(agent, console, scrub=Redactor.from_config(cfg).scrub)
 
 
 async def _serve_slack(cfg: Config) -> None:

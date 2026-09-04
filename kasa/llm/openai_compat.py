@@ -50,6 +50,7 @@ class OpenAICompatProvider(HTTPProvider):
         base_url: str = "https://api.openai.com/v1",
         name: str = "openai",
         embedding_dimensions: int | None = None,
+        timeout: httpx.Timeout | float | None = None,
         client: httpx.AsyncClient | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
@@ -58,7 +59,14 @@ class OpenAICompatProvider(HTTPProvider):
             "content-type": "application/json",
         }
         headers.update(extra_headers or {})
-        super().__init__(name=name, model=model, base_url=base_url, headers=headers, client=client)
+        super().__init__(
+            name=name,
+            model=model,
+            base_url=base_url,
+            headers=headers,
+            timeout=timeout,
+            client=client,
+        )
         self._embedding_dimensions = embedding_dimensions
 
     # -- request mapping -----------------------------------------------------

@@ -60,6 +60,7 @@ class ProviderConfig(BaseModel):
     base_url: str | None = None
     key_env: str | None = None
     embedding_dimensions: int | None = None
+    timeout_seconds: float | None = None
     fallbacks: list[ProviderConfig] = Field(default_factory=list)
 
     def api_key(self) -> str:
@@ -83,6 +84,7 @@ class ProviderConfig(BaseModel):
             api_key=self.api_key(),
             base_url=self.base_url or "https://api.openai.com/v1",
             embedding_dimensions=self.embedding_dimensions,
+            timeout=self.timeout_seconds,
         )
 
     def chain(self) -> list[LLMProvider]:
