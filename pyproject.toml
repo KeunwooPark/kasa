@@ -69,3 +69,7 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error"]
+markers = [
+    "e2e: black-box subprocess tests",
+    "external: tests that require real third-party services",
+]

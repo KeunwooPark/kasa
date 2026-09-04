@@ -125,3 +125,14 @@ uv run pytest
 uv run ruff check . && uv run ruff format --check .
 uv run mypy kasa
 ```
+
+The black-box QA suite starts the real terminal command against a local fake
+OpenAI-compatible server, so it needs neither network access nor API keys:
+
+```bash
+uv run pytest tests/e2e -q
+```
+
+Use `-m "not e2e"` when iterating on lower-level tests only. Tests marked
+`external` are reserved for optional smoke tests against real services and are
+not part of the deterministic suite.
