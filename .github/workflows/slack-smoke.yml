@@ -1,0 +1,20 @@
+name: Slack smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  live-slack:
+    runs-on: ubuntu-latest
+    environment: slack-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras --dev
+      - name: Connect to the dedicated Slack test workspace
+        env:
+          KASA_SLACK_SMOKE_APP_TOKEN: ${{ secrets.KASA_SLACK_SMOKE_APP_TOKEN }}
+          KASA_SLACK_SMOKE_BOT_TOKEN: ${{ secrets.KASA_SLACK_SMOKE_BOT_TOKEN }}
+        run: uv run pytest tests/e2e/test_slack_external.py -m external -q

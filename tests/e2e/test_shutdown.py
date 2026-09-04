@@ -39,10 +39,32 @@ class FakeSlack:
     api_url: str
     connected: threading.Event = field(default_factory=threading.Event)
     acknowledgements: list[str] = field(default_factory=list)
+    ack_snapshots: list[tuple[str, int]] = field(default_factory=list)
+    ack_observer: Callable[[], int] | None = None
     posts: list[dict[str, str]] = field(default_factory=list)
     _socket: web.WebSocketResponse | None = None
 
-    def event(self, *, event_id: str, text: str) -> None:
+    def event(
+        self,
+        *,
+        event_id: str,
+        text: str,
+        channel: str = "D_E2E",
+        timestamp: str | None = None,
+        thread_ts: str | None = None,
+        event_type: str = "message",
+    ) -> None:
+        timestamp = timestamp or f"1.{event_id[-3:]}"
+        event = {
+            "type": event_type,
+            "user": "U_USER",
+            "text": text,
+            "channel": channel,
+            "ts": timestamp,
+            "event_ts": timestamp,
+        }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
         payload = {
             "envelope_id": f"envelope-{event_id}",
             "type": "events_api",
@@ -57,20 +79,13 @@ class FakeSlack:
                     {
                         "enterprise_id": None,
                         "team_id": "T_E2E",
-                        "user_id": "U_BOT",
+                        "user_id": "UBOT",
                         "is_bot": True,
                         "is_enterprise_install": False,
                     }
                 ],
                 "is_ext_shared_channel": False,
-                "event": {
-                    "type": "message",
-                    "user": "U_USER",
-                    "text": text,
-                    "channel": "D_E2E",
-                    "ts": f"1.{event_id[-3:]}",
-                    "event_ts": f"1.{event_id[-3:]}",
-                },
+                "event": event,
             },
         }
 
@@ -104,7 +119,7 @@ def fake_slack() -> Iterator[FakeSlack]:
         async def api(request: web.Request) -> web.Response:
             method = request.match_info["method"]
             if method == "auth.test":
-                return web.json_response({"ok": True, "user_id": "U_BOT", "team_id": "T_E2E"})
+                return web.json_response({"ok": True, "user_id": "UBOT", "team_id": "T_E2E"})
             if method == "apps.connections.open":
                 slack = slack_ref["server"]
                 socket_url = slack.api_url.replace("http", "ws", 1) + "socket"
@@ -130,6 +145,8 @@ def fake_slack() -> Iterator[FakeSlack]:
                     ack = json.loads(message.data)
                     if envelope := ack.get("envelope_id"):
                         slack.acknowledgements.append(str(envelope))
+                        if slack.ack_observer is not None:
+                            slack.ack_snapshots.append((str(envelope), slack.ack_observer()))
             return ws
 
         app.router.add_post("/api/{method}", api)
