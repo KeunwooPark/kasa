@@ -18,7 +18,7 @@ from kasa.memory.gitcmd import GitRepo
 from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import INDEX_LEASE_NAME, Lease
 from kasa.memory.manifest import Manifest
-from kasa.runner.cron import HOURLY
+from kasa.runner.cron import HOURLY, NIGHTLY
 from kasa.runner.jobs import EVERY_FIVE_MINUTES, default_specs
 from kasa.runner.scheduler import Job, JobSpec, Scheduler
 from kasa.store import Store
@@ -225,3 +225,17 @@ def test_promote_needs_both_a_model_and_a_repo(clone: Path, store: Store) -> Non
     assert "promote" in specs
     assert specs["promote"].cron is not None
     assert specs["promote"].cron.expression == HOURLY
+
+
+def test_reflect_registers_alongside_promote(clone: Path, store: Store) -> None:
+    """Both need a repo to write to and a model to write with."""
+    kinds = [spec.kind for spec in default_specs(with_model(config_for(clone)), store)]
+
+    assert "reflect" in kinds
+    assert "reflect" not in [spec.kind for spec in default_specs(config_for(clone), store)]
+
+
+def test_reflect_runs_nightly(clone: Path, store: Store) -> None:
+    specs = {spec.kind: spec for spec in default_specs(with_model(config_for(clone)), store)}
+    assert specs["reflect"].cron is not None
+    assert specs["reflect"].cron.expression == NIGHTLY

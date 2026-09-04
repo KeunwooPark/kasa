@@ -483,3 +483,51 @@ def test_a_long_title_now_compiles(corpus: Corpus) -> None:
     changes = corpus.compiler().compile([Create(memory=doc)], job="promote")
 
     assert len(Path(changes[0].path).name.encode()) <= 255
+
+
+# -- derived frontmatter ------------------------------------------------------
+
+
+def test_recomputing_salience_does_not_stamp_the_memory_as_changed(corpus: Corpus) -> None:
+    """`reflect` rewrites salience nightly. `updated` is the age retrieval
+    scores recency on, the age salience itself decays from, and the age the
+    retention floor measures — so stamping it here would make the whole corpus
+    permanently new and nothing would ever be forgettable again."""
+    doc = corpus.add(aged(MemoryDoc.new(type="fact", title="Old news", body="Spring.")))
+
+    changes = corpus.compiler().compile(
+        [Update(id=doc.id, frontmatter={"salience": 0.2})], job="reflect"
+    )
+
+    written = MemoryDoc.parse(changes[0].content)  # type: ignore[union-attr]
+    assert written.frontmatter.salience == 0.2
+    assert written.frontmatter.updated == LONG_AGO, (
+        "the claim did not change; the file's age did not either"
+    )
+
+
+def test_an_edit_hiding_behind_a_salience_change_still_counts_as_an_edit(
+    corpus: Corpus,
+) -> None:
+    """Decided from what the patch does, never from what it claims."""
+    doc = corpus.add(aged(MemoryDoc.new(type="fact", title="Old news", body="Spring.")))
+
+    changes = corpus.compiler().compile(
+        [Update(id=doc.id, body="Actually, autumn.", frontmatter={"salience": 0.2})], job="reflect"
+    )
+
+    written = MemoryDoc.parse(changes[0].content)  # type: ignore[union-attr]
+    assert written.frontmatter.updated > LONG_AGO
+
+
+def test_a_salience_change_beside_another_field_still_counts_as_an_edit(
+    corpus: Corpus,
+) -> None:
+    doc = corpus.add(aged(MemoryDoc.new(type="fact", title="Old news", body="Spring.")))
+
+    changes = corpus.compiler().compile(
+        [Update(id=doc.id, frontmatter={"salience": 0.2, "confidence": 0.4})], job="reflect"
+    )
+
+    written = MemoryDoc.parse(changes[0].content)  # type: ignore[union-attr]
+    assert written.frontmatter.updated > LONG_AGO

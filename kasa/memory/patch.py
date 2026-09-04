@@ -247,7 +247,7 @@ class PatchCompiler:
         self._require_no_widening(doc.frontmatter.visibility, frontmatter.visibility, index)
 
         updated = MemoryDoc(
-            frontmatter=frontmatter.touch(),
+            frontmatter=frontmatter if _is_bookkeeping(patch) else frontmatter.touch(),
             body=doc.body if patch.body is None else _as_body(patch.body),
         )
         self._require_size(updated.render(), path, index)
@@ -492,6 +492,26 @@ class PatchCompiler:
 
     def _exists(self, path: str) -> bool:
         return (self._root / path).exists()
+
+
+#: Frontmatter a job may rewrite without it counting as a change to the memory.
+#: `salience` is derived — `reflect` recomputes it nightly from age and recall —
+#: so stamping `updated` for it would say the memory changed when nothing about
+#: what it claims did. That lie is not cosmetic: `updated` is the age retrieval
+#: scores recency on, the age salience itself decays from, and the age the
+#: retention floor measures, so a nightly rescore would make the whole corpus
+#: permanently new and nothing would ever be forgettable again.
+_DERIVED = frozenset({"salience"})
+
+
+def _is_bookkeeping(patch: Update) -> bool:
+    """Whether this update leaves the memory's actual content alone.
+
+    Decided from what the patch *does*, never from what it claims: an update
+    that also touches the body or any other field re-stamps `updated` as
+    normal, so nothing can hide an edit behind a salience change.
+    """
+    return patch.body is None and bool(patch.frontmatter) and set(patch.frontmatter) <= _DERIVED
 
 
 def _as_body(body: str) -> str:

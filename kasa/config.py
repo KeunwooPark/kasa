@@ -24,6 +24,7 @@ from kasa.llm.base import LLMProvider
 from kasa.llm.cost import CostMeter, Price, PriceBook
 from kasa.llm.openai_compat import OpenAICompatProvider
 from kasa.llm.registry import ModelRole, ProviderRegistry, RetryPolicy
+from kasa.memory.salience import Decay
 from kasa.store import Store
 
 ProviderKind = Literal["openai", "anthropic"]
@@ -212,6 +213,51 @@ class PromoteSettings(BaseModel):
     max_attempts: int = 3
 
 
+class ReflectSettings(BaseModel):
+    """The nightly pass: the journal, the salience curve, and the digest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The salience curve. See `kasa/memory/salience.py` — salience is
+    #: recomputed from age and recall rather than adjusted, which is what lets
+    #: a bounded nightly pass converge instead of double-counting.
+    base_salience: float = 0.5
+    half_life_days: float = 30.0
+    hit_boost: float = 0.08
+    max_hit_boost: float = 0.3
+    salience_floor: float = 0.05
+    #: How far back recalls count. The same order as the half-life: a memory
+    #: that was busy last season and quiet since should be fading.
+    hit_window_days: int = 30
+    #: Below this, a memory's salience is left alone. The commit is a diff a
+    #: person reads, and a file rewritten for a change in the third decimal
+    #: place is noise in it.
+    min_salience_move: float = 0.02
+    #: Salience rewrites per run, under the per-commit file cap. On a corpus
+    #: larger than one commit, the memories furthest from their true score go
+    #: first and the rest converge over the following nights.
+    max_salience_updates: int = 20
+    #: How many recently-touched memories are read together when looking for
+    #: contradictions. One prompt, so this is a token budget as much as a
+    #: coverage decision.
+    max_conflict_candidates: int = 12
+    #: Contradictions surfaced per night. More than a handful is a corpus with
+    #: a structural problem, and a list nobody reads to the end.
+    max_conflicts: int = 5
+    journal_tokens: int = 800
+    #: Slack channel id for the nightly digest. None posts nothing.
+    digest_channel: str | None = None
+
+    def decay(self) -> Decay:
+        return Decay(
+            base=self.base_salience,
+            half_life_days=self.half_life_days,
+            per_hit=self.hit_boost,
+            max_boost=self.max_hit_boost,
+            floor=self.salience_floor,
+        )
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -292,6 +338,7 @@ class Config(BaseModel):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     episodes: EpisodeSettings = Field(default_factory=EpisodeSettings)
     promote: PromoteSettings = Field(default_factory=PromoteSettings)
+    reflect: ReflectSettings = Field(default_factory=ReflectSettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -509,6 +556,7 @@ def render_toml(cfg: Config) -> str:
         ("memory", cfg.memory),
         ("episodes", cfg.episodes),
         ("promote", cfg.promote),
+        ("reflect", cfg.reflect),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),
