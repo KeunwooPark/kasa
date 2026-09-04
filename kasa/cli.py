@@ -28,7 +28,7 @@ from kasa.core.inbox import Inbox
 from kasa.core.memory_tools import memory_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
-from kasa.errors import KasaError
+from kasa.errors import ConfigError, KasaError
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
 from kasa.memory.document import Problem
@@ -40,6 +40,7 @@ from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.runner.jobs import default_specs
 from kasa.runner.scheduler import Scheduler, UnknownJob
+from kasa.search import SearchProvider, web_search_tool
 from kasa.store import Store
 from kasa.vault import Vault, check_placement, clear_cache, load_vault, vault_path
 
@@ -786,6 +787,26 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
         registry = cfg.build_registry(store=store)
         tools = builtin_tools()
         retriever = None
+        search: SearchProvider | None = None
+
+        if cfg.search.configured:
+            try:
+                search = cfg.search.build()
+            except ConfigError as exc:
+                # Same posture as a missing memory repo: answer without the
+                # capability rather than refuse to start, and let `kasa doctor`
+                # say why searching is unavailable.
+                err.print(f"[yellow]![/yellow] web search unavailable — {exc}")
+            else:
+                tools.append(
+                    web_search_tool(
+                        provider=search,
+                        meter=registry.meter,
+                        default_results=cfg.search.max_results,
+                        cost_per_call_usd=cfg.search.cost_per_call_usd,
+                        timeout=cfg.search.timeout_seconds + 5.0,
+                    )
+                )
 
         if cfg.ltm.configured:
             try:
@@ -824,6 +845,8 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
             )
         finally:
             await registry.aclose()
+            if search is not None:
+                await search.aclose()
 
 
 async def _repl(cfg: Config) -> None:

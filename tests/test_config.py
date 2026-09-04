@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from kasa.config import Config, config_from_env, load_config, write_config
+from kasa.config import Config, SearchSettings, config_from_env, load_config, write_config
 from kasa.errors import ConfigError
 from kasa.llm.registry import ModelRole
 
@@ -150,6 +151,12 @@ def _full_config() -> Config:
                     "base_url": "https://api.openai.com/v1",
                     "embedding_dimensions": 1536,
                 },
+            },
+            "search": {
+                "kind": "brave",
+                "key_env": "BRAVE_SEARCH_API_KEY",
+                "max_results": 8,
+                "cost_per_call_usd": 0.005,
             },
             "agent": {"max_tool_iterations": 3},
             "pricing": {"claude-opus-5": {"input": 3.0, "output": 15.0}},
@@ -300,3 +307,43 @@ def test_a_path_that_is_already_absolute_is_left_exactly_as_written(
     path.write_text(f'[ltm]\nrepo = "someone/mem"\nclone_path = "{value}"\n')
 
     assert load_config(path).ltm.clone_path == value
+
+
+# -- web search --------------------------------------------------------------
+
+
+def test_search_is_off_until_a_kind_is_set() -> None:
+    """Absent configuration must mean *no tool*, not a tool that fails on use:
+    a model told it can search spends a turn discovering that it cannot."""
+    assert not Config().search.configured
+    assert Config(search=SearchSettings(kind="brave")).search.configured
+
+
+def test_an_unconfigured_search_writes_no_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(Config(), path)
+
+    assert "[search]" not in path.read_text()
+
+
+def test_a_configured_search_survives_the_round_trip(tmp_path: Path) -> None:
+    cfg = Config(search=SearchSettings(kind="brave", key_env="KASA_BRAVE", max_results=3))
+    path = tmp_path / "config.toml"
+    write_config(cfg, path)
+
+    assert load_config(path) == cfg
+
+
+def test_a_search_key_is_never_written_into_the_config(tmp_path: Path) -> None:
+    """Only the name of the variable, as with every other credential."""
+    path = tmp_path / "config.toml"
+    write_config(Config(search=SearchSettings(kind="brave", key_env="KASA_BRAVE")), path)
+
+    written = path.read_text()
+    assert "KASA_BRAVE" in written
+    assert "cost_per_call_usd" in written, "written in full, so the price is visible to edit"
+
+
+def test_a_search_asking_for_more_results_than_the_tool_allows_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        SearchSettings(kind="brave", max_results=50)

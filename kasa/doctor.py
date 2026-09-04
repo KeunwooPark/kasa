@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from kasa.config import Config, config_path, default_key_env
+from kasa.config import Config, config_path, default_key_env, default_search_key_env
 from kasa.errors import ConfigError, GitHubError, KasaError
 from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
@@ -77,6 +77,7 @@ async def diagnose(
     checks += await _store_checks(cfg)
     checks.append(_manifest(cfg))
     checks += _embeddings(cfg)
+    checks.append(_search(cfg))
     return Report(tuple(checks))
 
 
@@ -142,6 +143,24 @@ def _models(cfg: Config) -> list[Check]:
     if "chat" not in cfg.llm:
         checks.append(Check("models", Status.FAIL, "no model configured for the 'chat' role"))
     return checks
+
+
+def _search(cfg: Config) -> Check:
+    """Whether the web is reachable, and whether the key for it resolves.
+
+    Unconfigured is `SKIP`, not `WARN`: most installs will never want the agent
+    reading the open web, and a nag for a capability nobody asked for trains
+    people to ignore the report.
+    """
+    search = cfg.search
+    if search.kind is None:
+        return Check("web search", Status.SKIP, "not configured; the agent cannot search the web")
+    env = search.key_env or default_search_key_env(search.kind)
+    try:
+        search.api_key()
+    except ConfigError:
+        return Check("web search", Status.FAIL, f"{search.kind} — {env} is not set")
+    return Check("web search", Status.OK, f"{search.kind} via {env}")
 
 
 def _vault(cfg: Config) -> list[Check]:

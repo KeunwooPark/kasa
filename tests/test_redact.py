@@ -5,7 +5,7 @@ import logging
 
 import pytest
 
-from kasa.config import Config
+from kasa.config import Config, SearchSettings
 from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.types import ToolUseBlock
 from kasa.redact import MIN_SECRET_LENGTH, Redactor
@@ -254,3 +254,17 @@ async def test_dispatch_without_a_scrubber_is_unchanged() -> None:
     )
     result = await registry.dispatch(ToolUseBlock(id="t1", name="plain", input={}))
     assert result.content == "just text"
+
+
+def test_an_exported_search_key_is_redacted_like_every_other_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vault covers a stored key on its own. An exported one is only known
+    to the redactor if the config's `[search]` section is read for its name."""
+    monkeypatch.setenv("KASA_BRAVE", "bsa-a-real-looking-search-key")
+    cfg = Config(search=SearchSettings(kind="brave", key_env="KASA_BRAVE"))
+
+    scrubbed = Redactor.from_config(cfg).scrub("sent bsa-a-real-looking-search-key upstream")
+
+    assert "bsa-a-real-looking-search-key" not in scrubbed
+    assert "[redacted:KASA_BRAVE]" in scrubbed

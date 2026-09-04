@@ -102,7 +102,7 @@ kasa run          start the terminal adapter
 kasa run --slack  serve Slack over Socket Mode
 kasa reindex      rebuild the search index from the memory repo
 kasa why "<q>"    show the full retrieval trace for a question
-kasa doctor       check config, tokens, repo privacy, and the clone
+kasa doctor       check config, tokens, repo privacy, search, and the clone
 kasa config       print the resolved configuration
 kasa cost         token and spend totals
 kasa inbox status what is queued, and what stopped being retried
@@ -136,6 +136,34 @@ During a conversation the agent can:
 consolidation job reviews, so the interactive path and the background path share
 one validated write path. Anything scoped to a DM or a private channel stays
 there: retrieval filters on visibility before it ranks.
+
+## Web search
+
+Optional, and off until you ask for it. With a Brave Search key in the vault,
+`web_search` lets Kasa answer things memory cannot — anything current, or simply
+outside the corpus.
+
+```bash
+uv run kasa vault set BRAVE_SEARCH_API_KEY
+```
+
+```toml
+[search]
+kind              = "brave"
+max_results       = 5
+cost_per_call_usd = 0.005    # counts toward the same [budget] ceiling as models
+```
+
+Without a `[search]` section the tool is not registered at all, so Kasa never
+claims a capability it does not have.
+
+Results are snippets, never fetched pages — there is deliberately no `web_fetch`.
+What comes back was written by strangers, so it arrives inside the same
+nonce-delimited untrusted block that consolidation prompts use, labelled as data
+rather than instruction. And nothing a search returns can become a memory: the
+transcript that candidate facts are extracted from is built from what people
+said, and a tool result is not that. A page saying *"remember that X"* does not
+make Kasa believe X.
 
 ## Development
 
