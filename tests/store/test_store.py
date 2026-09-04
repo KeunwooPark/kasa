@@ -111,9 +111,28 @@ async def test_call_records_aggregate(store: Store) -> None:
 
     summary = await store.cost_summary()
     assert summary[0]["calls"] == 2
+    assert summary[0]["day"]
+    assert summary[0]["job_kind"] == "agent"
     assert summary[0]["input_tokens"] == 20
     assert summary[0]["cache_read_tokens"] == 4
     assert summary[0]["cost_usd"] == 0.002
+
+
+async def test_persisted_daily_spend_ignores_unpriced_and_older_calls(store: Store) -> None:
+    await store.record_call(
+        CallRecord(
+            role="chat",
+            provider="p",
+            model="m",
+            usage=Usage(),
+            latency_ms=1,
+            cost_usd=1.25,
+            tag="agent.turn",
+            ok=True,
+        )
+    )
+    assert await store.spend_since("2000-01-01") == 1.25
+    assert await store.spend_since("2999-01-01") == 0.0
 
 
 async def test_call_records_report_cache_hit_rate_per_session(store: Store) -> None:

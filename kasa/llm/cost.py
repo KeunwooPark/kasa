@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from kasa.llm.types import Usage
 
@@ -66,6 +67,7 @@ class CallRecord:
 #: Where a completed call goes. The store supplies the real one; tests and the
 #: CLI can pass a collector.
 CostSink = Callable[[CallRecord], Awaitable[None]]
+SpendSource = Callable[[str], Awaitable[float]]
 
 
 async def null_sink(record: CallRecord) -> None:
@@ -73,18 +75,40 @@ async def null_sink(record: CallRecord) -> None:
 
 
 class CostMeter:
-    def __init__(self, price_book: PriceBook, sink: CostSink = null_sink) -> None:
+    def __init__(
+        self,
+        price_book: PriceBook,
+        sink: CostSink = null_sink,
+        *,
+        daily_usd_ceiling: float | None = None,
+        spent_since: SpendSource | None = None,
+    ) -> None:
         self._prices = price_book
         self._sink = sink
         self.total = Usage()
         self.total_usd = 0.0
         self._sessions: dict[str, Usage] = {}
+        self.daily_usd_ceiling = daily_usd_ceiling
+        self._spent_since = spent_since
+        self._day = _utc_day()
+        self._daily_usd = 0.0
 
     def session_usage(self, session_id: str) -> Usage:
         return self._sessions.get(session_id, Usage())
 
     def session_cache_hit_rate(self, session_id: str) -> float:
         return self.session_usage(session_id).cache_hit_rate
+
+    async def daily_ceiling_reached(self) -> bool:
+        ceiling = self.daily_usd_ceiling
+        if ceiling is None:
+            return False
+        day = _utc_day()
+        if self._spent_since is not None:
+            spent = await self._spent_since(day)
+        else:
+            spent = self._daily_usd if self._day == day else 0.0
+        return spent >= ceiling
 
     async def record(
         self,
@@ -105,6 +129,11 @@ class CostMeter:
             self._sessions[session_id] = self.session_usage(session_id) + usage
         if cost is not None:
             self.total_usd += cost
+            day = _utc_day()
+            if day != self._day:
+                self._day = day
+                self._daily_usd = 0.0
+            self._daily_usd += cost
         record = CallRecord(
             role=role,
             provider=provider,
@@ -119,3 +148,7 @@ class CostMeter:
         )
         await self._sink(record)
         return record
+
+
+def _utc_day() -> str:
+    return datetime.now(UTC).date().isoformat()

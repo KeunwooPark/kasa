@@ -63,6 +63,24 @@ def test_unknown_keys_are_rejected() -> None:
         Config.model_validate({"llm": {}, "nonsense": 1})
 
 
+def test_daily_budget_ceiling_is_optional_and_non_negative() -> None:
+    assert Config().budget.daily_usd_ceiling is None
+    assert (
+        Config.model_validate({"budget": {"daily_usd_ceiling": 2.5}}).budget.daily_usd_ceiling
+        == 2.5
+    )
+    with pytest.raises(Exception):  # noqa: B017 - pydantic's own error
+        Config.model_validate({"budget": {"daily_usd_ceiling": -1}})
+
+
+def test_daily_budget_ceiling_round_trips_through_toml(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(Config.model_validate({"budget": {"daily_usd_ceiling": 2.5}}), path)
+
+    assert "[budget]" in path.read_text()
+    assert load_config(path).budget.daily_usd_ceiling == 2.5
+
+
 def test_toml_is_loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     path = tmp_path / "config.toml"
