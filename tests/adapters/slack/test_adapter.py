@@ -20,6 +20,7 @@ from kasa.adapters.slack.app import NO_HTTP_VERIFICATION, SlackAdapter
 from kasa.adapters.slack.events import SlackContext, normalize
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
+from kasa.core.revise import TOMBSTONE
 from kasa.core.tools import ToolRegistry
 from kasa.llm.registry import ModelRole, ProviderRegistry
 from kasa.llm.tokens import Tokenizer
@@ -434,6 +435,105 @@ async def test_a_retried_turn_rewrites_its_own_placeholder(
         await asyncio.wait_for(running, timeout=30.0)
 
     assert len(client.posted) == 1, client.posted
+
+
+# -- revisions ----------------------------------------------------------------
+
+
+async def answer_once(adapter: SlackAdapter, client: RecordingClient) -> None:
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention())
+        await answered(client)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+
+async def test_editing_a_message_rewrites_what_kasa_stored(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """The whole chain, which no unit test covers: the turn records the Slack
+    key on the row it writes, and the edit finds the row by that key."""
+    adapter, client = make_adapter(store, tokenizer)
+    await answer_once(adapter, client)
+
+    await adapter.on_event(
+        {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "C0DEPLOY",
+            "ts": "1700000099.000000",
+            "message": {"ts": "1700000000.000100", "user": HUMAN, "text": "what did we ship?"},
+        }
+    )
+
+    stored = await store.recent_messages(f"slack:{TEAM}:C0DEPLOY:1700000000.000100")
+    assert stored[0].text == "what did we ship?"
+
+
+async def test_deleting_a_message_tombstones_it(store: Store, tokenizer: Tokenizer) -> None:
+    adapter, client = make_adapter(store, tokenizer)
+    await answer_once(adapter, client)
+
+    await adapter.on_event(
+        {
+            "type": "message",
+            "subtype": "message_deleted",
+            "channel": "C0DEPLOY",
+            "ts": "1700000099.000000",
+            "deleted_ts": "1700000000.000100",
+        }
+    )
+
+    stored = await store.recent_messages(f"slack:{TEAM}:C0DEPLOY:1700000000.000100")
+    assert stored[0].text == TOMBSTONE
+    assert "what did we decide" not in str(
+        await store.raw("SELECT content FROM messages WHERE seq = 1")
+    )
+
+
+async def test_a_revision_never_reaches_the_agent(store: Store, tokenizer: Tokenizer) -> None:
+    """Everything that comes out of the inbox is delivered as something to
+    answer, and "Jane fixed a typo" is not a question."""
+    provider = ScriptedProvider([says("noted")] * 4)
+    adapter, client = make_adapter(store, tokenizer, provider=provider)
+    await answer_once(adapter, client)
+
+    await adapter.on_event(
+        {
+            "type": "message",
+            "subtype": "message_deleted",
+            "channel": "C0DEPLOY",
+            "ts": "1700000099.000000",
+            "deleted_ts": "1700000000.000100",
+        }
+    )
+
+    assert await adapter.runtime.inbox.counts() == {"done": 1}, "the revision was not queued"
+    assert len(provider.requests) == 1, "and no second turn ran"
+
+
+async def test_kasas_own_streamed_updates_are_not_revisions(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """A streamed reply is one `chat.update` per second, and Slack echoes every
+    one of them back as `message_changed`."""
+    adapter, client = make_adapter(store, tokenizer)
+    await answer_once(adapter, client)
+
+    await adapter.on_event(
+        {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "C0DEPLOY",
+            "ts": "1700000099.000000",
+            "message": {"ts": client.posted[0]["ts"], "user": BOT, "text": "noted"},
+        }
+    )
+
+    stored = await store.recent_messages(f"slack:{TEAM}:C0DEPLOY:1700000000.000100")
+    assert stored[0].text == "what did we decide?", "the person's message is untouched"
 
 
 # -- identity -----------------------------------------------------------------

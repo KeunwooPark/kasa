@@ -52,6 +52,8 @@ inbox_app = typer.Typer(help="The durable ingress queue.", no_args_is_help=True)
 app.add_typer(inbox_app, name="inbox")
 job_app = typer.Typer(help="Background jobs.", no_args_is_help=True)
 app.add_typer(job_app, name="job")
+review_app = typer.Typer(help="Things Kasa decided not to decide alone.", no_args_is_help=True)
+app.add_typer(review_app, name="review")
 
 console = Console()
 #: Everything on stderr is a single diagnostic line, never a table, and it
@@ -426,6 +428,60 @@ def job_list(config: ConfigOption = None) -> None:
                 f"[red]![/red] {row['kind']} {row['id']} after {row['attempts']} attempt(s)"
                 f" — {row['last_error']}"
             )
+
+    _run(main())
+
+
+@review_app.command("list")
+def review_list(config: ConfigOption = None) -> None:
+    """Show what is waiting on a person.
+
+    One thing raises these today: a claim already in long-term memory whose
+    source message was edited or deleted afterwards (#25). Kasa will not
+    rewrite the corpus over a retraction — the memory may have been merged,
+    superseded or built on since — so it says what it noticed and stops.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            rows = await store.open_reviews()
+        if not rows:
+            console.print("[dim]nothing waiting[/dim]")
+            return
+        table = Table(show_header=True)
+        for column in ("id", "raised", "why", "subject"):
+            table.add_column(column, no_wrap=column != "subject", overflow="fold")
+        for row in rows:
+            table.add_row(
+                str(row["id"]), str(row["created_at"])[:16], str(row["kind"]), str(row["subject"])
+            )
+        console.print(table)
+        for row in rows:
+            # The detail carries the claim, and the claim may have come from a
+            # DM. Printed here on the operator's own terminal, with the scope
+            # beside it, and never anywhere a channel can read.
+            console.print(f"\n[bold]{row['id']}[/bold] [dim]({row['scope']})[/dim]")
+            console.print(f"  {row['detail']}")
+
+    _run(main())
+
+
+@review_app.command("done")
+def review_done(
+    review_id: Annotated[str, typer.Argument(help="The review to close.")],
+    config: ConfigOption = None,
+) -> None:
+    """Mark a review as dealt with. Kasa does not check that it was."""
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            closed = await store.resolve_review(review_id)
+        if not closed:
+            err.print(f"[yellow]![/yellow] no open review {review_id}")
+            raise typer.Exit(1)
+        console.print(f"[green]closed[/green] {review_id}")
 
     _run(main())
 

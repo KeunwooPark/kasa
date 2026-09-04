@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Self
 
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
@@ -19,12 +20,13 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from kasa.adapters.slack.events import Ignored, SlackContext, normalize
+from kasa.adapters.slack.events import Changed, Ignored, SlackContext, normalize
 from kasa.adapters.slack.identity import Directory
 from kasa.adapters.slack.stream import DEFAULT_INTERVAL, LiveMessage, SlackRateLimited
 from kasa.config import SlackSettings
 from kasa.core.agent import Agent, AgentResult
 from kasa.core.events import InboundEvent
+from kasa.core.revise import Reviser
 from kasa.core.runtime import DEFAULT_CONCURRENCY, Reply, Runtime, one_message
 from kasa.errors import ConfigError
 from kasa.llm.types import Delta
@@ -64,6 +66,7 @@ class SlackAdapter:
         self._interval = interval
         self._unfinished: dict[str, str] = {}
         self.directory = Directory(agent.store, self._users_info, team_id=context.team_id)
+        self.reviser = Reviser(agent.store)
         self.runtime = Runtime(
             agent,
             self.open_reply if stream else one_message(self.reply),
@@ -142,12 +145,39 @@ class SlackAdapter:
         if isinstance(decision, Ignored):
             log.debug("ignoring a slack event: %s", decision.reason)
             return
+        if isinstance(decision, Changed):
+            await self.revise(decision)
+            return
         enqueued = await self.runtime.submit(decision.event)
         if enqueued.duplicate:
             # Either Slack re-sent the event, or the same message reached us as
             # both `app_mention` and `message`. Both are normal; both are the
             # unique constraint doing its job.
             log.debug("slack sent %s again; already queued", decision.event.external_id)
+
+    async def revise(self, decision: Changed) -> None:
+        """Apply an edit or a deletion, here on the ack path rather than behind
+        the queue.
+
+        Deliberately, and it is the one thing besides the INSERT that runs
+        here. The work is a handful of indexed statements against SQLite with
+        no model and no network in it, so it fits the three seconds many times
+        over — and it must not go through the inbox, because everything that
+        comes out of the inbox is delivered to the agent as something to answer,
+        and "Jane fixed a typo" is not a question.
+
+        Durability comes from Slack instead: raising means bolt does not ack,
+        Slack re-sends, and every step here is idempotent — a rewrite to the
+        same words, a state already set, a review deduped on its key.
+        """
+        revision = decision.revision
+        if revision.text is not None:
+            # Cache-only, so the ack path stays free of `users.info`. The
+            # people in an edited message were almost always resolved when the
+            # original arrived.
+            revision = replace(revision, text=await self.directory.rename_known(revision.text))
+        outcome = await self.reviser.apply(revision)
+        log.debug("revision %s: %s", revision.external_id, outcome.summary())
 
     async def _known_session(self, session_id: str) -> bool:
         return await self.runtime.store.get_session(session_id) is not None

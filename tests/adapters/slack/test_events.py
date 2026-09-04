@@ -15,6 +15,7 @@ import pytest
 
 from kasa.adapters.slack.events import (
     Accepted,
+    Changed,
     Decision,
     Ignored,
     SlackContext,
@@ -266,18 +267,24 @@ async def test_a_channel_message_that_is_not_addressed_to_kasa_is_ignored() -> N
     assert decision.reason == "not addressed to Kasa"
 
 
-@pytest.mark.parametrize(
-    "subtype", ["message_changed", "message_deleted", "channel_join", "channel_topic", "invented"]
-)
+@pytest.mark.parametrize("subtype", ["channel_join", "channel_topic", "invented"])
 async def test_a_subtype_that_is_not_somebody_talking_is_ignored(subtype: str) -> None:
-    """Editing a message must not read as sending a new one. #25 is where
-    `message_changed` and `message_deleted` become something — and an unknown
-    subtype is ignored rather than answered, because Kasa replies in any thread
-    it is already part of and "Bob joined the channel" is not a question."""
+    """An unknown subtype is ignored rather than answered, because Kasa replies
+    in any thread it is already part of and "Bob joined the channel" is not a
+    question."""
     decision = await normalize(dm() | {"subtype": subtype}, context=context(), known_session=never)
 
     assert isinstance(decision, Ignored)
     assert subtype in decision.reason
+
+
+@pytest.mark.parametrize("subtype", ["message_changed", "message_deleted"])
+async def test_a_revision_is_never_something_to_answer(subtype: str) -> None:
+    """#25 made these mean something, and the thing they must not mean is a new
+    message: an edit that reached the agent would be answered a second time."""
+    decision = await normalize(dm() | {"subtype": subtype}, context=context(), known_session=always)
+
+    assert not isinstance(decision, Accepted)
 
 
 async def test_kasas_own_message_is_ignored() -> None:
@@ -370,6 +377,121 @@ async def test_only_a_d_channel_is_a_one_to_one(channel: str, expected: str) -> 
     """`D` is the one-to-one with the bot. A private channel or a group DM is
     `G`, and neither belongs to one person."""
     assert scope_for(channel, HUMAN, is_dm=channel.startswith("D")) == expected
+
+
+# -- revisions ----------------------------------------------------------------
+
+
+def edited(
+    text: str = "what did we decide, again?",
+    *,
+    ts: str = "1700000000.000100",
+    channel: str = "D1",
+    user: str = HUMAN,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "subtype": "message_changed",
+        "channel": channel,
+        # The change's own timestamp, which is *not* the message's. Written
+        # differently on purpose: reading this one looks up a message that
+        # never existed and silently does nothing.
+        "ts": "1700000099.000000",
+        "message": {"ts": ts, "user": user, "text": text} | extra,
+    }
+
+
+def deleted(ts: str = "1700000000.000100", *, channel: str = "D1") -> dict[str, Any]:
+    return {
+        "type": "message",
+        "subtype": "message_deleted",
+        "channel": channel,
+        "ts": "1700000099.000000",
+        "deleted_ts": ts,
+    }
+
+
+async def test_an_edit_names_the_message_it_edited() -> None:
+    decision = await normalize(edited(), context=context(), known_session=never)
+
+    assert isinstance(decision, Changed)
+    assert decision.revision.external_id == f"slack:{TEAM}:D1:1700000000.000100"
+    assert decision.revision.text == "what did we decide, again?"
+
+
+async def test_a_deletion_names_the_message_it_deleted() -> None:
+    decision = await normalize(deleted(), context=context(), known_session=never)
+
+    assert isinstance(decision, Changed)
+    assert decision.revision.external_id == f"slack:{TEAM}:D1:1700000000.000100"
+    assert decision.revision.deleted
+
+
+async def test_an_edited_message_is_keyed_the_same_way_the_original_was() -> None:
+    """The revision has to find the row ingress wrote, and the only thing
+    connecting them is that both sides spell the key the same way."""
+    original = await normalize(dm(), context=context(), known_session=never)
+    revision = await normalize(edited(channel="D1"), context=context(), known_session=never)
+
+    assert isinstance(original, Accepted) and isinstance(revision, Changed)
+    assert revision.revision.external_id == original.event.external_id
+
+
+async def test_kasas_own_message_changing_is_not_a_revision() -> None:
+    """A streamed reply is one `chat.update` per second (#22), and every one of
+    them comes back as a `message_changed`. Without this an answer would revise
+    itself thirty times."""
+    decision = await normalize(edited(user=BOT), context=context(), known_session=always)
+
+    assert isinstance(decision, Ignored)
+
+
+async def test_a_bot_message_changing_is_not_a_revision() -> None:
+    decision = await normalize(edited(bot_id="B0KASA"), context=context(), known_session=always)
+
+    assert isinstance(decision, Ignored)
+
+
+async def test_kasas_own_mention_is_stripped_from_an_edit_as_well() -> None:
+    """The stored text had it stripped, so an edit that put it back would
+    rewrite the message into something ingress would never have written."""
+    decision = await normalize(
+        edited(f"<@{BOT}> what did we decide, again?"), context=context(), known_session=never
+    )
+
+    assert isinstance(decision, Changed)
+    assert decision.revision.text == "what did we decide, again?"
+
+
+async def test_a_revision_outside_the_allowlist_is_ignored() -> None:
+    """It would find no stored message anyway — ingress never accepted one. Said
+    out loud rather than left to fall through, because "it happens to be
+    harmless" is not the same as "it is refused"."""
+    decision = await normalize(
+        deleted(channel="C0OTHER"), context=context(allowed=frozenset({"C1"})), known_session=never
+    )
+
+    assert isinstance(decision, Ignored)
+    assert "allowlist" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "message", "subtype": "message_deleted", "channel": "D1"},
+        {"type": "message", "subtype": "message_changed", "channel": "D1"},
+        {"type": "message", "subtype": "message_changed", "channel": "D1", "message": "nope"},
+        {"type": "message", "subtype": "message_deleted", "deleted_ts": "1.0"},
+    ],
+    ids=["no deleted_ts", "no message", "message is not an object", "no channel"],
+)
+async def test_a_revision_that_names_nothing_is_ignored(event: dict[str, Any]) -> None:
+    """These reach the ack path, where an exception is a message lost with
+    nothing recording that it arrived."""
+    decision = await normalize(event, context=context(), known_session=never)
+
+    assert isinstance(decision, Ignored)
 
 
 # -- dedupe -------------------------------------------------------------------

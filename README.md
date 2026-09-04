@@ -72,6 +72,13 @@ the answer is complete — never per token, which flickers and would spend the
 turn being rate limited. Under rate-limit pressure it drops the intermediate
 frames and keeps the answer. Set `slack.stream = false` for one message a turn.
 
+Editing a message rewrites what Kasa stored and marks any candidate fact drawn
+from it stale; deleting one leaves a tombstone in the transcript and lowers the
+confidence of what was drawn from it. Neither rewrites the memory repo: when
+the claim is already a file there, Kasa queues a review — `kasa review list` —
+because a retraction is not a correction and the file may have been merged or
+built on since.
+
 `kasa init` walks through the private GitHub repo that holds long-term memory —
 creating it if it does not exist — clones it, lays out the memory skeleton, and
 writes `~/.config/kasa/config.toml`. It refuses to configure a public repo, and
@@ -98,6 +105,8 @@ kasa inbox retry  requeue every dead-lettered event
 kasa job run <k>  run a background job now
 kasa job list     what each job is doing, and when it last ran
 kasa job retry    requeue every dead-lettered job
+kasa review list  what is waiting on a person, and why
+kasa review done  mark a review as dealt with
 kasa db migrate   apply pending migrations
 ```
 
