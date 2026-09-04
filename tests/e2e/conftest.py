@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +43,34 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             message["content"] for message in reversed(messages) if message["role"] == "user"
         )
         has_tool_result = any(message["role"] == "tool" for message in messages)
+
+        failures = {
+            "Fail with 401.": 401,
+            "Fail with 429.": 429,
+            "Fail with 503.": 503,
+        }
+        if status := failures.get(last_user):
+            body = json.dumps({"error": "planned failure echoed not-a-real-secret"}).encode()
+            self.send_response(status)
+            if status == 429:
+                self.send_header("retry-after", "0")
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if last_user == "Return malformed SSE.":
+            body = b"data: {this is not JSON}\n\n"
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if last_user == "Time out.":
+            time.sleep(0.2)
 
         if last_user == "Hold this turn.":
             self.server.request_started.set()
@@ -85,7 +115,8 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        with contextlib.suppress(BrokenPipeError):
+            self.wfile.write(body)
 
     @staticmethod
     def _usage() -> dict[str, int]:
@@ -151,6 +182,8 @@ def kasa_rig(tmp_path: Path) -> Iterator[KasaRig]:
         f'[store]\npath = "{database}"\n\n'
         '[llm.chat]\nkind = "openai"\nmodel = "e2e-model"\n'
         f'base_url = "http://{host}:{port}/v1"\nkey_env = "KASA_E2E_API_KEY"\n'
+        "timeout_seconds = 0.05\n\n"
+        "[retry]\nattempts = 3\nbase_delay = 0\nmax_delay = 0\njitter = 0\n"
     )
     env = os.environ.copy()
     env["KASA_E2E_API_KEY"] = "not-a-real-secret"

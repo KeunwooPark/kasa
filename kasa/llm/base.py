@@ -87,7 +87,7 @@ class HTTPProvider:
         model: str,
         base_url: str,
         headers: Mapping[str, str],
-        timeout: httpx.Timeout | None = None,
+        timeout: httpx.Timeout | float | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.name = name

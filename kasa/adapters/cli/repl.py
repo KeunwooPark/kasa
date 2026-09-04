@@ -9,6 +9,7 @@ indistinguishable in the database from one held in a channel.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -51,6 +52,7 @@ class Repl:
     agent: Agent
     console: Console
     session_id: str
+    scrub: Callable[[str], str] = lambda text: text
     last_result: AgentResult | None = None
 
     async def run(self) -> None:
@@ -92,7 +94,7 @@ class Repl:
             self.console.print("\n[yellow]interrupted[/yellow]")
             raise
         except Exception as exc:
-            self.console.print(f"\n[red]{type(exc).__name__}[/red]: {exc}")
+            self.console.print(f"\n[red]{type(exc).__name__}[/red]: {self.scrub(str(exc))}")
             return
 
         self.console.print()
@@ -136,10 +138,16 @@ class Repl:
         return False
 
 
-async def run_repl(agent: Agent, console: Console | None = None) -> None:
+async def run_repl(
+    agent: Agent,
+    console: Console | None = None,
+    *,
+    scrub: Callable[[str], str] = lambda text: text,
+) -> None:
     repl = Repl(
         agent=agent,
         console=console or Console(),
         session_id=f"cli:{ULID()}",
+        scrub=scrub,
     )
     await repl.run()
