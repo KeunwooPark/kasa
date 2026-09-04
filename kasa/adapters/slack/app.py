@@ -104,6 +104,11 @@ class SlackAdapter:
         )
         app = AsyncApp(
             client=client,
+            # Socket Mode sends its acknowledgement after dispatch returns.
+            # The listener only normalizes and commits one inbox row, and it
+            # must finish before that ack or a crash in between loses an event
+            # Slack has already been told was durable.
+            process_before_response=True,
             signing_secret=NO_HTTP_VERIFICATION,
             request_verification_enabled=False,
         )
