@@ -8,6 +8,7 @@ catch a scoring change that quietly makes recall worse.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from kasa.memory.explain import render_trace
 from kasa.memory.index import MemoryIndex
 from kasa.memory.retrieve import (
     DEFAULT_LIMIT,
+    Candidate,
     Retriever,
     build_match,
     is_self_contained,
@@ -1063,3 +1065,56 @@ async def test_a_retriever_that_is_not_a_conversation_records_nothing(
     await retriever(store, tokenizer).retrieve("who owns the deploy pipeline?")
 
     assert await store.memory_hits_since("2000-01-01") == {}
+
+
+# -- hybrid semantic retrieval ----------------------------------------------
+
+
+async def test_vectors_improve_recall_over_the_lexical_baseline(
+    tmp_path: Path, store: Store, tokenizer: Tokenizer
+) -> None:
+    bootstrap(tmp_path)
+    wanted = write(
+        tmp_path,
+        MemoryDoc.new(type="person", title="Alice", body="Alice leads talent acquisition."),
+    )
+    write(tmp_path, MemoryDoc.new(type="person", title="Bob", body="Bob owns payroll."))
+
+    async def semantic(texts: list[str]) -> list[list[float]]:
+        return [
+            [1.0, 0.0]
+            if "acquisition" in text.lower() or "recruiting" in text.lower()
+            else [0.0, 1.0]
+            for text in texts
+        ]
+
+    await MemoryIndex(store, tmp_path, embedder=semantic, embedding_model="semantic-v1").reindex()
+    lexical = await retriever(store, tokenizer).retrieve("Who handles recruiting?")
+    hybrid = await retriever(
+        store, tokenizer, embedder=semantic, embedding_model="semantic-v1"
+    ).retrieve("Who handles recruiting?")
+
+    assert wanted.id not in lexical.memory_ids
+    assert hybrid.memory_ids[:1] == [wanted.id]
+    assert "vector" in hybrid.kept[0].sources
+
+
+async def test_reranking_only_runs_for_a_large_enough_pool(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    calls = 0
+
+    async def rerank(query: str, candidates: Sequence[Candidate]) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return [candidates[-1].chunk_id]
+
+    small = retriever(store, tokenizer, reranker=rerank, rerank_threshold=100)
+    small_result = await small.retrieve("deploy pipeline")
+    assert small_result.trace is not None and not small_result.trace.reranked
+    assert calls == 0
+
+    large = retriever(store, tokenizer, reranker=rerank, rerank_threshold=2)
+    result = await large.retrieve("deploy pipeline")
+    assert result.trace is not None and result.trace.reranked
+    assert calls == 1

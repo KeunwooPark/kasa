@@ -116,7 +116,11 @@ def default_specs(
         # a human merges it. The job syncs first and then rebuilds both derived
         # views.
         specs.append(
-            JobSpec(kind="reindex", handler=_reindex(cfg, store), cron=Cron.parse("* * * * *"))
+            JobSpec(
+                kind="reindex",
+                handler=_reindex(cfg, store, models),
+                cron=Cron.parse("* * * * *"),
+            )
         )
     if cfg.ltm.configured and cfg.slack.configured:
         # A repo and a Slack install, and no model: what it writes is a uid and
@@ -286,7 +290,7 @@ def _digest_sink(cfg: Config) -> Notifier | None:
     return post
 
 
-def _reindex(cfg: Config, store: Store) -> JobHandler:
+def _reindex(cfg: Config, store: Store, models: Models) -> JobHandler:
     async def run(job: Job) -> None:
         # Both halves, for the reason `kasa reindex` gives: rebuilding only the
         # SQLite one is what let the index and the manifest disagree about
@@ -294,9 +298,18 @@ def _reindex(cfg: Config, store: Store) -> JobHandler:
         memory = await MemoryStore.open(cfg, store)
         changed = await asyncio.to_thread(memory.sync_default)
         try:
-            result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(
-                full=bool(job.payload.get("full"))
-            )
+            if "embedding" in cfg.llm:
+                async with models.use() as registry:
+                    result = await MemoryIndex(
+                        store,
+                        cfg.ltm.resolved_clone_path(),
+                        embedder=registry.embed,
+                        embedding_model=cfg.llm["embedding"].model,
+                    ).reindex(full=bool(job.payload.get("full")))
+            else:
+                result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(
+                    full=bool(job.payload.get("full"))
+                )
         except LeaseError as exc:
             # Losing the index lease (#96) means another rebuild is already
             # doing this job's entire work, and this job's whole point is that

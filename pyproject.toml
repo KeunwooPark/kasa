@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tiktoken = ["tiktoken>=0.7"]
+embeddings = ["sqlite-vec>=0.1.9"]
 slack = [
     "aiohttp>=3.9",
     "slack-bolt[async]>=1.18",
@@ -62,7 +63,7 @@ warn_unreachable = true
 plugins = []
 
 [[tool.mypy.overrides]]
-module = ["ulid.*", "tiktoken.*"]
+module = ["ulid.*", "tiktoken.*", "sqlite_vec.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

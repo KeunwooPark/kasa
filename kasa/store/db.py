@@ -99,6 +99,23 @@ class Store:
         self._conn = conn
         self.path = path
         self._serial = _Serial()
+        self._vectors_enabled = False
+
+    async def enable_vectors(self) -> None:
+        """Load sqlite-vec lazily; lexical-only installs need no extension."""
+        try:
+            import sqlite_vec
+        except ImportError as exc:  # pragma: no cover - depends on installation extras
+            raise StoreError("vector retrieval requires the 'embeddings' extra") from exc
+        async with self._serial:
+            if self._vectors_enabled:
+                return
+            await self._conn.enable_load_extension(True)
+            try:
+                await self._conn.load_extension(sqlite_vec.loadable_path())
+            finally:
+                await self._conn.enable_load_extension(False)
+            self._vectors_enabled = True
 
     @classmethod
     async def open(cls, path: str | Path) -> Self:
