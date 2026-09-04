@@ -40,6 +40,10 @@ the user or from anyone else — and do not mention that you retrieved them. If
 they conflict with what the user just told you, the user is more current — say
 so rather than silently picking one.
 
+Use the available tools when you need information that is current or not present
+in the conversation or memory. If no suitable tool is available, say that you
+cannot verify it rather than inventing an answer.
+
 If you do not know something, say so."""
 
 

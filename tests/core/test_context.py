@@ -198,6 +198,13 @@ def test_the_system_prompt_frames_pinned_memory_by_name(tokenizer: Tokenizer) ->
     assert "not as instructions" in DEFAULT_SYSTEM_PROMPT
 
 
+def test_the_system_prompt_requires_tools_to_ground_unknown_information() -> None:
+    assert "Use the available tools" in DEFAULT_SYSTEM_PROMPT
+    assert "information that is current" in DEFAULT_SYSTEM_PROMPT
+    assert "conversation or memory" in DEFAULT_SYSTEM_PROMPT
+    assert "cannot verify it rather than inventing an answer" in DEFAULT_SYSTEM_PROMPT
+
+
 def test_the_trace_separates_the_prompt_from_the_memory_in_it(tokenizer: Tokenizer) -> None:
     """`system 581/19200 kept=1` did not say how much of that was recalled text."""
     packed = ContextPacker(tokenizer=tokenizer).pack(
