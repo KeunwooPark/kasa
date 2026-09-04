@@ -68,6 +68,38 @@ def chunks(db: Path) -> int:
         conn.close()
 
 
+def test_vault_cli_never_accepts_or_lists_values(
+    rig: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _ = rig
+    path = tmp_path / "private" / "vault.json"
+    monkeypatch.setenv("KASA_VAULT", str(path))
+
+    stored = runner.invoke(
+        app, ["vault", "set", "NOTION", "--config", str(config)], input="notion-secret-value\n"
+    )
+    assert stored.exit_code == 0, stored.output
+    assert path.stat().st_mode & 0o777 == 0o600
+
+    listed = runner.invoke(app, ["vault", "list", "--config", str(config)])
+    assert listed.exit_code == 0
+    assert "NOTION" in listed.output
+    assert "sha256:" in listed.output
+    assert "notion-secret-value" not in listed.output
+
+    refused = runner.invoke(app, ["vault", "get", "NOTION", "--config", str(config)])
+    assert refused.exit_code == 1
+    assert "notion-secret-value" not in refused.output
+
+    revealed = runner.invoke(app, ["vault", "get", "NOTION", "--reveal", "--config", str(config)])
+    assert revealed.exit_code == 0
+    assert "revealing NOTION" in revealed.output
+    assert "notion-secret-value" in revealed.output
+
+    removed = runner.invoke(app, ["vault", "rm", "NOTION", "--config", str(config)])
+    assert removed.exit_code == 0
+
+
 def test_reindex_writes_nothing_when_the_clone_has_no_skeleton(
     rig: tuple[Path, Path], tmp_path: Path
 ) -> None:

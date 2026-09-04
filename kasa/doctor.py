@@ -27,6 +27,7 @@ from kasa.memory.index import MemoryIndex
 from kasa.memory.lease import LEASE_NAME, LOCK_FILENAME, stale_lease
 from kasa.memory.manifest import Manifest
 from kasa.store import Store
+from kasa.vault import Vault, check_placement, enclosing_git_repo, resolve, vault_path
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ async def diagnose(
     checks += _models(cfg)
     checks += await _memory_repo(cfg, github=github)
     checks += _slack(cfg)
+    checks += _vault(cfg)
     checks += await _store_checks(cfg)
     checks.append(_manifest(cfg))
     checks += _embeddings(cfg)
@@ -139,6 +141,60 @@ def _models(cfg: Config) -> list[Check]:
 
     if "chat" not in cfg.llm:
         checks.append(Check("models", Status.FAIL, "no model configured for the 'chat' role"))
+    return checks
+
+
+def _vault(cfg: Config) -> list[Check]:
+    """The vault's own health: can it be read, and is it somewhere safe.
+
+    Every failure here is caught rather than raised. `doctor` is the command
+    somebody runs *because* something is wrong, so a vault with bad permissions
+    has to be reported as a red line in the report — the one place it is
+    actionable — and not as a traceback that takes the other fifteen checks
+    down with it.
+    """
+    path = vault_path()
+    if not path.exists():
+        return [Check("vault", Status.SKIP, f"{path} does not exist; no secrets stored")]
+
+    checks: list[Check] = []
+    try:
+        check_placement(path, clone_path=cfg.ltm.resolved_clone_path())
+    except ConfigError as exc:
+        # The worst case in the system: a credential store inside a directory
+        # that background jobs commit and push on a schedule.
+        return [Check("vault", Status.FAIL, str(exc).splitlines()[0])]
+
+    try:
+        vault = Vault.load(path)
+    except KasaError as exc:
+        return [Check("vault", Status.FAIL, str(exc).splitlines()[0])]
+
+    names = vault.names()
+    checks.append(Check("vault", Status.OK, f"{len(names)} secret(s) in {path}"))
+
+    if repo := enclosing_git_repo(path):
+        checks.append(
+            Check(
+                "vault location",
+                Status.WARN,
+                f"{path} is inside the git work tree at {repo}; it must never be committed",
+            )
+        )
+
+    # An exported variable silently wins over a stored one (`vault.resolve`),
+    # which is the intended precedence and also the thing that makes people
+    # think a rotated key did not take.
+    if shadowed := [
+        name for name in names if os.environ.get(name) and os.environ[name] != vault.get(name)
+    ]:
+        checks.append(
+            Check(
+                "vault shadowed",
+                Status.WARN,
+                f"the environment overrides the stored {', '.join(sorted(shadowed))}",
+            )
+        )
     return checks
 
 
@@ -340,7 +396,7 @@ def _slack(cfg: Config) -> list[Check]:
     missing = [
         env
         for env in (cfg.slack.app_token_env, cfg.slack.bot_token_env)
-        if env and not os.environ.get(env)
+        if env and not resolve(env)
     ]
     if missing:
         return [Check("slack", Status.FAIL, f"{', '.join(missing)} not set")]

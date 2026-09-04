@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
+import sys
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from itertools import chain
@@ -39,6 +41,7 @@ from kasa.redact import Redactor
 from kasa.runner.jobs import default_specs
 from kasa.runner.scheduler import Scheduler, UnknownJob
 from kasa.store import Store
+from kasa.vault import Vault, check_placement, clear_cache, load_vault, vault_path
 
 app = typer.Typer(
     name="kasa",
@@ -54,6 +57,10 @@ job_app = typer.Typer(help="Background jobs.", no_args_is_help=True)
 app.add_typer(job_app, name="job")
 review_app = typer.Typer(help="Things Kasa decided not to decide alone.", no_args_is_help=True)
 app.add_typer(review_app, name="review")
+vault_app = typer.Typer(
+    help="Secrets held on this machine, and nowhere else.", no_args_is_help=True
+)
+app.add_typer(vault_app, name="vault")
 
 console = Console()
 #: Everything on stderr is a single diagnostic line, never a table, and it
@@ -122,6 +129,114 @@ def show_config(config: ConfigOption = None) -> None:
     # first thing `kasa config | jq` choked on.
     err.print(f"[dim]{config or config_path()}[/dim]")
     console.print_json(json.dumps(cfg.redacted(), indent=2))
+
+
+# -- vault -------------------------------------------------------------------
+
+REVEAL_REFUSED = (
+    "refusing to print {name}. Pass --reveal if you meant to put a credential "
+    "on your terminal, and remember it lands in the scrollback."
+)
+
+
+def _vault(config: Path | None) -> Vault:
+    """Load the vault, refusing one placed where it would be pushed."""
+    path = vault_path()
+    try:
+        check_placement(path, clone_path=_load(config).ltm.resolved_clone_path())
+        return Vault.load(path)
+    except KasaError as exc:
+        err.print(f"[red]error[/red]: {exc}")
+        raise typer.Exit(1) from exc
+
+
+@vault_app.command("set")
+def vault_set(
+    name: Annotated[str, typer.Argument(help="Env var name, e.g. ANTHROPIC_API_KEY.")],
+    config: ConfigOption = None,
+) -> None:
+    """Store a secret.
+
+    The value is never taken from the command line. An argument would be in
+    `ps` output for every user on the box while it ran, and in the shell
+    history afterwards — which is most of what this file exists to avoid. It is
+    read from the terminal without echo, or from stdin when that is a pipe:
+
+        kasa vault set ANTHROPIC_API_KEY < key.txt
+    """
+    vault = _vault(config)
+    if sys.stdin.isatty():
+        value = typer.prompt(f"Value for {name}", hide_input=True, confirmation_prompt=True)
+    else:
+        value = sys.stdin.read().strip()
+    try:
+        vault.set(name, value)
+        vault.save()
+    except KasaError as exc:
+        err.print(f"[red]error[/red]: {exc}")
+        raise typer.Exit(1) from exc
+    clear_cache()
+    err.print(f"[green]stored[/green] {name} in {vault.path}")
+    if os.environ.get(name):
+        err.print(
+            f"[yellow]![/yellow] {name} is also exported in this shell, and the "
+            "environment wins. Unset it to use the stored value."
+        )
+
+
+@vault_app.command("list")
+def vault_list(config: ConfigOption = None) -> None:
+    """Show what is stored, without showing any of it."""
+    vault = _vault(config)
+    entries = vault.entries()
+    if not entries:
+        console.print(f"[dim]{vault.path} holds nothing yet[/dim]")
+        return
+    table = Table(show_header=True)
+    for column in ("name", "fingerprint", "updated", "source"):
+        table.add_column(column, no_wrap=True)
+    for entry in entries:
+        # Which value would actually be used, since the environment overrides.
+        source = "[yellow]env (shadowed)[/yellow]" if os.environ.get(entry.name) else "vault"
+        table.add_row(entry.name, entry.fingerprint, entry.updated, source)
+    console.print(table)
+
+
+@vault_app.command("get")
+def vault_get(
+    name: str,
+    reveal: Annotated[bool, typer.Option("--reveal", help="Actually print the value.")] = False,
+    config: ConfigOption = None,
+) -> None:
+    """Print one secret's fingerprint, or with --reveal its value."""
+    vault = _vault(config)
+    value = vault.get(name)
+    if value is None:
+        err.print(f"[red]error[/red]: {name} is not in {vault.path}")
+        raise typer.Exit(1)
+    if not reveal:
+        err.print(REVEAL_REFUSED.format(name=name))
+        raise typer.Exit(1)
+    err.print(f"[yellow]![/yellow] revealing {name}; the value will remain in terminal scrollback")
+    emit(value)
+
+
+@vault_app.command("rm")
+def vault_rm(name: str, config: ConfigOption = None) -> None:
+    """Forget one secret."""
+    vault = _vault(config)
+    if not vault.remove(name):
+        err.print(f"[red]error[/red]: {name} is not in {vault.path}")
+        raise typer.Exit(1)
+    vault.save()
+    clear_cache()
+    err.print(f"[green]removed[/green] {name}")
+
+
+@vault_app.command("path")
+def vault_show_path() -> None:
+    """Print where the vault lives."""
+    emit(str(vault_path()))
 
 
 @app.command()
@@ -657,6 +772,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
     # A repo that silently became public is a serious incident, so visibility is
     # re-checked on every start rather than trusted from setup time.
     await verify_repo_visibility(cfg)
+    check_placement(vault_path(), clone_path=cfg.ltm.resolved_clone_path())
 
     # The store must be closed on every path, including a failure to build the
     # registry: aiosqlite holds a non-daemon thread per connection, so leaking
@@ -700,7 +816,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
             yield Agent(
                 registry=registry,
                 store=store,
-                tools=ToolRegistry(tools, scrub=scrub),
+                tools=ToolRegistry(tools, scrub=scrub, resolve_secret=load_vault().get),
                 packer=ContextPacker(cfg.context.to_budget(), tokenizer=tokenizer),
                 config=cfg.agent_config(),
                 retriever=retriever,

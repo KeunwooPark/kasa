@@ -9,6 +9,7 @@ from kasa.config import Config
 from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.types import ToolUseBlock
 from kasa.redact import MIN_SECRET_LENGTH, Redactor
+from kasa.vault import Vault, clear_cache, vault_path
 
 
 def test_known_secrets_are_replaced_with_their_variable_name() -> None:
@@ -23,6 +24,19 @@ def test_short_values_are_left_alone() -> None:
     redactor = Redactor({"KEY": "k"})
     assert redactor.scrub("a knapsack of knowledge") == "a knapsack of knowledge"
     assert len("k") < MIN_SECRET_LENGTH
+
+
+def test_every_vault_value_seeds_exact_redaction() -> None:
+    vault = Vault(vault_path())
+    vault.set("NOTION", "opaque-credential-with-no-known-shape")
+    vault.save()
+    clear_cache()
+
+    scrubbed = Redactor.from_config(Config()).scrub(
+        "use opaque-credential-with-no-known-shape for the request"
+    )
+    assert "opaque-credential-with-no-known-shape" not in scrubbed
+    assert "[redacted:NOTION (vault)]" in scrubbed
 
 
 @pytest.mark.parametrize(

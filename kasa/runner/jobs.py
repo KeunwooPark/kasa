@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -39,6 +38,7 @@ from kasa.runner.reflect import Notifier, Reflector
 from kasa.runner.reorganize import Librarian
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
+from kasa.vault import resolve
 
 log = logging.getLogger(__name__)
 
@@ -274,12 +274,13 @@ def _digest_sink(cfg: Config) -> Notifier | None:
     do the work that matters.
     """
     channel = cfg.reflect.digest_channel
-    token = os.environ.get(cfg.slack.bot_token_env or "")
+    token = resolve(cfg.slack.bot_token_env or "")
     if not channel:
         return None
     if not token:
         log.warning(
-            "reflect: a digest channel is configured but %s is not set; nothing will be posted",
+            "reflect: a digest channel is configured but %s is not set or in the vault; "
+            "nothing will be posted",
             cfg.slack.bot_token_env or "the Slack bot token env var",
         )
         return None

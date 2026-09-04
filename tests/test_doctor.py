@@ -16,6 +16,7 @@ from kasa.memory.gitcmd import GitRepo, run_git
 from kasa.memory.index import MemoryIndex
 from kasa.memory.manifest import Manifest
 from kasa.store import Store
+from kasa.vault import VAULT_ENV, Vault, clear_cache
 from tests.conftest import mock_client
 
 REPO = {
@@ -422,3 +423,99 @@ async def test_a_configured_slack_says_where_it_will_listen(
     )
 
     assert _slack(cfg)[0] == Check("slack", Status.OK, "socket mode; C0DEPLOY, C0GENERAL")
+
+
+# -- the vault ---------------------------------------------------------------
+
+
+def stored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **secrets: str) -> Path:
+    vault = Vault(tmp_path / "vault.json")
+    for name, value in secrets.items():
+        vault.set(name, value)
+    vault.save()
+    monkeypatch.setenv(VAULT_ENV, str(vault.path))
+    clear_cache()
+    return vault.path
+
+
+async def test_no_vault_is_skipped_rather_than_flagged(tmp_path: Path, clone: Path) -> None:
+    """Most installations have no vault. That is not a finding."""
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "vault") is Status.SKIP
+
+
+async def test_a_healthy_vault_reports_how_much_it_holds(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = stored(tmp_path, monkeypatch, SOME_TOKEN="a-stored-credential")
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert report.ok
+    assert status_of(report, "vault") is Status.OK
+    assert "1 secret(s)" in detail_of(report, "vault")
+    assert "a-stored-credential" not in detail_of(report, "vault")
+    assert str(path) in detail_of(report, "vault")
+
+
+async def test_a_readable_vault_fails_the_report(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And fails it as a check, rather than taking the whole report down."""
+    path = stored(tmp_path, monkeypatch, SOME_TOKEN="a-stored-credential")
+    path.chmod(0o644)
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert not report.ok
+    assert status_of(report, "vault") is Status.FAIL
+    assert status_of(report, "repo privacy") is Status.OK  # the rest still ran
+
+
+async def test_a_vault_inside_the_memory_repo_fails(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worst case: a credential store in a directory jobs push on a schedule."""
+    vault = Vault(clone / "vault.json")
+    vault.set("SOME_TOKEN", "a-stored-credential")
+    vault.save()
+    monkeypatch.setenv(VAULT_ENV, str(vault.path))
+    clear_cache()
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert not report.ok
+    assert status_of(report, "vault") is Status.FAIL
+    assert "inside the long-term memory repo" in detail_of(report, "vault")
+
+
+async def test_a_vault_in_a_git_work_tree_warns(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dotfiles case: a 0600 file somebody's home-directory repo would push."""
+    home = tmp_path / "home"
+    GitRepo.init(home, branch="main")
+    vault = Vault(home / "share" / "vault.json")
+    vault.set("SOME_TOKEN", "a-stored-credential")
+    vault.save()
+    monkeypatch.setenv(VAULT_ENV, str(vault.path))
+    clear_cache()
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert report.ok  # a warning, not a refusal
+    assert status_of(report, "vault location") is Status.WARN
+
+
+async def test_an_exported_variable_shadowing_the_vault_warns(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise a rotated key looks stored and quietly has no effect."""
+    stored(tmp_path, monkeypatch, TEST_KEY="the-stored-one")
+    monkeypatch.setenv("TEST_KEY", "a-different-exported-one")
+
+    report = await diagnose(config_for(tmp_path), github=github())
+
+    assert status_of(report, "vault shadowed") is Status.WARN
+    assert "TEST_KEY" in detail_of(report, "vault shadowed")
+    assert "the-stored-one" not in detail_of(report, "vault shadowed")

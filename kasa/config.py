@@ -1,9 +1,13 @@
 """Configuration loading and object construction.
 
-Secrets are never stored in the config file — only the *name* of the environment
-variable holding them. `kasa init` writes this file; with no file present a
-usable config is synthesized from the environment, so a first run needs nothing
-but an API key exported.
+Secrets are never stored in the config file — only the *name* of the
+environment variable holding them. `kasa init` writes this file; with no file
+present a usable config is synthesized from the environment, so a first run
+needs nothing but an API key exported.
+
+That name is resolved by `kasa.vault.resolve`: the environment first, then the
+local vault. So the same config file works whether the key is exported or
+stored by `kasa vault set`, and nothing here has to know which.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from kasa.llm.openai_compat import OpenAICompatProvider
 from kasa.llm.registry import ModelRole, ProviderRegistry, RetryPolicy
 from kasa.memory.salience import Decay
 from kasa.store import Store
+from kasa.vault import resolve
 
 ProviderKind = Literal["openai", "anthropic"]
 
@@ -65,10 +70,12 @@ class ProviderConfig(BaseModel):
 
     def api_key(self) -> str:
         env = self.key_env or default_key_env(self.kind)
-        key = os.environ.get(env)
+        key = resolve(env)
         if not key:
             raise ConfigError(
-                f"{env} is not set (needed for the {self.kind} provider {self.model!r})"
+                f"{env} is not set and is not in the vault "
+                f"(needed for the {self.kind} provider {self.model!r}).\n"
+                f"Export it, or run `kasa vault set {env}`."
             )
         return key
 
@@ -114,7 +121,7 @@ class LTMSettings(BaseModel):
         return Path(self.clone_path or DEFAULT_CLONE_PATH).expanduser()
 
     def token(self) -> str | None:
-        return os.environ.get(self.token_env) or None
+        return resolve(self.token_env)
 
 
 class SlackSettings(BaseModel):
@@ -572,21 +579,27 @@ def _anchor(value: str | None, base: Path) -> str | None:
 
 
 def config_from_env() -> Config:
-    """Synthesize a config from whatever API key is exported.
+    """Synthesize a config from whatever API key can be resolved.
 
-    Keeps first run to `export ANTHROPIC_API_KEY=... && kasa run`. `kasa init`
+    Keeps first run to `export ANTHROPIC_API_KEY=... && kasa run`, or to
+    `kasa vault set ANTHROPIC_API_KEY` and nothing exported at all. `kasa init`
     replaces this with a real config file.
+
+    Only the *keys* fall back to the vault. `KASA_CHAT_MODEL` and
+    `OPENAI_BASE_URL` are settings rather than secrets, so they stay
+    environment-only: the vault is for credentials, and a config knob that
+    could hide in it would be a config knob nobody can find.
 
     Returns a provider-less config rather than raising when no key is present:
     `kasa db migrate`, `kasa cost` and `kasa config` are all useful before any
     model is configured, and only `chains()` actually needs a provider.
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    if resolve("ANTHROPIC_API_KEY"):
         chat = ProviderConfig(
             kind="anthropic",
             model=os.environ.get("KASA_CHAT_MODEL") or DEFAULT_ANTHROPIC_MODEL,
         )
-    elif os.environ.get("OPENAI_API_KEY"):
+    elif resolve("OPENAI_API_KEY"):
         chat = ProviderConfig(
             kind="openai",
             model=os.environ.get("KASA_CHAT_MODEL") or DEFAULT_OPENAI_MODEL,
