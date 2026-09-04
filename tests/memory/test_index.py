@@ -488,3 +488,42 @@ async def test_a_symlink_to_a_real_file_is_still_indexed(repo: Path, store: Stor
 
     assert result.problems == []
     assert "memory/facts/link.md" in result.indexed
+
+
+# -- semantic index generations ---------------------------------------------
+
+
+async def test_embeddings_are_batched_skip_unchanged_blobs_and_version_by_model(
+    repo: Path, store: Store
+) -> None:
+    first_path = add(repo, MemoryDoc.new(type="person", title="Jane", body="Owns deploys."))
+    add(repo, MemoryDoc.new(type="person", title="Bob", body="Runs incidents."))
+    batches: list[list[str]] = []
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        batches.append(texts)
+        return [[float(len(text)), 1.0, 0.0] for text in texts]
+
+    index = MemoryIndex(store, repo, embedder=embed, embedding_model="embed-v1")
+    first = await index.reindex()
+    assert first.embedded == 4
+    assert len(batches) == 1, "all new chunks went through one batch"
+
+    batches.clear()
+    assert (await index.reindex()).embedded == 0
+    assert batches == [], "unchanged git blobs cost no embedding call"
+
+    original = MemoryDoc.parse((repo / first_path).read_text())
+    (repo / first_path).write_text(
+        MemoryDoc(frontmatter=original.frontmatter, body="\nOwns releases.\n").render()
+    )
+    assert (await index.reindex()).embedded == 2
+
+    batches.clear()
+    replaced = await MemoryIndex(store, repo, embedder=embed, embedding_model="embed-v2").reindex()
+    assert replaced.embedded == 4, "a new model builds a complete generation"
+    versions = await store.raw("SELECT model, active FROM vector_indexes ORDER BY model")
+    assert versions == [
+        {"model": "embed-v1", "active": 0},
+        {"model": "embed-v2", "active": 1},
+    ]

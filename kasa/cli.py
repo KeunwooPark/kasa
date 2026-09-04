@@ -156,7 +156,18 @@ def reindex(
             # to rebuild the manifest from would leave the index rebuilt, the
             # manifest untouched, and the command reporting failure.
             memory = await MemoryStore.open(cfg, store)
-            result = await MemoryIndex(store, cfg.ltm.resolved_clone_path()).reindex(full=full)
+            embedding = cfg.llm.get("embedding")
+            registry = cfg.build_registry(store=store) if embedding else None
+            try:
+                result = await MemoryIndex(
+                    store,
+                    cfg.ltm.resolved_clone_path(),
+                    embedder=registry.embed if registry else None,
+                    embedding_model=embedding.model if embedding else None,
+                ).reindex(full=full)
+            finally:
+                if registry is not None:
+                    await registry.aclose()
             # Both artifacts are derived from the repo, and rebuilding only the
             # SQLite half is what let them disagree about which memories exist.
             manifest = await memory.refresh_manifest()
@@ -191,6 +202,8 @@ def why(
             err.print("[red]error[/red]: no memory repo configured; run `kasa init`")
             raise typer.Exit(1)
         async with await Store.open(cfg.store.resolved()) as store:
+            embedding = cfg.llm.get("embedding")
+            registry = cfg.build_registry(store=store) if embedding else None
             retriever = Retriever(
                 store,
                 tokenizer=default_tokenizer(),
@@ -200,8 +213,14 @@ def why(
                 # into a bug report; the file itself is one `cat` away for an
                 # operator who actually needs the raw value.
                 scrub=Redactor.from_config(cfg).scrub,
+                embedder=registry.embed if registry else None,
+                embedding_model=embedding.model if embedding else None,
             )
-            retrieval = await retriever.retrieve(question, scope=scope, explain=True)
+            try:
+                retrieval = await retriever.retrieve(question, scope=scope, explain=True)
+            finally:
+                if registry is not None:
+                    await registry.aclose()
         # markup=False because a memory id arrives as `[[mem_01...]]`, and rich
         # reads square brackets as style tags — it renders the ids away entirely.
         # soft_wrap because the score table is meant to be read in columns.
@@ -651,6 +670,7 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
                 # still works, and `kasa doctor` says what is wrong.
                 err.print(f"[yellow]![/yellow] long-term memory unavailable — {exc}")
             else:
+                embedding = cfg.llm.get("embedding")
                 retriever = Retriever(
                     store,
                     tokenizer=tokenizer,
@@ -662,6 +682,8 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
                     # counting either would let a debugging session decide what
                     # stays in long-term memory.
                     record_hits=True,
+                    embedder=registry.embed if embedding else None,
+                    embedding_model=embedding.model if embedding else None,
                 )
                 tools += memory_tools(retriever=retriever, memory=memory, store=store)
 

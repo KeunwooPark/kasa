@@ -1,8 +1,8 @@
-"""Lexical retrieval: query, candidates, fusion, scope filter, pack.
+"""Hybrid retrieval: query, candidates, fusion, scope filter, pack.
 
-Hybrid retrieval arrives in #31. This is the lexical half, and it has to be
-good enough to be useful on its own, because a memory system that only works
-once embeddings are configured is a memory system that does not work.
+The lexical half remains good enough to be useful on its own, because a memory
+system that only works once embeddings are configured is a memory system that
+does not work.
 
 It has one known blind spot, and it is the ordinary one for lexical search:
 derivational morphology. Porter stemming turns "deploying" into "deploy" but
@@ -30,8 +30,10 @@ on `Retriever` and #67.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
+import struct
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -182,6 +184,7 @@ _WORD = re.compile(r"[A-Za-z0-9_'-]+")
 #: caller so the utility model stays out of this module; None means the
 #: heuristic below.
 Rewriter = Callable[[str, Sequence[str]], Awaitable[str]]
+Embedder = Callable[[list[str]], Awaitable[list[list[float]]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +203,8 @@ class Candidate:
     lexical_rank: int | None = None
     header_rank: int | None = None
     bm25: float | None = None
+    vector_rank: int | None = None
+    vector_distance: float | None = None
 
     fused: float = 0.0
     recency: float = 1.0
@@ -214,9 +219,14 @@ class Candidate:
             found.append("bm25")
         if self.header_rank is not None:
             found.append("title/tag")
+        if self.vector_rank is not None:
+            found.append("vector")
         if self.pinned:
             found.append("pinned")
         return tuple(found)
+
+
+Reranker = Callable[[str, Sequence[Candidate]], Awaitable[Sequence[str]]]
 
 
 @dataclass(slots=True)
@@ -231,6 +241,7 @@ class RetrievalTrace:
     kept: list[Candidate] = field(default_factory=list)
     budget_tokens: int = 0
     used_tokens: int = 0
+    reranked: bool = False
 
 
 @dataclass(slots=True)
@@ -320,6 +331,10 @@ class Retriever:
         scrub: Scrubber | None = None,
         record_hits: bool = False,
         now: datetime | None = None,
+        embedder: Embedder | None = None,
+        embedding_model: str | None = None,
+        reranker: Reranker | None = None,
+        rerank_threshold: int = 20,
     ) -> None:
         self._store = store
         self._tok = tokenizer
@@ -336,6 +351,10 @@ class Retriever:
         # and a debugging session decide what stays in long-term memory.
         self._record_hits = record_hits
         self._now = now
+        self._embedder = embedder
+        self._embedding_model = embedding_model
+        self._reranker = reranker
+        self._rerank_threshold = rerank_threshold
 
     async def retrieve(
         self,
@@ -383,13 +402,19 @@ class Retriever:
             budget_tokens=self._budget,
         )
 
-        candidates = await self._candidates(match, scope)
+        candidates = await self._candidates(query, match, scope)
         pinned = await self._pinned(scope) if include_pinned else []
         merged = [self._redact(c) for c in _merge(candidates + pinned)]
         for candidate in merged:
             trace.candidates.append(candidate)
 
         ranked = sorted(merged, key=lambda c: c.final, reverse=True)
+        if self._reranker is not None and len(ranked) >= self._rerank_threshold:
+            order = {
+                chunk_id: rank for rank, chunk_id in enumerate(await self._reranker(query, ranked))
+            }
+            ranked.sort(key=lambda c: (order.get(c.chunk_id, len(order)), -c.final))
+            trace.reranked = True
         trace.candidates = ranked
         if explain:
             trace.denied = await self._denied(match, scope)
@@ -428,11 +453,12 @@ class Retriever:
 
     # -- candidates ----------------------------------------------------------
 
-    async def _candidates(self, match: str, scope: str) -> list[Candidate]:
-        if not match:
-            return []
-        body = await self._match(match, scope, header_only=False)
-        header = await self._match(match, scope, header_only=True)
+    async def _candidates(self, query: str, match: str, scope: str) -> list[Candidate]:
+        lexical = self._match(match, scope, header_only=False) if match else _empty_rows()
+        headers = self._match(match, scope, header_only=True) if match else _empty_rows()
+        body, header, vector = await asyncio.gather(
+            lexical, headers, self._vector_match(query, scope)
+        )
 
         found: dict[str, Candidate] = {}
         for rank, row in enumerate(body, start=1):
@@ -441,7 +467,66 @@ class Retriever:
             )
         for rank, row in enumerate(header, start=1):
             await self._carry_header_rank(found, row, rank, scope)
+        for rank, row in enumerate(vector, start=1):
+            await self._carry_vector_rank(found, row, rank, scope)
         return [self._score(c) for c in found.values()]
+
+    async def _carry_vector_rank(
+        self, found: dict[str, Candidate], row: Row, rank: int, scope: str
+    ) -> None:
+        """Keep locator/header embeddings from displacing a memory's prose."""
+        distance = float(str(row["distance"]))
+        if int(str(row["ordinal"])) == 0:
+            bodies = [
+                c for c in found.values() if c.memory_id == str(row["memory_id"]) and c.ordinal
+            ]
+            if bodies:
+                for body in bodies:
+                    if body.vector_rank is None or rank < body.vector_rank:
+                        found[body.chunk_id] = replace(
+                            body, vector_rank=rank, vector_distance=distance
+                        )
+                return
+            lead = await self._lead_body(str(row["memory_id"]), scope)
+            if lead is not None:
+                row = lead
+        chunk_id = str(row["id"])
+        candidate = _candidate(row, vector_rank=rank, vector_distance=distance)
+        found[chunk_id] = (
+            _merge((found[chunk_id], candidate))[0] if chunk_id in found else candidate
+        )
+
+    async def _vector_match(self, query: str, scope: str) -> list[Row]:
+        if self._embedder is None or self._embedding_model is None:
+            return []
+        await self._store.enable_vectors()
+        versions = await self._store.raw(
+            "SELECT table_name, dimensions FROM vector_indexes WHERE active = 1 AND model = ?",
+            (self._embedding_model,),
+        )
+        if not versions:
+            return []
+        vectors = await self._embedder([query])
+        if len(vectors) != 1 or len(vectors[0]) != int(versions[0]["dimensions"]):
+            return []
+        table = str(versions[0]["table_name"])
+        if not re.fullmatch(r"chunks_vec_[0-9a-f]{16}", table):
+            return []
+        blob = struct.pack(f"{len(vectors[0])}f", *vectors[0])
+        scopes = ["workspace"] if scope == "workspace" else ["workspace", scope]
+        rows: list[Row] = []
+        for allowed in scopes:
+            rows.extend(
+                await self._store.raw(
+                    f"SELECT c.id, c.memory_id, c.path, c.ordinal, c.text, c.scope,"
+                    f" c.salience, c.pinned, c.updated_at, v.distance"
+                    f" FROM {table} v JOIN chunks c ON c.id = v.chunk_id"
+                    f" WHERE v.embedding MATCH ? AND k = ? AND v.scope = ?"
+                    f" ORDER BY v.distance",
+                    (blob, SOURCE_LIMIT, allowed),
+                )
+            )
+        return sorted(rows, key=lambda row: float(str(row["distance"])))[:SOURCE_LIMIT]
 
     async def _carry_header_rank(
         self, found: dict[str, Candidate], row: Row, rank: int, scope: str
@@ -537,6 +622,8 @@ class Retriever:
             # than a hit buried in prose, so that list fuses in as its own
             # ranking. It is carried by the body — see `_carry_header_rank`.
             fused += HEADER_WEIGHT / (RRF_K + candidate.header_rank)
+        if candidate.vector_rank is not None:
+            fused += 1.0 / (RRF_K + candidate.vector_rank)
         if candidate.pinned:
             fused += 1.0 / RRF_K
 
@@ -685,6 +772,8 @@ def _candidate(
     lexical_rank: int | None = None,
     header_rank: int | None = None,
     bm25: float | None = None,
+    vector_rank: int | None = None,
+    vector_distance: float | None = None,
     denied: str | None = None,
 ) -> Candidate:
     return Candidate(
@@ -700,6 +789,8 @@ def _candidate(
         lexical_rank=lexical_rank,
         header_rank=header_rank,
         bm25=bm25,
+        vector_rank=vector_rank,
+        vector_distance=vector_distance,
         denied=denied,
     )
 
@@ -726,7 +817,17 @@ def _merge(candidates: Sequence[Candidate]) -> list[Candidate]:
             existing,
             lexical_rank=existing.lexical_rank or candidate.lexical_rank,
             header_rank=existing.header_rank or candidate.header_rank,
+            vector_rank=existing.vector_rank or candidate.vector_rank,
+            vector_distance=(
+                existing.vector_distance
+                if existing.vector_distance is not None
+                else candidate.vector_distance
+            ),
             fused=max(existing.fused, candidate.fused),
             final=max(existing.final, candidate.final),
         )
     return list(merged.values())
+
+
+async def _empty_rows() -> list[Row]:
+    return []

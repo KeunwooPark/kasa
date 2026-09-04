@@ -10,6 +10,7 @@ in a public repository.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import logging
 import os
 from dataclasses import dataclass
@@ -73,7 +74,7 @@ async def diagnose(
     checks += _slack(cfg)
     checks += await _store_checks(cfg)
     checks.append(_manifest(cfg))
-    checks += _not_yet()
+    checks += _embeddings(cfg)
     return Report(tuple(checks))
 
 
@@ -351,9 +352,14 @@ def _slack(cfg: Config) -> list[Check]:
     return [Check("slack", Status.OK, f"socket mode; {where}")]
 
 
-def _not_yet() -> list[Check]:
-    """Checks whose subjects do not exist yet, listed so they are not forgotten."""
-    return [Check("embeddings", Status.SKIP, "arrives with hybrid retrieval (#31)")]
+def _embeddings(cfg: Config) -> list[Check]:
+    if "embedding" not in cfg.llm:
+        return [
+            Check("embeddings", Status.SKIP, "not configured; lexical retrieval remains active")
+        ]
+    if importlib.util.find_spec("sqlite_vec") is None:
+        return [Check("embeddings", Status.FAIL, "install the 'embeddings' extra for sqlite-vec")]
+    return [Check("embeddings", Status.OK, "sqlite-vec available; index rebuilds in background")]
 
 
 async def _lookup(cfg: Config, *, github: GitHubClient | None) -> RepoInfo | None:

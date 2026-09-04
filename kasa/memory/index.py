@@ -8,14 +8,16 @@ that reason — a rebuild that renumbered rows would be a different index wearin
 the same name.
 
 Incremental work is keyed on the git blob hash of each file. Content that has
-not changed is not re-chunked, and — once #31 lands — not re-embedded, which is
-the expensive half.
+not changed is neither re-chunked nor re-embedded, which is the expensive half.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import re
+import struct
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +29,10 @@ from kasa.memory.lease import INDEX_LEASE_NAME, INDEX_LOCK_SUFFIX, Lease
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
+
+Embedder = Callable[[list[str]], Awaitable[list[list[float]]]]
+EMBED_BATCH_SIZE = 64
+_TABLE = re.compile(r"^chunks_vec_[0-9a-f]{16}$")
 
 
 @dataclass(slots=True)
@@ -40,6 +46,7 @@ class IndexResult:
     #: twice, once uselessly (#77).
     problems: list[Problem] = field(default_factory=list)
     chunks: int = 0
+    embedded: int = 0
 
     def summary(self) -> str:
         parts = [f"{len(self.indexed)} file(s) indexed", f"{self.chunks} chunk(s)"]
@@ -49,6 +56,8 @@ class IndexResult:
             parts.append(f"{len(self.removed)} removed")
         if self.problems:
             parts.append(f"{len(self.problems)} unreadable")
+        if self.embedded:
+            parts.append(f"{self.embedded} embedded")
         return ", ".join(parts)
 
 
@@ -84,9 +93,18 @@ def blob_sha(data: bytes) -> str:
 class MemoryIndex:
     """The chunk table and its FTS mirror, derived from a memory repo."""
 
-    def __init__(self, store: Store, root: Path) -> None:
+    def __init__(
+        self,
+        store: Store,
+        root: Path,
+        *,
+        embedder: Embedder | None = None,
+        embedding_model: str | None = None,
+    ) -> None:
         self._store = store
         self._root = root.expanduser()
+        self._embedder = embedder
+        self._embedding_model = embedding_model
 
     async def reindex(self, *, full: bool = False) -> IndexResult:
         """Bring the index in step with the repo, under the index lease.
@@ -126,6 +144,7 @@ class MemoryIndex:
         result = IndexResult()
         state = await self._state()
         on_disk: set[str] = set()
+        dirty_chunks: list[Chunk] = []
 
         for path in sorted((self._root / MEMORY_DIR).rglob("*.md")):
             relative = path.relative_to(self._root).as_posix()
@@ -157,12 +176,16 @@ class MemoryIndex:
 
             chunks = chunk_document(doc, relative)
             await self._replace(relative, chunks, sha)
+            dirty_chunks.extend(chunks)
             result.indexed.append(relative)
             result.chunks += len(chunks)
 
         for gone in sorted(set(state) - on_disk):
             await self._forget(gone)
             result.removed.append(gone)
+
+        if self._embedder is not None and self._embedding_model is not None:
+            result.embedded = await self._update_vectors(dirty_chunks, full=full)
 
         log.info("reindex: %s", result.summary())
         return result
@@ -257,3 +280,86 @@ class MemoryIndex:
     async def _forget(self, path: str) -> None:
         await self._store.write("DELETE FROM chunks WHERE path = ?", (path,))
         await self._store.write("DELETE FROM index_state WHERE path = ?", (path,))
+
+    async def _update_vectors(self, dirty: list[Chunk], *, full: bool) -> int:
+        await self._store.enable_vectors()
+        current = await self._store.raw("SELECT * FROM vector_indexes WHERE active = 1")
+        active = current[0] if current else None
+        rebuild = full or active is None or active["model"] != self._embedding_model
+        if rebuild:
+            rows = await self._store.raw("SELECT id, text, scope FROM chunks ORDER BY id")
+        else:
+            assert active is not None
+            dirty_ids = {chunk.id for chunk in dirty}
+            rows = [{"id": chunk.id, "text": chunk.text, "scope": chunk.scope} for chunk in dirty]
+            table = _safe_table(str(active["table_name"]))
+            for chunk_id in sorted(dirty_ids):
+                await self._store.write(f"DELETE FROM {table} WHERE chunk_id = ?", (chunk_id,))
+            live = {str(row["id"]) for row in await self._store.raw("SELECT id FROM chunks")}
+            vector_ids = {
+                str(row["chunk_id"])
+                for row in await self._store.raw(f"SELECT chunk_id FROM {table}")
+            }
+            for stale in sorted(vector_ids - live):
+                await self._store.write(f"DELETE FROM {table} WHERE chunk_id = ?", (stale,))
+        if not rows:
+            return 0
+
+        embedded: list[tuple[dict[str, object], list[float]]] = []
+        assert self._embedder is not None
+        for start in range(0, len(rows), EMBED_BATCH_SIZE):
+            batch = rows[start : start + EMBED_BATCH_SIZE]
+            vectors = await self._embedder([str(row["text"]) for row in batch])
+            if len(vectors) != len(batch):
+                raise ValueError(f"asked for {len(batch)} embeddings, got {len(vectors)}")
+            embedded.extend(zip(batch, vectors, strict=True))
+        dimensions = len(embedded[0][1])
+        if not dimensions or any(len(vector) != dimensions for _, vector in embedded):
+            raise ValueError("embedding provider returned inconsistent dimensions")
+
+        if rebuild:
+            version = hashlib.sha256(f"{self._embedding_model}\0{dimensions}".encode()).hexdigest()[
+                :16
+            ]
+            table = f"chunks_vec_{version}"
+            await self._store.write(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0("
+                f"chunk_id TEXT PRIMARY KEY, scope TEXT, embedding float[{dimensions}])"
+            )
+            await self._store.write(f"DELETE FROM {table}")
+        else:
+            assert active is not None
+            table = _safe_table(str(active["table_name"]))
+            if dimensions != int(active["dimensions"]):
+                raise ValueError("embedding dimensions changed without a model version change")
+
+        await self._store.write_many(
+            f"INSERT INTO {table} (chunk_id, scope, embedding) VALUES (?, ?, ?)",
+            [(str(row["id"]), str(row["scope"]), _serialize(vector)) for row, vector in embedded],
+        )
+        if rebuild:
+            await self._store.write("UPDATE vector_indexes SET active = 0 WHERE active = 1")
+            await self._store.write(
+                "INSERT INTO vector_indexes"
+                " (version, model, dimensions, table_name, active, built_at)"
+                " VALUES (?, ?, ?, ?, 1, ?)"
+                " ON CONFLICT(version) DO UPDATE SET active = 1, built_at = excluded.built_at",
+                (
+                    table.removeprefix("chunks_vec_"),
+                    self._embedding_model,
+                    dimensions,
+                    table,
+                    datetime.now(UTC).isoformat(timespec="seconds"),
+                ),
+            )
+        return len(embedded)
+
+
+def _serialize(vector: list[float]) -> bytes:
+    return struct.pack(f"{len(vector)}f", *vector)
+
+
+def _safe_table(table: str) -> str:
+    if not _TABLE.fullmatch(table):
+        raise ValueError("invalid vector table name")
+    return table
