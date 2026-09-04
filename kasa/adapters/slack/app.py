@@ -16,15 +16,18 @@ from typing import Any, Self
 
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
 from kasa.adapters.slack.events import Ignored, SlackContext, normalize
 from kasa.adapters.slack.identity import Directory
+from kasa.adapters.slack.stream import DEFAULT_INTERVAL, LiveMessage, SlackRateLimited
 from kasa.config import SlackSettings
 from kasa.core.agent import Agent, AgentResult
 from kasa.core.events import InboundEvent
-from kasa.core.runtime import DEFAULT_CONCURRENCY, Runtime
+from kasa.core.runtime import DEFAULT_CONCURRENCY, Reply, Runtime, one_message
 from kasa.errors import ConfigError
+from kasa.llm.types import Delta
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +35,13 @@ log = logging.getLogger(__name__)
 #: and no secret to verify it with. Saying so is clearer than leaving bolt to
 #: warn about a secret that does not apply here.
 NO_HTTP_VERIFICATION = "unused-in-socket-mode"
+
+#: How many unfinished live messages are remembered, so a redelivered event
+#: rewrites the message its last attempt posted instead of adding another
+#: "thinking…" to the thread. Only turns that failed outright stay here — a
+#: finished one is forgotten — and the inbox dead-letters after five attempts,
+#: so this is a cap on a leak rather than a working set.
+MAX_UNFINISHED = 256
 
 
 class SlackAdapter:
@@ -45,13 +55,20 @@ class SlackAdapter:
         context: SlackContext,
         app_token: str,
         concurrency: int = DEFAULT_CONCURRENCY,
+        stream: bool = True,
+        interval: float = DEFAULT_INTERVAL,
     ) -> None:
         self._app = app
         self._context = context
         self._app_token = app_token
+        self._interval = interval
+        self._unfinished: dict[str, str] = {}
         self.directory = Directory(agent.store, self._users_info, team_id=context.team_id)
         self.runtime = Runtime(
-            agent, self.reply, concurrency=concurrency, prepare=self.directory.hydrate
+            agent,
+            self.open_reply if stream else one_message(self.reply),
+            concurrency=concurrency,
+            prepare=self.directory.hydrate,
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._register()
@@ -82,6 +99,7 @@ class SlackAdapter:
             ),
             app_token=_token(settings.app_token_env, "app"),
             concurrency=concurrency,
+            stream=settings.stream,
         )
 
     @property
@@ -147,17 +165,53 @@ class SlackAdapter:
 
     # -- egress --------------------------------------------------------------
 
+    async def open_reply(self, event: InboundEvent) -> Reply:
+        """Put a message up now, and rewrite it as the turn produces an answer.
+
+        In the thread the question was asked in, always. A turn that takes
+        thirty seconds and says nothing for twenty-nine of them is
+        indistinguishable from one that broke, and somebody who thinks Kasa
+        broke asks again — which is a second turn, a second model call, and two
+        answers to one question.
+        """
+        if not event.channel:
+            return _Posted(self, event)
+        message = LiveMessage(
+            _ClientPoster(self.client),
+            channel=event.channel,
+            thread_ts=event.reply_to,
+            interval=self._interval,
+            ts=self._unfinished.get(event.external_id),
+        )
+        await message.open()
+        if message.ts is not None:
+            self._remember(event.external_id, message.ts)
+        return _Live(self, event, message)
+
     async def reply(self, event: InboundEvent, result: AgentResult) -> None:
-        """Post the answer, in the thread the question was asked in."""
-        text = result.text.strip()
-        if note := result.note:
-            text = f"{text}\n\n_{note}_" if text else f"_{note}_"
+        """Post the answer as one message, having shown nothing before it.
+
+        What a build with `stream: false` uses, and where a live reply lands
+        when its placeholder never went up.
+        """
+        text = answer(result)
         if not text or not event.channel:
             log.warning("nothing to post for %s", event.external_id)
             return
         await self.client.chat_postMessage(
             channel=event.channel, thread_ts=event.reply_to, text=text
         )
+
+    def _remember(self, external_id: str, ts: str) -> None:
+        self._unfinished[external_id] = ts
+        while len(self._unfinished) > MAX_UNFINISHED:
+            # Oldest first, which for a dict is insertion order. Losing one
+            # costs a duplicate placeholder on a redelivery that was already
+            # four attempts deep.
+            self._unfinished.pop(next(iter(self._unfinished)))
+
+    def _forget(self, external_id: str) -> None:
+        self._unfinished.pop(external_id, None)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -187,6 +241,104 @@ class SlackAdapter:
         # about is decided by whichever arrived first.
         for name in ("app_mention", "message"):
             self._app.event(name)(listener)
+
+
+def answer(result: AgentResult) -> str:
+    """The finished message: what the model said, and why if it stopped early.
+
+    One function because both egress paths render it, and a live reply that
+    formatted the answer differently from the plain one would make "did the
+    placeholder go up?" visible to the person reading the thread.
+    """
+    text = result.text.strip()
+    if note := result.note:
+        return f"{text}\n\n_{note}_" if text else f"_{note}_"
+    return text
+
+
+class _Live:
+    """A turn whose answer is a message already in the thread."""
+
+    def __init__(self, adapter: SlackAdapter, event: InboundEvent, message: LiveMessage) -> None:
+        self._adapter = adapter
+        self._event = event
+        self._message = message
+
+    async def delta(self, delta: Delta) -> None:
+        await self._message.delta(delta)
+
+    async def finish(self, result: AgentResult) -> None:
+        await self._message.finish(answer(result))
+        # Only now: until the answer is in the thread, a redelivery of this
+        # event should rewrite this message rather than post another.
+        self._adapter._forget(self._event.external_id)
+
+    async def aclose(self) -> None:
+        await self._message.aclose()
+
+
+class _Posted:
+    """A turn with nowhere to put a placeholder. Answers the old way."""
+
+    def __init__(self, adapter: SlackAdapter, event: InboundEvent) -> None:
+        self._adapter = adapter
+        self._event = event
+
+    async def delta(self, delta: Delta) -> None:
+        pass
+
+    async def finish(self, result: AgentResult) -> None:
+        await self._adapter.reply(self._event, result)
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _ClientPoster:
+    """`Poster`, over the Slack web client.
+
+    The translation lives here rather than in `stream.py` for the reason the
+    directory's lookup does: what streaming needs is two writes and a way to
+    hear "not so fast", and keeping `slack_sdk` on this side is what lets the
+    throttling be tested without it.
+    """
+
+    def __init__(self, client: AsyncWebClient) -> None:
+        self._client = client
+
+    async def post(self, *, channel: str, thread_ts: str | None, text: str) -> str:
+        try:
+            response = await self._client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=text
+            )
+        except SlackApiError as exc:
+            raise _translate(exc) from exc
+        return str(response["ts"])
+
+    async def update(self, *, channel: str, ts: str, text: str) -> None:
+        try:
+            await self._client.chat_update(channel=channel, ts=ts, text=text)
+        except SlackApiError as exc:
+            raise _translate(exc) from exc
+
+
+def _translate(exc: SlackApiError) -> Exception:
+    """Slack's "too fast", told from Slack's "no".
+
+    Only a 429 becomes `SlackRateLimited`, because it is the only one where
+    waiting is the answer. Everything else is passed along as it was: a
+    live frame swallows it and the final write fails the turn, which is the
+    right split for `channel_not_found` or a revoked token.
+    """
+    response = getattr(exc, "response", None)
+    if response is None or getattr(response, "status_code", None) != 429:
+        return exc
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        retry_after = float(headers.get("Retry-After", 1))
+    except (TypeError, ValueError):
+        retry_after = 1.0
+    return SlackRateLimited(retry_after)
 
 
 def _token(env: str | None, kind: str) -> str:

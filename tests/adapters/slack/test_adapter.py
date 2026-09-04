@@ -34,24 +34,56 @@ HUMAN = "U0HUMAN"
 
 
 class RecordingClient(AsyncWebClient):
-    """A Slack client that keeps what it was asked to post instead of posting."""
+    """A Slack client that keeps what it was asked to post instead of posting.
+
+    It has to model a *thread* rather than a list of calls, because a reply is
+    now one message written several times (#22): the assertion worth making is
+    what the thread says when the turn is over, and how many messages it took
+    to say it.
+    """
 
     def __init__(self) -> None:
         super().__init__(token="xoxb-test")
         self.posted: list[dict[str, Any]] = []
+        self.updates: list[dict[str, Any]] = []
         self.profiles: dict[str, dict[str, Any]] = {
             HUMAN: {"name": "jane", "profile": {"display_name": "jane"}}
         }
+        self._ts = 0
 
     async def chat_postMessage(self, **kwargs: Any) -> Any:
-        self.posted.append(kwargs)
-        return {"ok": True}
+        self._ts += 1
+        ts = f"1700009999.{self._ts:06d}"
+        self.posted.append(kwargs | {"ts": ts})
+        return {"ok": True, "ts": ts}
+
+    async def chat_update(self, **kwargs: Any) -> Any:
+        self.updates.append(kwargs)
+        return {"ok": True, "ts": kwargs["ts"]}
 
     async def users_info(self, *, user: str, **kwargs: Any) -> Any:
         # Answered rather than left to the real client: every delivered event
         # resolves its author now (#23), and a test suite that reached
         # slack.com to find that out would be a test suite that needs a network.
         return {"ok": True, "user": self.profiles.get(user, {})}
+
+    @property
+    def messages(self) -> list[str]:
+        """What each message in the thread says now, in the order posted."""
+        latest = {post["ts"]: post["text"] for post in self.posted}
+        for update in self.updates:
+            latest[update["ts"]] = update["text"]
+        return [latest[post["ts"]] for post in self.posted]
+
+
+async def answered(client: RecordingClient, count: int = 1) -> None:
+    """Wait for `count` turns to have delivered an answer.
+
+    The final `chat.update` is the one that carries it. Waiting on the *post*
+    would be waiting on the placeholder, which goes up before the model is
+    called and therefore before anything a test wants to assert on exists.
+    """
+    await until(lambda: len(client.updates) >= count)
 
 
 class SlowProvider(ScriptedProvider):
@@ -82,6 +114,7 @@ def make_adapter(
     *,
     provider: ScriptedProvider | None = None,
     concurrency: int = 8,
+    stream: bool = True,
 ) -> tuple[SlackAdapter, RecordingClient]:
     client = RecordingClient()
     app = AsyncApp(
@@ -95,6 +128,7 @@ def make_adapter(
         context=SlackContext(bot_user_id=BOT, team_id=TEAM),
         app_token="xapp-test",
         concurrency=concurrency,
+        stream=stream,
     )
     return adapter, client
 
@@ -162,7 +196,7 @@ async def test_a_forced_retry_produces_exactly_one_reply(
     try:
         for delivery in (body, body, as_mention, body):
             await adapter.on_event(delivery)
-        await until(lambda: len(client.posted) >= 1)
+        await answered(client)
         await asyncio.sleep(0.2)  # a second answer would land in this window
     finally:
         adapter.runtime.stop()
@@ -190,7 +224,7 @@ async def test_a_file_entry_that_is_not_an_object_still_reaches_the_inbox(
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(body)
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
@@ -243,7 +277,7 @@ async def test_ingress_still_works_after_an_event_it_could_not_read(
     try:
         await adapter.on_event(mention(ts="1700000000.000100"))
         await adapter.on_event(mention(ts="1700000000.000200"))
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
@@ -259,16 +293,14 @@ async def test_the_answer_goes_back_into_the_thread(store: Store, tokenizer: Tok
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(mention())
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
 
-    assert client.posted[0] == {
-        "channel": "C0DEPLOY",
-        "thread_ts": "1700000000.000100",
-        "text": "noted",
-    }
+    assert client.posted[0]["channel"] == "C0DEPLOY"
+    assert client.posted[0]["thread_ts"] == "1700000000.000100"
+    assert client.messages == ["noted"], "one message in the thread, and it is the answer"
 
 
 async def test_a_turn_with_nothing_to_say_says_why(store: Store, tokenizer: Tokenizer) -> None:
@@ -277,12 +309,12 @@ async def test_a_turn_with_nothing_to_say_says_why(store: Store, tokenizer: Toke
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(mention())
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
 
-    assert client.posted[0]["text"] == "_the model returned nothing._"
+    assert client.messages == ["_the model returned nothing._"]
 
 
 async def test_a_turn_is_scoped_to_the_channel_it_came_from(
@@ -294,7 +326,7 @@ async def test_a_turn_is_scoped_to_the_channel_it_came_from(
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(mention())
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
@@ -318,7 +350,7 @@ async def test_a_dm_is_scoped_to_the_person_in_it(store: Store, tokenizer: Token
                 "ts": "1700000000.000100",
             }
         )
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
@@ -326,6 +358,82 @@ async def test_a_dm_is_scoped_to_the_person_in_it(store: Store, tokenizer: Token
     session = await store.get_session(f"slack:{TEAM}:D0PRIVATE:1700000000.000100")
     assert session is not None
     assert session["scope"] == f"private:{HUMAN}"
+
+
+# -- streaming ----------------------------------------------------------------
+
+
+async def test_the_thread_shows_a_reply_before_the_turn_is_over(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """The point of #22. A turn that says nothing for thirty seconds is
+    indistinguishable from one that broke, and somebody who thinks Kasa broke
+    asks again — a second turn, a second model call, two answers."""
+    provider = SlowProvider([says("noted")] * 4, delay=0.3)
+    adapter, client = make_adapter(store, tokenizer, provider=provider)
+
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention())
+        await until(lambda: len(client.posted) == 1)
+        assert client.messages == ["_thinking…_"], "up before the model answered"
+        await answered(client)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+    assert client.messages == ["noted"], "and the same message carries the answer"
+
+
+async def test_streaming_off_posts_the_answer_and_nothing_else(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """One API call a turn, for a workspace that would rather not watch a
+    message rewrite itself."""
+    adapter, client = make_adapter(store, tokenizer, stream=False)
+
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention())
+        await until(lambda: len(client.posted) == 1)
+        await asyncio.sleep(0.1)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+    assert client.messages == ["noted"]
+    assert client.updates == []
+
+
+async def test_a_retried_turn_rewrites_its_own_placeholder(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """Delivery is at-least-once, so a turn that fails is run again. A fresh
+    placeholder per attempt would leave the thread full of "thinking…"."""
+    provider = ScriptedProvider([says("noted")] * 4)
+    adapter, client = make_adapter(store, tokenizer, provider=provider)
+    attempts = 0
+
+    # Failing the *final* write is the case that matters: the placeholder is
+    # already up, and the event goes back on the queue with it still there.
+    async def finish_or_fail(**kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("slack went away mid-answer")
+        return await RecordingClient.chat_update(client, **kwargs)
+
+    client.chat_update = finish_or_fail  # type: ignore[method-assign]
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention())
+        await until(lambda: attempts >= 2)
+        await until(lambda: client.messages == ["noted"])
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=30.0)
+
+    assert len(client.posted) == 1, client.posted
 
 
 # -- identity -----------------------------------------------------------------
@@ -344,7 +452,7 @@ async def test_the_model_is_shown_names_rather_than_user_ids(
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(mention(text=f"<@{BOT}> did <@U0RAJ> ship it?"))
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)
@@ -364,7 +472,7 @@ async def test_everybody_a_message_saw_is_recorded_for_mapping(
     running = asyncio.create_task(adapter.runtime.run())
     try:
         await adapter.on_event(mention(text=f"<@{BOT}> ask <@U0RAJ>"))
-        await until(lambda: len(client.posted) == 1)
+        await answered(client)
     finally:
         adapter.runtime.stop()
         await asyncio.wait_for(running, timeout=10.0)

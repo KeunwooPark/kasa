@@ -795,6 +795,7 @@ key_env    = "OPENAI_API_KEY"
 app_token_env = "SLACK_APP_TOKEN"     # xapp-, Socket Mode
 bot_token_env = "SLACK_BOT_TOKEN"     # xoxb-
 allowed_channels = ["C0123ABCD"]
+stream = true                         # rewrite one message; false posts once
 
 [memory]
 episode_idle_minutes = 20

@@ -67,6 +67,11 @@ Kasa answers when it is mentioned in a channel it has been invited to, in any
 thread it is already part of, and in a DM. Everything else it hears, it ignores.
 Set `slack.allowed_channels` to narrow that further.
 
+The reply goes up as a placeholder and is rewritten about once a second until
+the answer is complete — never per token, which flickers and would spend the
+turn being rate limited. Under rate-limit pressure it drops the intermediate
+frames and keeps the answer. Set `slack.stream = false` for one message a turn.
+
 `kasa init` walks through the private GitHub repo that holds long-term memory —
 creating it if it does not exist — clones it, lays out the memory skeleton, and
 writes `~/.config/kasa/config.toml`. It refuses to configure a public repo, and
