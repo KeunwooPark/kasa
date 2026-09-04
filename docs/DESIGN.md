@@ -361,9 +361,10 @@ few weeks of running it. Recommended default: supervised **on** for `forget`,
 
 ### 5.2 Auth
 
-Fine-grained PAT scoped to the single LTM repo with `contents: write`, stored in
-the OS keyring or referenced by env var. A GitHub App installation token is the
-right answer only if Kasa ever becomes multi-tenant.
+Fine-grained PAT scoped to the single LTM repo with `contents: write`, supplied
+by an environment variable or Kasa's local vault. Environment values override
+the vault. A GitHub App installation token is the right answer only if Kasa
+ever becomes multi-tenant.
 
 ---
 
@@ -643,9 +644,17 @@ confirmed private *and* the channel is opted in.
 
 ### 11.2 Secrets
 
-`~/.config/kasa/config.toml` holds no secrets inline — only env var names or OS
-keyring references. The GitHub token is scoped to a single repo. Secret material
-is scrubbed from logs and from anything that reaches an LLM prompt.
+`~/.config/kasa/config.toml` holds no secrets inline — only names. Secret values
+may be exported or stored in the plaintext local vault at
+`~/.local/share/kasa/vault.json` (`0600`, in a `0700` directory). The vault
+protects against accidental commits, sync, and other local users; it does not
+protect against root or code already running as the same user. It refuses to
+load from inside the LTM clone. The GitHub token is scoped to a single repo.
+
+Vault values seed exact-match redaction and are never rendered into a model
+prompt. A model can emit `{{vault:name}}`; only the tool dispatcher substitutes
+the value immediately before invoking the tool. Secret material is scrubbed
+from logs, tool results, recalled memory, and anything that reaches an LLM.
 
 ### 11.3 Repo privacy
 

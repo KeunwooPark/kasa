@@ -12,7 +12,6 @@ that already has memories in it.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +39,7 @@ from kasa.github import GitHubClient, RepoInfo, is_full_name
 from kasa.memory.bootstrap import bootstrap, is_bootstrapped, refresh_schema
 from kasa.memory.gitcmd import GitRepo, git_available
 from kasa.memory.layout import SCHEMA_PATH
+from kasa.vault import resolve
 
 _OPTIONAL_ROLES = {
     "utility": "summaries and consolidation; falls back to the chat model",
@@ -191,7 +191,7 @@ async def _resolve_on_github(
         )
         return None
 
-    token = os.environ.get(settings.token_env)
+    token = resolve(settings.token_env)
     if not token and github is None:
         raise ConfigError(NO_TOKEN.format(env=settings.token_env, name=spec))
 
@@ -353,8 +353,11 @@ async def _configure_role(
         if models
         else prompter.ask(f"Model for {role}", default=default_model)
     ).strip()
-    if not os.environ.get(key_env):
-        prompter.warn(f"{key_env} is not set in this shell. Export it before `kasa run`.")
+    if not resolve(key_env):
+        prompter.warn(
+            f"{key_env} is not set and is not in the vault. Export it or run "
+            f"`kasa vault set {key_env}` before `kasa run`."
+        )
 
     return ProviderConfig(
         kind=provider_kind,
@@ -374,7 +377,7 @@ def _preset_for(current: ProviderConfig) -> str:
 
 
 async def discover_models(kind: ProviderKind, base_url: str | None, key_env: str) -> list[str]:
-    key = os.environ.get(key_env)
+    key = resolve(key_env)
     if not key:
         return []
     root = base_url or (

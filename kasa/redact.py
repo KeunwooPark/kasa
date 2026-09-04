@@ -2,10 +2,12 @@
 
 Two sources feed this. The first is exact: Kasa knows the names of the
 environment variables holding its own credentials, so it knows their values and
-can match them literally. The second is shape-based, for tokens Kasa was never
-told about — a key pasted into a chat message, or one echoed back inside a tool
-result — matched by the prefixes the major providers issue and by the header a
-private key carries.
+can match them literally. The vault is part of that first source — every secret
+in it is matched exactly, whether or not any config file refers to it, which is
+what makes the vault a containment boundary rather than a filing cabinet. The
+second is shape-based, for tokens Kasa was never told about — a key pasted into
+a chat message, or one echoed back inside a tool result — matched by the
+prefixes the major providers issue and by the header a private key carries.
 
 Neither is a guarantee, and this is not a substitute for not putting secrets
 somewhere. It is the net under the times somebody does.
@@ -23,6 +25,8 @@ import os
 import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
+
+from kasa.vault import load_vault
 
 if TYPE_CHECKING:
     from kasa.config import Config
@@ -85,8 +89,8 @@ class Redactor:
 
     @classmethod
     def from_config(cls, cfg: Config) -> Redactor:
-        """Read the values of every env var the config references."""
-        return cls(_environ_values(_referenced_env_names(cfg)))
+        """Every env var the config references, plus every secret in the vault."""
+        return cls(_environ_values(_referenced_env_names(cfg)) | _vault_values())
 
     def scrub(self, text: str) -> str:
         if not text:
@@ -146,3 +150,15 @@ def _referenced_env_names(cfg: Config) -> set[str]:
 
 def _environ_values(names: Iterable[str]) -> dict[str, str]:
     return {name: value for name in names if (value := os.environ.get(name))}
+
+
+def _vault_values() -> dict[str, str]:
+    """Every secret in the vault, labelled so a redaction says where it came from.
+
+    Suffixed rather than keyed on the bare name because the environment and the
+    vault can disagree: an exported `ANTHROPIC_API_KEY` overrides a stored one
+    (`kasa.vault.resolve`), but the overridden value is still a live credential
+    on this machine, and a merge keyed on the name alone would silently drop
+    one of the two from the redactor.
+    """
+    return {f"{name} (vault)": value for name, value in load_vault().values().items()}

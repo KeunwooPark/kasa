@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -10,6 +10,23 @@ import pytest
 
 from kasa.llm.tokens import HeuristicTokenizer, Tokenizer
 from kasa.store import Store
+from kasa.vault import VAULT_ENV, clear_cache
+
+
+@pytest.fixture(autouse=True)
+def isolated_vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point every test at an empty vault under `tmp_path`.
+
+    Autouse and not optional. Without it the default path is the real
+    `user_data_dir`, so a developer who has run `kasa vault set` would have
+    their own credentials resolved inside the suite — which would make tests
+    pass on their machine and fail in CI, and is a live secret in a test
+    process either way.
+    """
+    monkeypatch.setenv(VAULT_ENV, str(tmp_path / "vault" / "vault.json"))
+    clear_cache()
+    yield
+    clear_cache()
 
 
 @pytest.fixture

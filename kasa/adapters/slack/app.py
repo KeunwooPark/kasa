@@ -10,7 +10,6 @@ behind the queue, where taking a minute costs nothing.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Self
@@ -40,6 +39,7 @@ from kasa.core.revise import Reviser
 from kasa.core.runtime import DEFAULT_CONCURRENCY, Reply, Runtime, one_message
 from kasa.errors import ConfigError
 from kasa.llm.types import Delta
+from kasa.vault import resolve
 
 log = logging.getLogger(__name__)
 
@@ -458,7 +458,10 @@ def _translate(exc: SlackApiError) -> Exception:
 def _token(env: str | None, kind: str) -> str:
     if not env:
         raise ConfigError(f"no {kind} token configured for Slack; run `kasa init`")
-    value = os.environ.get(env)
+    value = resolve(env)
     if not value:
-        raise ConfigError(f"{env} is not set (the Slack {kind} token)")
+        raise ConfigError(
+            f"{env} is not set and is not in the vault (the Slack {kind} token).\n"
+            f"Export it, or run `kasa vault set {env}`."
+        )
     return value

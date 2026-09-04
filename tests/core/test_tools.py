@@ -124,3 +124,33 @@ async def test_builtin_current_time() -> None:
     result = await reg.dispatch(ToolUseBlock(id="t1", name="current_time", input={}))
     assert not result.is_error
     assert result.content.endswith("+00:00")
+
+
+async def test_vault_references_are_substituted_only_for_the_handler() -> None:
+    seen: dict[str, Any] = {}
+
+    async def capture(args: dict[str, Any], context: ToolContext) -> str:
+        seen.update(args)
+        return f"used {args['city']}"
+
+    reg = ToolRegistry(
+        [Tool(name="capture", description="d", input_schema=SCHEMA, handler=capture)],
+        scrub=lambda text: text.replace("tool-only-secret", "[redacted]"),
+        resolve_secret=lambda name: "tool-only-secret" if name == "notion" else None,
+    )
+    use_block = use("capture", city="Bearer {{vault:notion}}")
+    result = await reg.dispatch(use_block)
+
+    assert use_block.input["city"] == "Bearer {{vault:notion}}", "the transcript keeps the ref"
+    assert seen["city"] == "Bearer tool-only-secret"
+    assert "tool-only-secret" not in result.content
+
+
+async def test_missing_vault_reference_is_a_tool_error() -> None:
+    reg = ToolRegistry(
+        [Tool(name="weather", description="d", input_schema=SCHEMA, handler=echo)],
+        resolve_secret=lambda name: None,
+    )
+    result = await reg.dispatch(use("weather", city="{{vault:missing}}"))
+    assert result.is_error
+    assert "does not exist" in result.content

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[str]]
 #: is the one part of a prompt Kasa does not write itself, so it is the one part
 #: that can carry a credential back to a provider.
 Scrubber = Callable[[str], str]
+SecretResolver = Callable[[str], str | None]
 
 #: A handler that hangs would hang the turn, and the user is waiting.
 DEFAULT_TOOL_TIMEOUT = 30.0
@@ -66,9 +68,16 @@ class Tool:
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[Tool] | None = None, *, scrub: Scrubber | None = None) -> None:
+    def __init__(
+        self,
+        tools: list[Tool] | None = None,
+        *,
+        scrub: Scrubber | None = None,
+        resolve_secret: SecretResolver | None = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
         self._scrub: Scrubber = scrub or (lambda text: text)
+        self._resolve_secret = resolve_secret
         for tool in tools or []:
             self.register(tool)
 
@@ -104,7 +113,8 @@ class ToolRegistry:
 
         try:
             async with asyncio.timeout(tool.timeout):
-                result = await tool.handler(use.input, context or ToolContext())
+                arguments = _substitute_vault_refs(use.input, self._resolve_secret)
+                result = await tool.handler(arguments, context or ToolContext())
         except TimeoutError:
             return self._error(use, f"tool timed out after {tool.timeout:g}s")
         except asyncio.CancelledError:
@@ -120,6 +130,30 @@ class ToolRegistry:
 
     def _error(self, use: ToolUseBlock, message: str) -> ToolResultBlock:
         return ToolResultBlock(tool_use_id=use.id, content=self._scrub(message), is_error=True)
+
+
+_VAULT_REF = re.compile(r"\{\{vault:([A-Za-z0-9_.-]+)\}\}")
+
+
+def _substitute_vault_refs(value: Any, resolver: SecretResolver | None) -> Any:
+    """Resolve vault references only at the last boundary before a tool call."""
+    if resolver is None:
+        return value
+    if isinstance(value, dict):
+        return {key: _substitute_vault_refs(item, resolver) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_substitute_vault_refs(item, resolver) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        secret = resolver(name)
+        if secret is None:
+            raise ValueError(f"vault secret {name!r} does not exist")
+        return secret
+
+    return _VAULT_REF.sub(replace, value)
 
 
 # -- built-ins ---------------------------------------------------------------
