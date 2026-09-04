@@ -329,13 +329,39 @@ async def test_a_plain_git_url_skips_github_but_warns(tmp_path: Path, remote: st
 async def test_optional_roles_can_be_declined(tmp_path: Path, remote: str) -> None:
     prompter = ScriptedPrompter(
         {"memory repo": "someone/kasa-memory", "clone path": str(tmp_path / "ltm")},
-        confirms={"utility model": False, "embedding model": False, "Slack": False},
+        confirms={"different models": False, "Slack": False},
     )
     _, config, _ = await do_init(tmp_path, remote, prompter=prompter)
 
     cfg = load_config(config)
     assert set(cfg.llm) == {"chat"}
     assert not cfg.slack.configured
+    assert not any("utility" in question for question in prompter.chosen)
+    assert not any("embedding" in question for question in prompter.chosen)
+
+
+async def test_existing_extra_roles_make_the_advanced_gate_default_to_yes(
+    tmp_path: Path, remote: str
+) -> None:
+    config = tmp_path / "config.toml"
+    clone = tmp_path / "ltm"
+    config.write_text(
+        f'[ltm]\nrepo = "someone/kasa-memory"\nclone_path = "{clone}"\n\n'
+        '[llm.chat]\nkind = "anthropic"\nmodel = "chat"\n\n'
+        '[llm.utility]\nkind = "openai"\nmodel = "utility"\n\n'
+        '[llm.embedding]\nkind = "openai"\nmodel = "embedding"\n'
+    )
+    prompter = ScriptedPrompter(
+        {"memory repo": "someone/kasa-memory", "clone path": str(clone)},
+        confirms={"Slack": False},
+    )
+    client = fake_github(clone_url=remote)
+    try:
+        await run_init(prompter, path=config, github=client)
+    finally:
+        await client.aclose()
+
+    assert set(load_config(config).llm) == {"chat", "utility", "embedding"}
 
 
 async def test_slack_tokens_are_recorded_by_name(tmp_path: Path, remote: str) -> None:
