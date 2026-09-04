@@ -39,10 +39,19 @@ class RecordingClient(AsyncWebClient):
     def __init__(self) -> None:
         super().__init__(token="xoxb-test")
         self.posted: list[dict[str, Any]] = []
+        self.profiles: dict[str, dict[str, Any]] = {
+            HUMAN: {"name": "jane", "profile": {"display_name": "jane"}}
+        }
 
     async def chat_postMessage(self, **kwargs: Any) -> Any:
         self.posted.append(kwargs)
         return {"ok": True}
+
+    async def users_info(self, *, user: str, **kwargs: Any) -> Any:
+        # Answered rather than left to the real client: every delivered event
+        # resolves its author now (#23), and a test suite that reached
+        # slack.com to find that out would be a test suite that needs a network.
+        return {"ok": True, "user": self.profiles.get(user, {})}
 
 
 class SlowProvider(ScriptedProvider):
@@ -317,6 +326,52 @@ async def test_a_dm_is_scoped_to_the_person_in_it(store: Store, tokenizer: Token
     session = await store.get_session(f"slack:{TEAM}:D0PRIVATE:1700000000.000100")
     assert session is not None
     assert session["scope"] == f"private:{HUMAN}"
+
+
+# -- identity -----------------------------------------------------------------
+
+
+async def test_the_model_is_shown_names_rather_than_user_ids(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """The end-to-end half of #23: the resolution happens after the queue and
+    before the session, so what the model reads and what is stored as the
+    user's message are the same text."""
+    provider = ScriptedProvider([says("noted")] * 4)
+    adapter, client = make_adapter(store, tokenizer, provider=provider)
+    client.profiles["U0RAJ"] = {"name": "raj", "profile": {"display_name": "raj"}}
+
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention(text=f"<@{BOT}> did <@U0RAJ> ship it?"))
+        await until(lambda: len(client.posted) == 1)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+    asked = [m for m in provider.requests[0].messages if m.role == "user"][-1]
+    assert asked.text == "did @raj ship it?"
+    stored = await store.recent_messages(f"slack:{TEAM}:C0DEPLOY:1700000000.000100", 10)
+    assert stored[0].text == "did @raj ship it?"
+
+
+async def test_everybody_a_message_saw_is_recorded_for_mapping(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    adapter, client = make_adapter(store, tokenizer)
+    client.profiles["U0RAJ"] = {"name": "raj", "profile": {"display_name": "raj"}}
+
+    running = asyncio.create_task(adapter.runtime.run())
+    try:
+        await adapter.on_event(mention(text=f"<@{BOT}> ask <@U0RAJ>"))
+        await until(lambda: len(client.posted) == 1)
+    finally:
+        adapter.runtime.stop()
+        await asyncio.wait_for(running, timeout=10.0)
+
+    for uid, name in ((HUMAN, "jane"), ("U0RAJ", "raj")):
+        row = await store.get_slack_user(TEAM, uid)
+        assert row is not None and row["display_name"] == name
 
 
 # -- the package --------------------------------------------------------------

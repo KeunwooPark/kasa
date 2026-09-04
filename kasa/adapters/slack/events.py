@@ -22,7 +22,7 @@ SOURCE = "slack"
 #: together with any run of spaces or tabs either side of it. The gap is part
 #: of the match because removing a mention has to remove the space it was
 #: sitting in, and that is the *only* whitespace it is allowed to touch.
-_MENTION = re.compile(r"(?P<before>[ \t]*)<@(?P<user>[A-Z0-9]+)(?:\|[^>]*)?>(?P<after>[ \t]*)")
+MENTION = re.compile(r"(?P<before>[ \t]*)<@(?P<user>[A-Z0-9]+)(?:\|[^>]*)?>(?P<after>[ \t]*)")
 
 #: Slack channel ids are prefixed by kind, and a one-to-one conversation with
 #: the bot is `D`. Derived from the id rather than from `channel_type`, which
@@ -200,7 +200,7 @@ def _filename(item: Any) -> str:
 
 
 def _mentions(text: str, bot_user_id: str) -> bool:
-    return any(match["user"] == bot_user_id for match in _MENTION.finditer(text))
+    return any(match["user"] == bot_user_id for match in MENTION.finditer(text))
 
 
 def _strip_mention(text: str, bot_user_id: str) -> str:
@@ -224,4 +224,4 @@ def _strip_mention(text: str, bot_user_id: str) -> str:
         # either end of a line, the mention takes its gap with it.
         return " " if match["before"] and match["after"] else ""
 
-    return _MENTION.sub(drop, text).strip()
+    return MENTION.sub(drop, text).strip()

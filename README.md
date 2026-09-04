@@ -33,6 +33,7 @@ daemon: a restart loses nothing and a crashed job runs again.
 | `reorganize` | weekly | merges duplicates, splits oversized files, repairs links, regenerates the listings |
 | `forget` | weekly | archives what stopped mattering, and collects the archive after a grace period |
 | `reindex` | every minute | rebuilds the search index and the manifest for changed blobs |
+| `identity` | every 15 min | maps each Slack user id to one `people/` memory, and follows renames into it |
 
 An episode is scored before anything expensive happens to it, so small talk
 closes with a summary and costs nothing further. `forget` makes no model call at

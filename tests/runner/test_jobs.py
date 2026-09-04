@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from kasa.config import Config, LTMSettings, ProviderConfig
+from kasa.config import Config, LTMSettings, ProviderConfig, SlackSettings
 from kasa.memory.bootstrap import bootstrap
 from kasa.memory.document import MemoryDoc
 from kasa.memory.gitcmd import GitRepo
@@ -275,3 +275,40 @@ def test_forget_is_supervised_by_default() -> None:
     """`docs/DESIGN.md` §5.1: it opens a pull request rather than pushing, and
     somebody reads it before anything leaves the branch."""
     assert Config().ltm.supervised == ["forget"]
+
+
+def with_slack(cfg: Config) -> Config:
+    return cfg.model_copy(
+        update={
+            "slack": SlackSettings(app_token_env="KASA_SLACK_APP", bot_token_env="KASA_SLACK_BOT")
+        }
+    )
+
+
+def test_identity_needs_a_repo_and_a_slack_install(clone: Path, store: Store) -> None:
+    """It maps Slack user ids into the corpus, so it needs both ends of that.
+    A build with one and not the other has nothing to sweep, and an empty sweep
+    every quarter of an hour is still a query every quarter of an hour."""
+    assert "identity" not in [s.kind for s in default_specs(config_for(clone), store)]
+    assert "identity" not in [s.kind for s in default_specs(with_slack(Config()), store)]
+
+    assert "identity" in [s.kind for s in default_specs(with_slack(config_for(clone)), store)]
+
+
+def test_identity_needs_no_model(clone: Path, store: Store) -> None:
+    """Everything it writes came from `users.info`. There is no judgement in
+    it, and a build with no API key still maps its workspace."""
+    kinds = [spec.kind for spec in default_specs(with_slack(config_for(clone)), store)]
+
+    assert "identity" in kinds and "promote" not in kinds
+
+
+def test_identity_and_promote_do_not_fire_on_the_same_minute(clone: Path, store: Store) -> None:
+    """Both want the memory write lease, and `promote` is the one with a model
+    call behind it — it should not be the one waiting."""
+    cfg = with_slack(with_model(config_for(clone)))
+    specs = {spec.kind: spec for spec in default_specs(cfg, store)}
+    moment = datetime(2026, 9, 4, tzinfo=UTC)
+
+    assert specs["identity"].cron is not None and specs["promote"].cron is not None
+    assert specs["identity"].cron.next_after(moment) != specs["promote"].cron.next_after(moment)
