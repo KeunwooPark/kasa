@@ -121,6 +121,11 @@ class SlackSettings(BaseModel):
     app_token_env: str | None = None  # xapp-, Socket Mode
     bot_token_env: str | None = None  # xoxb-
     allowed_channels: list[str] = Field(default_factory=list)
+    #: Post a placeholder and rewrite it as the answer arrives, rather than
+    #: saying nothing until the turn is over. On by default: a long turn that
+    #: shows no sign of life gets asked again, and that is a second model call
+    #: and two answers. Off is a single message, and costs one API call a turn.
+    stream: bool = True
 
     @property
     def configured(self) -> bool:

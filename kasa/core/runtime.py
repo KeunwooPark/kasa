@@ -10,18 +10,60 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from kasa.core.agent import Agent, AgentResult
 from kasa.core.events import InboundEvent
 from kasa.core.inbox import DEFAULT_LEASE_TTL, Dispatcher, Enqueued, Inbox
 from kasa.core.session import IDLE_AFTER, SessionRouter, Turn
+from kasa.llm.types import Delta
 from kasa.store import Store
 
 log = logging.getLogger(__name__)
 
-#: How an answer gets back to where the question came from. Raising means the
-#: turn failed, so the queue will run it again — model call included. A surface
-#: whose posting can fail transiently should retry inside this, not through it.
+
+class Reply(Protocol):
+    """One turn's answer, on its way back to whoever asked for it.
+
+    Opened before the model is called, so a surface that can show progress has
+    somewhere to show it. A surface that cannot ignores `delta` entirely; see
+    `one_message`.
+    """
+
+    async def delta(self, delta: Delta) -> None:
+        """One fragment of the answer, as the model produces it.
+
+        Called on the path that consumes the model's stream, so it must not
+        wait on anything: whatever it does costs the turn its latency, once per
+        token. Raising fails the turn, which is a heavy price for a progress
+        indicator — swallow instead.
+        """
+        ...
+
+    async def finish(self, result: AgentResult) -> None:
+        """Deliver the finished answer.
+
+        Raising means the turn failed, so the queue will run it again — model
+        call included. A surface whose posting can fail transiently should
+        retry inside this, not through it.
+        """
+        ...
+
+    async def aclose(self) -> None:
+        """The turn ended without an answer. Release anything `delta` held.
+
+        Called instead of `finish` when the turn raised. The event goes back on
+        the queue, so anything left half-written here is what the next attempt
+        inherits.
+        """
+        ...
+
+
+#: How a surface opens the reply for one turn. Called before the model is, and
+#: on the turn path, so a failure here fails the turn like any other.
+ReplyOpener = Callable[[InboundEvent], Awaitable[Reply]]
+
+#: The whole of a surface that has nothing to say until the turn is over.
 ReplySink = Callable[[InboundEvent, AgentResult], Awaitable[None]]
 
 #: A last look at an event after it leaves the queue and before a session sees
@@ -39,13 +81,44 @@ EventPreparer = Callable[[InboundEvent], Awaitable[InboundEvent]]
 DEFAULT_CONCURRENCY = 8
 
 
+class _OneMessage:
+    """A `Reply` that says nothing until it has the answer."""
+
+    def __init__(self, event: InboundEvent, sink: ReplySink) -> None:
+        self._event = event
+        self._sink = sink
+
+    async def delta(self, delta: Delta) -> None:
+        pass
+
+    async def finish(self, result: AgentResult) -> None:
+        await self._sink(self._event, result)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def one_message(sink: ReplySink) -> ReplyOpener:
+    """Turn a plain "post the answer" function into a `ReplyOpener`.
+
+    For a surface with nothing to stream to — and for the Slack adapter with
+    streaming switched off, which is what a workspace that would rather not
+    watch a message rewrite itself gets.
+    """
+
+    async def open(event: InboundEvent) -> Reply:
+        return _OneMessage(event, sink)
+
+    return open
+
+
 class Runtime:
     """Queue, actors and agent, wired the one way they work."""
 
     def __init__(
         self,
         agent: Agent,
-        reply: ReplySink,
+        reply: ReplyOpener,
         *,
         concurrency: int = DEFAULT_CONCURRENCY,
         lease_ttl: float = DEFAULT_LEASE_TTL,
@@ -91,15 +164,25 @@ class Runtime:
         await self._router.deliver(event)
 
     async def _turn(self, turn: Turn) -> None:
-        result = await self._agent.respond(
-            turn.event.session_id,
-            turn.event.text,
-            surface=turn.event.source,
-            author=turn.event.author,
-            # The session's scope, not the event's. They are derived the same
-            # way and normally agree; when they do not, the record of what this
-            # conversation has been under all along is the one to trust, and an
-            # event cannot widen a session that was opened as private.
-            scope=turn.session.scope,
-        )
-        await self._reply(turn.event, result)
+        reply = await self._reply(turn.event)
+        try:
+            result = await self._agent.respond(
+                turn.event.session_id,
+                turn.event.text,
+                surface=turn.event.source,
+                author=turn.event.author,
+                # The session's scope, not the event's. They are derived the
+                # same way and normally agree; when they do not, the record of
+                # what this conversation has been under all along is the one to
+                # trust, and an event cannot widen a session that was opened as
+                # private.
+                scope=turn.session.scope,
+                on_delta=reply.delta,
+            )
+        except BaseException:
+            # Including cancellation, which is what a shutdown mid-turn is. A
+            # reply left open holds a background task; the event is going back
+            # on the queue either way.
+            await reply.aclose()
+            raise
+        await reply.finish(result)
