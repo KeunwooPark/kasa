@@ -4,16 +4,23 @@ Small on purpose. The schedules this has to express are the ones in
 `docs/DESIGN.md` §6 — hourly, nightly, weekly — and a dependency taken on for
 that is a dependency to keep current forever.
 
-Times are UTC, because that is what the database stores and what a daemon on a
-server runs in. `0 3 * * *` is three in the morning UTC, which is not three in
-the morning where you are; say what you mean in UTC.
+Times are UTC unless an expression is given a zone. That default is the right
+one for the jobs this was written for: nobody asks what time zone `reindex`
+runs in, and `0 3 * * *` in a registration means three in the morning on the
+server. It stops being the right one the moment a *person* names a time.
+"Nine every morning" is nine where they are, it moves twice a year, and nobody
+should have to do the offset arithmetic to say it — so `parse` takes an
+optional IANA zone, the walk happens on that zone's wall clock, and only the
+answer is converted back. The boundary is unchanged either way: an aware UTC
+instant in, an aware UTC instant out.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kasa.errors import KasaError
 
@@ -49,9 +56,12 @@ class Cron:
     #: restricted, which the obvious `!= "*"` does, yields a much larger set.
     either_day: bool
     expression: str
+    #: The wall clock the fields are read against. None is UTC, and is what
+    #: every schedule that ships with Kasa uses.
+    tz: ZoneInfo | None = None
 
     @classmethod
-    def parse(cls, expression: str) -> Self:
+    def parse(cls, expression: str, *, tz: str | ZoneInfo | None = None) -> Self:
         fields = expression.split()
         if len(fields) != 5:
             raise CronError(
@@ -70,23 +80,37 @@ class Cron:
             weekdays=values[4],
             either_day=not fields[2].startswith("*") and not fields[4].startswith("*"),
             expression=expression,
+            tz=_zone(tz),
         )
 
+    @property
+    def label(self) -> str:
+        """How to name this in a log line or a listing.
+
+        Five fields alone are ambiguous once a zone is possible, and the reader
+        of "could not schedule 0 9 * * 1-5" has no way to ask which nine.
+        """
+        return self.expression if self.tz is None else f"{self.expression} ({self.tz.key})"
+
     def matches(self, moment: datetime) -> bool:
+        local = self._wall(moment)
         return (
-            moment.minute in self.minutes
-            and moment.hour in self.hours
-            and moment.month in self.months
-            and self._day_matches(moment)
+            local.minute in self.minutes
+            and local.hour in self.hours
+            and local.month in self.months
+            and self._day_matches(local)
         )
 
     def next_after(self, moment: datetime) -> datetime:
         """The first minute strictly after `moment` that this fires on.
 
         Walks forward, but skips: a month that does not match costs one step,
-        not forty-four thousand.
+        not forty-four thousand. With a zone, the walk is over that zone's wall
+        clock — which is the whole point, since nine in the morning stays nine
+        in the morning on both sides of a DST boundary — and each candidate is
+        turned back into an instant before it is offered.
         """
-        candidate = moment.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        candidate = self._wall(moment).replace(second=0, microsecond=0) + timedelta(minutes=1)
         limit = candidate + HORIZON
         while candidate < limit:
             if candidate.month not in self.months:
@@ -97,15 +121,102 @@ class Cron:
                 candidate = (candidate + timedelta(hours=1)).replace(minute=0)
             elif candidate.minute not in self.minutes:
                 candidate += timedelta(minutes=1)
+            elif (fire_at := self._instant(candidate, after=moment)) is not None:
+                return fire_at
             else:
-                return candidate
-        raise CronError(f"{self.expression!r} does not fire within four years")
+                candidate += timedelta(minutes=1)
+        raise CronError(f"{self.label!r} does not fire within four years")
 
     def _day_matches(self, moment: datetime) -> bool:
         # cron counts weekdays from Sunday; Python counts from Monday.
         by_month = moment.day in self.days
         by_week = moment.isoweekday() % 7 in self.weekdays
         return (by_month or by_week) if self.either_day else (by_month and by_week)
+
+    def _wall(self, moment: datetime) -> datetime:
+        """`moment` as the naive wall clock the fields are read against.
+
+        Naive on purpose: the walk adds days and hours, and adding a day to an
+        aware datetime across a DST boundary moves the wall clock by 23 or 25
+        hours, which is exactly the arithmetic a schedule must not do.
+        """
+        if self.tz is None:
+            return moment.replace(tzinfo=None)
+        if moment.tzinfo is None:
+            raise CronError(
+                f"{self.label!r} counts from an instant, and a naive datetime does not name one"
+            )
+        return moment.astimezone(self.tz).replace(tzinfo=None)
+
+    def _instant(self, local: datetime, *, after: datetime) -> datetime | None:
+        """The UTC instant `local` names, or None if the walk should go on.
+
+        None on two counts, and the caller treats them the same way — advance a
+        minute and keep looking:
+
+        * The instant is not after `after`. Only reachable in the hour a
+          fall-back repeats: the clock ticks in the second pass over a wall
+          time that already fired in the first, and `next_after` promises an
+          instant that is strictly later than the one it was handed. Skipping
+          is also what makes a repeated wall time fire *once* rather than
+          twice.
+        * The wall time is inside a spring-forward gap and has no far side
+          within the gap — which cannot happen, but is not worth asserting.
+
+        Without a zone there is nothing to resolve and nothing to skip: the
+        walk started a minute after `after` and every step moves forward, so
+        the candidate is already the answer, in the frame it was asked in.
+        """
+        if self.tz is None:
+            return local.replace(tzinfo=after.tzinfo)
+        # fold=0 is the earlier of the two passes over a repeated wall time,
+        # which is the one that fires.
+        fire_at = _to_utc(local, self.tz) or _after_gap(local, self.tz)
+        return fire_at if fire_at is not None and fire_at > after else None
+
+
+def _to_utc(local: datetime, tz: ZoneInfo) -> datetime | None:
+    """The instant a wall time names, or None if it names none.
+
+    A wall time inside a spring-forward gap still *converts* — PEP 495 gives it
+    the offset from before the transition — so the check is the round trip: an
+    hour that does not exist comes back as a different hour.
+    """
+    instant = local.replace(tzinfo=tz).astimezone(UTC)
+    return instant if instant.astimezone(tz).replace(tzinfo=None) == local else None
+
+
+def _after_gap(local: datetime, tz: ZoneInfo) -> datetime | None:
+    """The first wall time on the far side of the gap that swallowed `local`.
+
+    A schedule whose hour a zone skips still fires that day: `0 2 * * *` where
+    02:00 does not exist runs at 03:00, not tomorrow. Walking a minute at a
+    time is bounded by the gap itself — an hour nearly everywhere, and a whole
+    day only for Apia in 2011.
+    """
+    ahead = local.replace(tzinfo=tz, fold=1).utcoffset()
+    behind = local.replace(tzinfo=tz).utcoffset()
+    if ahead is None or behind is None or ahead <= behind:  # pragma: no cover - not a gap
+        return None
+    probe, edge = local, local + (ahead - behind)
+    while probe < edge:
+        probe += timedelta(minutes=1)
+        if (instant := _to_utc(probe, tz)) is not None:
+            return instant
+    return None
+
+
+def _zone(tz: str | ZoneInfo | None) -> ZoneInfo | None:
+    if tz is None or isinstance(tz, ZoneInfo):
+        return tz
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise CronError(
+            f"{tz!r} is not a time zone this machine knows. Names come from the IANA "
+            "database — 'Asia/Seoul', not 'KST' — and a platform that ships without one "
+            "needs the 'tzdata' package installed."
+        ) from exc
 
 
 def _next_month(moment: datetime) -> datetime:

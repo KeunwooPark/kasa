@@ -333,14 +333,14 @@ class Scheduler:
                 failures = self._schedule_failures.get(spec.kind, 0) + 1
                 self._schedule_failures[spec.kind] = failures
                 report = log.exception if failures == 1 else log.error
-                report("could not schedule %s (%s)", spec.kind, spec.cron.expression)
+                report("could not schedule %s (%s)", spec.kind, spec.cron.label)
                 continue
             failures = self._schedule_failures.pop(spec.kind, 0)
             if failures:
                 log.info(
                     "scheduling %s (%s) recovered after %d failed tick%s",
                     spec.kind,
-                    spec.cron.expression,
+                    spec.cron.label,
                     failures,
                     "" if failures == 1 else "s",
                 )
