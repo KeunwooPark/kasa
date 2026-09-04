@@ -14,10 +14,10 @@ from typing import Any
 import httpx
 import pytest
 
-from kasa.config import load_config
+from kasa.config import ProviderKind, load_config
 from kasa.errors import ConfigError
 from kasa.github import GitHubClient
-from kasa.init import run_init
+from kasa.init import FAUCET_BASE_URL, run_init
 from kasa.memory.gitcmd import GitRepo, run_git
 from kasa.memory.layout import MANIFEST_PATH, SCHEMA_PATH
 from tests.conftest import mock_client
@@ -45,6 +45,9 @@ class ScriptedPrompter:
         self.default_confirm = default_confirm
         self.said: list[str] = []
         self.warned: list[str] = []
+        self.asked: list[str] = []
+        self.chosen: list[str] = []
+        self.selected: list[str] = []
 
     def _match(self, question: str, table: dict[str, Any]) -> Any | None:
         for fragment, value in table.items():
@@ -53,10 +56,17 @@ class ScriptedPrompter:
         return None
 
     def ask(self, question: str, *, default: str | None = None) -> str:
+        self.asked.append(question)
         answer = self._match(question, self.answers)
         return answer if answer is not None else (default or "")
 
     def choose(self, question: str, choices: tuple[str, ...], *, default: str) -> str:
+        self.chosen.append(question)
+        answer = self._match(question, self.answers)
+        return answer if answer is not None else default
+
+    def select(self, question: str, options: tuple[str, ...], *, default: str) -> str:
+        self.selected.append(question)
         answer = self._match(question, self.answers)
         return answer if answer is not None else default
 
@@ -121,7 +131,7 @@ def remote(tmp_path: Path) -> str:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (TOKEN_ENV, "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+    for name in (TOKEN_ENV, "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "FAUCET_API_KEY"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -348,6 +358,79 @@ async def test_unset_key_env_is_warned_about_not_fatal(tmp_path: Path, remote: s
     prompter, config, _ = await do_init(tmp_path, remote)
     assert any("ANTHROPIC_API_KEY is not set" in w for w in prompter.warned)
     assert config.exists()
+
+
+async def test_faucet_preset_discovers_and_writes_plain_openai_config(
+    tmp_path: Path, remote: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAUCET_API_KEY", "faucet-secret")
+    prompter = ScriptedPrompter(
+        {
+            "memory repo": "someone/kasa-memory",
+            "clone path": str(tmp_path / "ltm"),
+            "preset for chat": "faucet",
+            "model for chat": "anthropic/claude-opus-5",
+        },
+        confirms={"utility model": False, "embedding model": False, "Slack": False},
+    )
+    discovered: list[tuple[str, str | None, str]] = []
+
+    async def models(kind: ProviderKind, base_url: str | None, key_env: str) -> list[str]:
+        discovered.append((kind, base_url, key_env))
+        return ["openai/gpt-5.2", "anthropic/claude-opus-5"]
+
+    client = fake_github(clone_url=remote)
+    try:
+        await run_init(
+            prompter,
+            path=tmp_path / "config.toml",
+            github=client,
+            model_discovery=models,
+        )
+    finally:
+        await client.aclose()
+
+    chat = load_config(tmp_path / "config.toml").llm["chat"]
+    assert (chat.kind, chat.base_url, chat.key_env, chat.model) == (
+        "openai",
+        FAUCET_BASE_URL,
+        "FAUCET_API_KEY",
+        "anthropic/claude-opus-5",
+    )
+    assert discovered[0] == ("openai", FAUCET_BASE_URL, "FAUCET_API_KEY")
+    assert not any("Base URL for chat" in question for question in prompter.asked)
+    assert not any("chat API key" in question for question in prompter.asked)
+
+
+async def test_model_discovery_is_optional_and_typed_names_remain_open(
+    tmp_path: Path, remote: str
+) -> None:
+    typed = "vendor/a-model-not-in-the-list"
+    prompter = ScriptedPrompter(
+        {
+            "memory repo": "someone/kasa-memory",
+            "clone path": str(tmp_path / "ltm"),
+            "preset for chat": "faucet",
+            "model for chat": typed,
+        },
+        confirms={"utility model": False, "embedding model": False, "Slack": False},
+    )
+
+    async def listed(kind: ProviderKind, base_url: str | None, key_env: str) -> list[str]:
+        return ["openai/gpt-5.2"]
+
+    client = fake_github(clone_url=remote)
+    try:
+        await run_init(
+            prompter,
+            path=tmp_path / "config.toml",
+            github=client,
+            model_discovery=listed,
+        )
+    finally:
+        await client.aclose()
+
+    assert load_config(tmp_path / "config.toml").llm["chat"].model == typed
 
 
 async def test_a_relative_clone_answer_is_stored_absolutely(

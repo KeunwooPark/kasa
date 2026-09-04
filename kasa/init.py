@@ -13,9 +13,12 @@ that already has memories in it.
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+import httpx
 
 from kasa.config import (
     DEFAULT_ANTHROPIC_MODEL,
@@ -43,6 +46,14 @@ _OPTIONAL_ROLES = {
     "embedding": "semantic retrieval; lexical search works without it",
 }
 
+FAUCET_BASE_URL = "https://api.intfaucet.com/v1"
+_PRESETS: dict[str, tuple[ProviderKind, str | None, str]] = {
+    "anthropic": ("anthropic", None, "ANTHROPIC_API_KEY"),
+    "openai": ("openai", None, "OPENAI_API_KEY"),
+    "faucet": ("openai", FAUCET_BASE_URL, "FAUCET_API_KEY"),
+}
+ModelDiscovery = Callable[[ProviderKind, str | None, str], Awaitable[list[str]]]
+
 PUBLIC_REPO_REFUSED = (
     "{name} is a public repository.\n"
     "Long-term memory accumulates whatever the agent is told, including the "
@@ -62,6 +73,7 @@ class Prompter(Protocol):
 
     def ask(self, question: str, *, default: str | None = None) -> str: ...
     def choose(self, question: str, choices: tuple[str, ...], *, default: str) -> str: ...
+    def select(self, question: str, options: tuple[str, ...], *, default: str) -> str: ...
     def confirm(self, question: str, *, default: bool = False) -> bool: ...
     def say(self, text: str) -> None: ...
     def warn(self, text: str) -> None: ...
@@ -83,6 +95,7 @@ async def run_init(
     *,
     path: Path | None = None,
     github: GitHubClient | None = None,
+    model_discovery: ModelDiscovery | None = None,
 ) -> InitResult:
     """Walk the setup and write the config file. Returns what it did."""
     if not git_available():
@@ -107,7 +120,9 @@ async def run_init(
     # Bound to names first: as keyword arguments these would be evaluated in
     # source order, which asks about the optional Slack surface before the
     # required chat model.
-    llm = _configure_providers(prompter, cfg.llm)
+    llm = await _configure_providers(
+        prompter, cfg.llm, model_discovery=model_discovery or discover_models
+    )
     slack = _configure_slack(prompter, cfg.slack)
 
     cfg = Config(
@@ -268,48 +283,110 @@ def _publish(prompter: Prompter, repo: GitRepo, ltm: LTMSettings) -> bool:
 # -- models and surfaces -----------------------------------------------------
 
 
-def _configure_providers(
-    prompter: Prompter, current: dict[str, ProviderConfig]
+async def _configure_providers(
+    prompter: Prompter,
+    current: dict[str, ProviderConfig],
+    *,
+    model_discovery: ModelDiscovery,
 ) -> dict[str, ProviderConfig]:
-    providers = {"chat": _configure_role(prompter, "chat", current.get("chat"))}
+    providers = {
+        "chat": await _configure_role(
+            prompter, "chat", current.get("chat"), model_discovery=model_discovery
+        )
+    }
     for role, hint in _OPTIONAL_ROLES.items():
         prompter.say(f"The {role} model is optional — {hint}.")
         if prompter.confirm(f"Configure the {role} model?", default=role in current):
-            providers[role] = _configure_role(prompter, role, current.get(role))
+            providers[role] = await _configure_role(
+                prompter, role, current.get(role), model_discovery=model_discovery
+            )
     return providers
 
 
-def _configure_role(
-    prompter: Prompter, role: str, current: ProviderConfig | None
+async def _configure_role(
+    prompter: Prompter,
+    role: str,
+    current: ProviderConfig | None,
+    *,
+    model_discovery: ModelDiscovery,
 ) -> ProviderConfig:
-    kind = prompter.choose(
-        f"Provider kind for {role}",
-        ("anthropic", "openai"),
-        default=current.kind if current else "anthropic",
+    default_preset = _preset_for(current) if current else "anthropic"
+    preset = prompter.choose(
+        f"Provider preset for {role}",
+        ("anthropic", "openai", "faucet", "custom"),
+        default=default_preset,
     )
-    provider_kind: ProviderKind = "anthropic" if kind == "anthropic" else "openai"
+    if preset == "custom":
+        kind = prompter.choose(
+            f"Provider kind for {role}",
+            ("anthropic", "openai"),
+            default=current.kind if current else "anthropic",
+        )
+        provider_kind: ProviderKind = "anthropic" if kind == "anthropic" else "openai"
+        base_url = (
+            prompter.ask(
+                f"Base URL for {role} (blank for the provider default)",
+                default=current.base_url if current else "",
+            ).strip()
+            or None
+        )
+        default_env = (
+            current.key_env if current and current.key_env else default_key_env(provider_kind)
+        )
+        key_env = prompter.ask(f"Env var holding the {role} API key", default=default_env).strip()
+    else:
+        provider_kind, base_url, key_env = _PRESETS[preset]
     default_model = (
         current.model
         if current
         else (DEFAULT_ANTHROPIC_MODEL if provider_kind == "anthropic" else DEFAULT_OPENAI_MODEL)
     )
-    model = prompter.ask(f"Model for {role}", default=default_model).strip()
-    base_url = prompter.ask(
-        f"Base URL for {role} (blank for the provider default)",
-        default=current.base_url if current else "",
+    models = await model_discovery(provider_kind, base_url, key_env)
+    model = (
+        prompter.select(f"Model for {role}", tuple(models), default=default_model)
+        if models
+        else prompter.ask(f"Model for {role}", default=default_model)
     ).strip()
-    default_env = current.key_env if current and current.key_env else default_key_env(provider_kind)
-    key_env = prompter.ask(f"Env var holding the {role} API key", default=default_env).strip()
     if not os.environ.get(key_env):
         prompter.warn(f"{key_env} is not set in this shell. Export it before `kasa run`.")
 
     return ProviderConfig(
         kind=provider_kind,
         model=model,
-        base_url=base_url or None,
+        base_url=base_url,
         key_env=key_env,
         embedding_dimensions=current.embedding_dimensions if current else None,
     )
+
+
+def _preset_for(current: ProviderConfig) -> str:
+    if current.kind == "openai" and current.base_url == FAUCET_BASE_URL:
+        return "faucet"
+    if current.base_url is None:
+        return current.kind
+    return "custom"
+
+
+async def discover_models(kind: ProviderKind, base_url: str | None, key_env: str) -> list[str]:
+    key = os.environ.get(key_env)
+    if not key:
+        return []
+    root = base_url or (
+        "https://api.anthropic.com/v1" if kind == "anthropic" else "https://api.openai.com/v1"
+    )
+    headers = (
+        {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        if kind == "anthropic"
+        else {"authorization": f"Bearer {key}"}
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{root.rstrip('/')}/models", headers=headers)
+            response.raise_for_status()
+            data = response.json().get("data", [])
+            return sorted(str(item["id"]) for item in data if item.get("id"))
+    except (httpx.HTTPError, AttributeError, ValueError, TypeError, KeyError):
+        return []
 
 
 def _configure_slack(prompter: Prompter, current: SlackSettings) -> SlackSettings:

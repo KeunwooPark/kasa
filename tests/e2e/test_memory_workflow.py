@@ -57,10 +57,11 @@ def bootstrap_with_init(rig: KasaRig, tmp_path: Path) -> Path:
         f"{remote}\n"  # repository
         "\n"  # default token environment variable
         f"{clone}\n"
-        "\n"  # keep the configured OpenAI provider
-        "\n"  # keep model
+        "\n"  # keep the inferred custom preset
+        "\n"  # keep the configured OpenAI wire format
         "\n"  # keep local fake-provider URL
         "\n"  # keep key environment variable
+        "\n"  # keep model (from discovery when available)
         "n\n"  # no utility provider
         "n\n"  # no embedding provider
         "n\n"  # no Slack
