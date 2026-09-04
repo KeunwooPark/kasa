@@ -26,6 +26,7 @@ from kasa.store import Store
 log = logging.getLogger(__name__)
 
 DeltaSink = Callable[[Delta], Awaitable[None]]
+Scrubber = Callable[[str], str]
 
 DEFAULT_SYSTEM_PROMPT = """You are Kasa, a long-running assistant that remembers.
 
@@ -65,6 +66,7 @@ class AgentResult:
     #: boosts and an ❌ marks suspect (#36), so it has to be what actually
     #: reached the model rather than what was ranked.
     memory_ids: list[str] = field(default_factory=list)
+    credential_scrubbed: bool = False
 
     @property
     def note(self) -> str | None:
@@ -76,22 +78,43 @@ class AgentResult:
         rather than in the REPL because every surface needs the same sentence,
         and a silent turn on Slack will be no more debuggable than on a tty.
         """
+        operational: str | None
         match self.stop_reason:
             case "max_iterations":
-                return (
+                operational = (
                     f"stopped after {self.tool_calls} tool call(s) without an answer — "
                     "the model kept asking for tools. Try a narrower question."
                 )
             case "max_tokens":
-                return "the reply hit the model's output limit and was cut off."
+                operational = "the reply hit the model's output limit and was cut off."
             case "content_filter":
-                return "the provider stopped this reply before it finished."
+                operational = "the provider stopped this reply before it finished."
             case "tool_use":
-                return "the model asked for a tool that was never run."
+                operational = "the model asked for a tool that was never run."
             case _ if not self.text.strip():
-                return "the model returned nothing."
+                operational = "the model returned nothing."
             case _:
-                return None
+                operational = None
+        security = (
+            "That looked like a credential, so I did not store it. Run `kasa vault set NAME` "
+            "if you want Kasa to keep it locally."
+            if self.credential_scrubbed
+            else None
+        )
+        return " ".join(note for note in (security, operational) if note) or None
+
+
+def _restore_current_message(
+    history: list[Message], persisted_text: str, original_text: str
+) -> list[Message]:
+    """Put the current raw input back into an in-memory prompt, never the store."""
+    restored = list(history)
+    for index in range(len(restored) - 1, -1, -1):
+        message = restored[index]
+        if message.role == "user" and message.text == persisted_text:
+            restored[index] = Message.user(original_text)
+            break
+    return restored
 
 
 class Agent:
@@ -104,12 +127,14 @@ class Agent:
         packer: ContextPacker,
         config: AgentConfig | None = None,
         retriever: Retriever | None = None,
+        inbound_scrub: Scrubber | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
         self._tools = tools
         self._packer = packer
         self._retriever = retriever
+        self._inbound_scrub = inbound_scrub or (lambda text: text)
         self.config = config or AgentConfig()
 
     @property
@@ -134,11 +159,14 @@ class Agent:
         scope: str = "workspace",
         on_delta: DeltaSink | None = None,
         external_id: str | None = None,
+        credential_scrubbed: bool = False,
     ) -> AgentResult:
         await self._store.ensure_session(session_id, surface=surface, scope=scope)
         # `external_id` is the surface's own key for this message, and it is
         # what lets an edit or a deletion arriving later find the row it
         # invalidates (#25). Nothing in the turn reads it.
+        safe_user_text = self._inbound_scrub(user_text)
+        credential_scrubbed = credential_scrubbed or safe_user_text != user_text
         await self._store.append_message(
             session_id, Message.user(user_text), author=author, external_id=external_id
         )
@@ -158,6 +186,8 @@ class Agent:
         # after the last permitted round of tool calls.
         for iteration in range(1, self.config.max_tool_iterations + 2):
             history = await self._store.recent_messages(session_id, self.config.history_limit)
+            if credential_scrubbed:
+                history = _restore_current_message(history, safe_user_text, user_text)
             # Retrieval runs once, on the opening message. Re-running it after
             # every tool call would pay for it on each pass and thrash the
             # cacheable prefix for material that has not changed.
@@ -217,6 +247,7 @@ class Agent:
             # Tool calls append to the context as the turn runs, so this is
             # read at the end rather than built alongside `recalled`.
             memory_ids=list(dict.fromkeys([*recalled, *context.recalled])),
+            credential_scrubbed=credential_scrubbed,
         )
 
     # -- internals -----------------------------------------------------------

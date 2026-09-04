@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -23,6 +23,22 @@ from kasa.memory.subject import normalize_subject
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 _BLOCKS = TypeAdapter(tuple[ContentBlock, ...])
+
+Scrubber = Callable[[str], str]
+
+
+def _scrub_message(message: Message, scrub: Scrubber) -> Message:
+    content = _scrub_value([block.model_dump(mode="python") for block in message.content], scrub)
+    return message.model_copy(update={"content": _BLOCKS.validate_python(content)})
+
+
+def _scrub_value(value: Any, scrub: Scrubber) -> Any:
+    if isinstance(value, dict):
+        return {key: _scrub_value(item, scrub) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_value(item, scrub) for item in value]
+    return scrub(value) if isinstance(value, str) else value
+
 
 #: One episode, with the two things every consolidation job asks about it that
 #: are not on the row: how much conversation it holds, and who is allowed to
@@ -95,11 +111,14 @@ class _Serial:
 class Store:
     """Owns the connection. One instance per process."""
 
-    def __init__(self, conn: aiosqlite.Connection, path: str) -> None:
+    def __init__(
+        self, conn: aiosqlite.Connection, path: str, *, scrub: Scrubber | None = None
+    ) -> None:
         self._conn = conn
         self.path = path
         self._serial = _Serial()
         self._vectors_enabled = False
+        self._scrub = scrub or (lambda text: text)
 
     async def enable_vectors(self) -> None:
         """Load sqlite-vec lazily; lexical-only installs need no extension."""
@@ -118,7 +137,7 @@ class Store:
             self._vectors_enabled = True
 
     @classmethod
-    async def open(cls, path: str | Path) -> Self:
+    async def open(cls, path: str | Path, *, scrub: Scrubber | None = None) -> Self:
         """Open the database, or raise `StoreError` having closed it again.
 
         The close is not tidiness. `aiosqlite.connect` starts a worker thread
@@ -148,7 +167,7 @@ class Store:
             await conn.execute("PRAGMA foreign_keys = ON")
             await conn.execute("PRAGMA busy_timeout = 5000")
             await conn.commit()
-            store = cls(conn, target)
+            store = cls(conn, target, scrub=scrub)
             await store.migrate()
         except BaseException as exc:
             await conn.close()
@@ -239,6 +258,9 @@ class Store:
         tokens: int | None = None,
         external_id: str | None = None,
     ) -> str:
+        # The final common boundary before conversation content reaches disk.
+        # Providers and tools can echo a credential, so every block is covered.
+        message = _scrub_message(message, self._scrub)
         async with self._serial:
             message_id = str(ULID())
             async with self._conn.execute(
@@ -1153,6 +1175,7 @@ class Store:
         reply is still in the transcript, and a reply to nothing reads as the
         model having invented the question.
         """
+        content = _scrub_message(content, self._scrub)
         async with self._serial:
             await self._conn.execute(
                 "UPDATE messages SET content = ?, state = ?, revised_at = ? WHERE id = ?",

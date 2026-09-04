@@ -113,6 +113,7 @@ def build(
     tools: list[Tool] | None = None,
     config: AgentConfig | None = None,
     retriever: Retriever | None = None,
+    inbound_scrub: Any = None,
 ) -> tuple[Agent, ScriptedProvider]:
     provider = ScriptedProvider(script)
     agent = Agent(
@@ -124,8 +125,26 @@ def build(
         packer=ContextPacker(tokenizer=tokenizer),
         config=config,
         retriever=retriever,
+        inbound_scrub=inbound_scrub,
     )
     return agent, provider
+
+
+async def test_current_secret_is_visible_once_but_only_redaction_is_stored(
+    tmp_path: Path, tokenizer: Tokenizer
+) -> None:
+    secret = "sk-ant-this-is-the-current-turn-secret"
+    redactor = Redactor()
+    async with await Store.open(tmp_path / "guarded.db", scrub=redactor.scrub) as guarded:
+        agent, provider = build(
+            guarded, tokenizer, [says("It has the expected shape.")], inbound_scrub=redactor.scrub
+        )
+        result = await agent.respond("s1", f"is {secret} valid?", surface="slack")
+        stored = await guarded.recent_messages("s1")
+
+    assert secret in provider.requests[0].messages[-1].text
+    assert all(secret not in message.model_dump_json() for message in stored)
+    assert "did not store it" in (result.note or "")
 
 
 async def transcript(store: Store, session: str) -> list[tuple[str, str]]:

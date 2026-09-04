@@ -76,6 +76,7 @@ ReplySink = Callable[[InboundEvent, AgentResult], Awaitable[None]]
 #: improvement rather than a requirement should swallow its own failures and
 #: return the event it was given, which is what `Directory.hydrate` does.
 EventPreparer = Callable[[InboundEvent], Awaitable[InboundEvent]]
+Scrubber = Callable[[str], str]
 
 #: How many turns may be in flight at once, across all conversations.
 DEFAULT_CONCURRENCY = 8
@@ -124,10 +125,13 @@ class Runtime:
         lease_ttl: float = DEFAULT_LEASE_TTL,
         idle_after: float = IDLE_AFTER,
         prepare: EventPreparer | None = None,
+        scrub: Scrubber | None = None,
     ) -> None:
         self._agent = agent
         self._reply = reply
         self._prepare = prepare
+        self._scrub = scrub or (lambda text: text)
+        self._ephemeral_originals: dict[tuple[str, str], str] = {}
         self.inbox = Inbox(agent.store, lease_ttl=lease_ttl)
         self._router = SessionRouter(agent.store, self._turn, idle_after=idle_after)
         self.dispatcher = Dispatcher(self.inbox, self._deliver, concurrency=concurrency)
@@ -138,7 +142,15 @@ class Runtime:
 
     async def submit(self, event: InboundEvent) -> Enqueued:
         """What an adapter calls at ingress. Durable by the time it returns."""
-        return await self.inbox.enqueue(event)
+        original = event.text
+        safe = self._scrub(original)
+        changed = safe != original
+        if changed:
+            event = event.model_copy(update={"text": safe, "credential_scrubbed": True})
+        enqueued = await self.inbox.enqueue(event)
+        if changed and not enqueued.duplicate:
+            self._ephemeral_originals[(event.source, event.external_id)] = original
+        return enqueued
 
     async def run(self) -> None:
         """Answer whatever arrives, until `stop()`."""
@@ -156,9 +168,12 @@ class Runtime:
         """Between the queue and the conversation.
 
         Before the router rather than inside the turn, so the session actor
-        serializes an event that already says what it means — and so what is
-        stored as the user's message is the text the model was actually shown.
+        serializes an event that already says what it means. A scrubbed event's
+        original is restored here only in memory; the agent's store boundary
+        persists the redacted form while its first prompt sees the original.
         """
+        if original := self._ephemeral_originals.pop((event.source, event.external_id), None):
+            event = event.model_copy(update={"text": original})
         if self._prepare is not None:
             event = await self._prepare(event)
         await self._router.deliver(event)
@@ -181,6 +196,7 @@ class Runtime:
                 # So a later edit or deletion of this message can find what was
                 # stored for it (#25).
                 external_id=turn.event.external_id,
+                credential_scrubbed=turn.event.credential_scrubbed,
             )
         except BaseException:
             # Including cancellation, which is what a shutdown mid-turn is. A

@@ -45,6 +45,20 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
     ("slack token", re.compile(r"\bxox[aborps]-[A-Za-z0-9-]{10,}")),
     ("slack app token", re.compile(r"\bxapp-[A-Za-z0-9-]{10,}")),
+    # Provider-agnostic, but contextual: a long random-looking word is often a
+    # hash or fixture; explicitly presenting it as a bearer credential is the
+    # evidence that makes redaction worth the false-positive cost.
+    (
+        "bearer token",
+        re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}"),
+    ),
+    # JWT's three encoded segments are distinctive enough to catch without an
+    # Authorization header. Require substantial header and payload segments so
+    # dotted prose and version strings remain untouched.
+    (
+        "json web token",
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}\b"),
+    ),
     # Only the two prefixes AWS issues as *credentials*. The principal-id
     # prefixes (AIDA, AROA, …) share the shape but are not secret, and they are
     # the identifiers an IAM policy or a CloudTrail event is about — redacting

@@ -50,6 +50,8 @@ def test_every_vault_value_seeds_exact_redaction() -> None:
         "xapp-1-A0123456789-abcdef",
         "AKIAIOSFODNN7EXAMPLE",
         "ASIAY34FZKBOKMSXQWER",
+        "Bearer arbitrarySaaSToken_1234567890",
+        "eyJabcdefghijk.eyJabcdefghijklmnop.abcdefghijklmnopqrstuv",
     ],
 )
 def test_token_shapes_are_caught_even_when_unknown(text: str) -> None:
@@ -69,6 +71,20 @@ def test_iam_principal_ids_are_left_alone() -> None:
     """They share the AWS key shape but are identifiers, not credentials — and
     they are the thing an IAM question is about."""
     text = "role AROAEXAMPLEID1234567 denied s3:GetObject to user AIDAEXAMPLEID1234567"
+    assert Redactor().scrub(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ordinary prose has long words like internationalization and characterization.",
+        "```python\nfixture = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\n```",
+        "image payload: iVBORw0KGgoAAAANSUhEUgAAAAUAABCD1234567890==",
+        "Bearer short-placeholder",
+        "release eyJheader.payload.signature is documentation, not a JWT",
+    ],
+)
+def test_generic_token_near_misses_survive(text: str) -> None:
     assert Redactor().scrub(text) == text
 
 

@@ -656,6 +656,14 @@ prompt. A model can emit `{{vault:name}}`; only the tool dispatcher substitutes
 the value immediately before invoking the tool. Secret material is scrubbed
 from logs, tool results, recalled memory, and anything that reaches an LLM.
 
+Inbound events are scrubbed before the durable inbox and message store. The
+original may remain in process memory for the current turn so the model can
+answer the request that carried it, but only the redaction marker survives a
+restart or reaches episode extraction. The user is told when this happens.
+Finally, the deterministic patch validator scans every proposed write using the
+same exact values and credential shapes and rejects the entire plan before any
+file can be committed.
+
 ### 11.3 Repo privacy
 
 `kasa init` refuses to configure a public repository as the LTM store, and the
