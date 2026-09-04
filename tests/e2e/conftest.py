@@ -42,6 +42,19 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         )
         has_tool_result = any(message["role"] == "tool" for message in messages)
 
+        if last_user == "Hold this turn.":
+            self.server.request_started.set()
+            if not self.server.release_request.wait(timeout=10):
+                raise TimeoutError("test did not release the held provider request")
+            if self.server.fail_held_request:
+                body = b'{"error":{"message":"planned E2E failure"}}'
+                self.send_response(503)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
         if last_user == "Use the clock tool." and not has_tool_result:
             body = _sse(
                 _chunk(
@@ -85,6 +98,9 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
 
 class FakeOpenAIServer(ThreadingHTTPServer):
     requests: list[dict[str, object]]
+    request_started: threading.Event
+    release_request: threading.Event
+    fail_held_request: bool
 
 
 @dataclass(frozen=True)
@@ -110,6 +126,9 @@ class KasaRig:
 def kasa_rig(tmp_path: Path) -> Iterator[KasaRig]:
     server = FakeOpenAIServer(("127.0.0.1", 0), FakeOpenAIHandler)
     server.requests = []
+    server.request_started = threading.Event()
+    server.release_request = threading.Event()
+    server.fail_held_request = False
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 

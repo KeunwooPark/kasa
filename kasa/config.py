@@ -120,6 +120,9 @@ class SlackSettings(BaseModel):
 
     app_token_env: str | None = None  # xapp-, Socket Mode
     bot_token_env: str | None = None  # xoxb-
+    #: Override Slack's Web API endpoint. Useful for private proxies and for
+    #: exercising the real Socket Mode client against a local QA server.
+    api_url: str = "https://slack.com/api/"
     allowed_channels: list[str] = Field(default_factory=list)
     #: Post a placeholder and rewrite it as the answer arrives, rather than
     #: saying nothing until the turn is over. On by default: a long turn that

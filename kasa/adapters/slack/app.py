@@ -99,8 +99,11 @@ class SlackAdapter:
         mention from chatter and Kasa's own messages from everyone else's, and
         the team id is half of every session key.
         """
+        client = AsyncWebClient(
+            token=_token(settings.bot_token_env, "bot"), base_url=settings.api_url
+        )
         app = AsyncApp(
-            token=_token(settings.bot_token_env, "bot"),
+            client=client,
             signing_secret=NO_HTTP_VERIFICATION,
             request_verification_enabled=False,
         )
