@@ -197,9 +197,7 @@ def state(rig: KasaRig, event_id: str) -> str | None:
     connection = sqlite3.connect(rig.database)
     try:
         with connection:
-            row = connection.execute(
-                "SELECT state FROM inbox ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            row = connection.execute("SELECT state FROM inbox ORDER BY id DESC LIMIT 1").fetchone()
     except sqlite3.OperationalError:
         return None
     finally:
