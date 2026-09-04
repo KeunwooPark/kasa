@@ -27,10 +27,29 @@ TYPE_DIRS = ("people", "projects", "topics", "facts", "journal")
 ARCHIVE_DIR = f"{MEMORY_DIR}/archive"
 
 
+#: The name every generated listing goes under, at any depth. `reorganize`
+#: regenerates them from the manifest; a patch plan may not write one.
+INDEX_NAME = "README.md"
+
+
+def is_index_page(relative_path: str | Path) -> bool:
+    """True for a generated listing under `memory/`.
+
+    A directory index is a memory-shaped path holding something that is not a
+    memory — no frontmatter, nothing anybody claimed. Naming it here is what
+    keeps the manifest and the search index from walking into it and reporting
+    it as a broken file every time they run.
+    """
+    path = Path(relative_path)
+    if ".." in path.parts or path.is_absolute():
+        return False
+    return path.parts[:1] == (MEMORY_DIR,) and path.name == INDEX_NAME
+
+
 def is_machinery(relative_path: str | Path) -> bool:
     """True for generated files no patch plan may touch."""
     path = Path(relative_path)
-    return ".kasa" in path.parts or path.as_posix() == INDEX_PATH
+    return ".kasa" in path.parts or is_index_page(path)
 
 
 def is_memory_path(relative_path: str | Path) -> bool:

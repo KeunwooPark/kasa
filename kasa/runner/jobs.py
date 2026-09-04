@@ -1,8 +1,8 @@
 """The jobs Kasa actually knows how to run.
 
-The rest of `docs/DESIGN.md` §6 arrives later: `reorganize` (#33) and
-`forget` (#34). Each is a `JobSpec` registered here, and nothing else about the
-machinery changes when they do.
+The rest of `docs/DESIGN.md` §6 arrives later: `forget` (#34). It will be a
+`JobSpec` registered here, and nothing else about the machinery changes when it
+is.
 
 What a spec is registered *on* is what this module decides, and the conditions
 differ. `episode_close` needs a model and no repo — it writes to SQLite, and it
@@ -29,10 +29,11 @@ from kasa.memory.lease import LeaseError
 from kasa.memory.ltm import MemoryStore
 from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
-from kasa.runner.cron import HOURLY, NIGHTLY, Cron
+from kasa.runner.cron import HOURLY, NIGHTLY, WEEKLY, Cron
 from kasa.runner.episodes import EpisodeCloser
 from kasa.runner.promote import Promoter
 from kasa.runner.reflect import Notifier, Reflector
+from kasa.runner.reorganize import Librarian
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
 
@@ -81,6 +82,14 @@ def default_specs(
     if cfg.ltm.configured and "chat" in cfg.llm:
         specs.append(
             JobSpec(kind="reflect", handler=_reflect(cfg, store, models), cron=Cron.parse(NIGHTLY))
+        )
+    if cfg.ltm.configured and "chat" in cfg.llm:
+        specs.append(
+            JobSpec(
+                kind="reorganize",
+                handler=_reorganize(cfg, store, models),
+                cron=Cron.parse(WEEKLY),
+            )
         )
     if cfg.ltm.configured:
         # Polling the private repo is how a supervised PR becomes visible after
@@ -178,6 +187,23 @@ def _reflect(cfg: Config, store: Store, models: Models) -> JobHandler:
                 job_id=job.id,
             ).run()
         log.info("reflect: %s", result.summary())
+
+    return run
+
+
+def _reorganize(cfg: Config, store: Store, models: Models) -> JobHandler:
+    async def run(job: Job) -> None:
+        memory = await MemoryStore.open(cfg, store)
+        async with models.use() as registry:
+            result = await Librarian(
+                store,
+                memory,
+                registry,
+                settings=cfg.reorganize,
+                policy=cfg.memory,
+                job_id=job.id,
+            ).run()
+        log.info("reorganize: %s", result.summary())
 
     return run
 

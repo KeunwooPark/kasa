@@ -14,6 +14,7 @@ strict about the resulting values.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -231,6 +232,25 @@ class MemoryDoc(BaseModel):
         """Where a memory of this type belongs, by convention."""
         directory = TYPE_DIRECTORY[self.frontmatter.type]
         return f"memory/{directory}/{slug or slugify(self.frontmatter.title)}.md"
+
+
+def rewrite_links(body: str, rename: Callable[[str], str | None]) -> str:
+    """Rewrite wikilink *targets*, leaving everything else exactly as it was.
+
+    `rename` returns the new target for one it wants changed and None for one
+    it does not. Anchors and display text survive: `[[old#section|Jane]]`
+    becomes `[[new#section|Jane]]`, because the parts of a link a person wrote
+    for a reader are not the part that went stale.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        replacement = rename(target)
+        if replacement is None:
+            return match.group(0)
+        return match.group(0).replace(match.group(1), replacement, 1)
+
+    return _WIKILINK.sub(replace, body)
 
 
 def read_memory_bytes(path: Path, *, source: str) -> bytes:

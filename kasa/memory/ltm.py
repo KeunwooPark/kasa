@@ -33,7 +33,7 @@ from kasa.github import GitHubClient, PullRequestInfo, is_full_name
 from kasa.memory.bootstrap import is_bootstrapped
 from kasa.memory.document import Problem
 from kasa.memory.gitcmd import GitRepo
-from kasa.memory.layout import MANIFEST_PATH, is_memory_path
+from kasa.memory.layout import MANIFEST_PATH, is_index_page, is_memory_path
 from kasa.memory.lease import LOCK_FILENAME, Lease, stale_lease
 from kasa.memory.manifest import Manifest
 from kasa.store import Store
@@ -519,7 +519,15 @@ class MemoryStore:
         these long before they get here — but this is the function that actually
         touches the filesystem, so it checks too.
         """
-        if not is_memory_path(relative_path) and relative_path != MANIFEST_PATH:
+        # The two generated exceptions. Both are written by deterministic code
+        # only: the manifest by this class, the listings by `reorganize`. A
+        # patch plan cannot reach either — `is_machinery` refuses them in the
+        # validator, which is the check that matters, and this is the last one.
+        if (
+            not is_memory_path(relative_path)
+            and relative_path != MANIFEST_PATH
+            and not is_index_page(relative_path)
+        ):
             raise MemoryStoreError(f"{relative_path!r} is not a writable memory path")
         target = (self._repo.path / relative_path).resolve()
         root = self._repo.path.resolve()

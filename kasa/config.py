@@ -213,6 +213,43 @@ class PromoteSettings(BaseModel):
     max_attempts: int = 3
 
 
+class ReorganizeSettings(BaseModel):
+    """The weekly librarian pass: what it looks at, and how much it may do.
+
+    Every number is a bound on a job that rewrites files nobody asked it to
+    touch. The value of the corpus being in git is that a person can read what
+    changed, and a pass that rewrote a hundred files a week would take that
+    away while technically remaining reversible.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: A memory past this is a candidate to split. Well under
+    #: `memory.max_file_bytes`, which is the point at which the validator
+    #: refuses a file outright: this is "has grown into two subjects", not
+    #: "is a transcript that escaped".
+    split_above_bytes: int = 6_000
+    #: Token overlap at which two memories are worth *asking* about. Not a
+    #: judgement that they are duplicates — that costs a model call over both
+    #: whole documents — only a filter that never suggests a pair sharing no
+    #: vocabulary, so a tidy corpus costs nothing to check.
+    #:
+    #: Low, and deliberately so. Two memories written months apart about one
+    #: fact share the names and the verbs and little else, so a strict
+    #: threshold misses exactly the duplicates worth finding. The two errors
+    #: are not symmetric: a false positive costs one bounded model call that
+    #: answers `[]`, and a false negative is a duplicate that stays forever.
+    duplicate_overlap: float = 0.45
+    #: Model calls per run, across merges and splits together.
+    max_operations: int = 6
+    #: Memories that may end up in one merge. Three files about one person are
+    #: one question; a cap is what stops a corpus of near-identical notes from
+    #: becoming a single unreadable file.
+    max_cluster: int = 4
+    #: Memories read per run when looking for candidates.
+    max_candidates: int = 500
+
+
 class ReflectSettings(BaseModel):
     """The nightly pass: the journal, the salience curve, and the digest."""
 
@@ -339,6 +376,7 @@ class Config(BaseModel):
     episodes: EpisodeSettings = Field(default_factory=EpisodeSettings)
     promote: PromoteSettings = Field(default_factory=PromoteSettings)
     reflect: ReflectSettings = Field(default_factory=ReflectSettings)
+    reorganize: ReorganizeSettings = Field(default_factory=ReorganizeSettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -557,6 +595,7 @@ def render_toml(cfg: Config) -> str:
         ("episodes", cfg.episodes),
         ("promote", cfg.promote),
         ("reflect", cfg.reflect),
+        ("reorganize", cfg.reorganize),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),
