@@ -14,17 +14,30 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 **v1 — it remembers on purpose.** Long-term memory lives in a private git repo
 of Markdown files. Retrieval is lexical (FTS5 + BM25, scope-filtered) and runs
 on every turn; the agent can also search, read, and propose memories with tools.
-Consolidation is still manual — background jobs arrive in v3. See the
-[milestones](https://github.com/KeunwooPark/kasa/milestones).
+See the [milestones](https://github.com/KeunwooPark/kasa/milestones).
 
 **v2 in progress — it lives in Slack.** `kasa run --slack` connects over Socket
 Mode, so a self-hosted daemon needs no public ingress. Events land in a durable
 queue and are acknowledged immediately; one actor per thread answers them in
 order, and many threads at once.
 
+**v3/v4 in progress — it remembers automatically, and curates itself.**
 Background jobs are rows in the same database, run by a scheduler inside the
-daemon: a restart loses nothing and a crashed job runs again. The jobs that
-consolidate memory arrive in v3; today the scheduler runs `reindex`.
+daemon: a restart loses nothing and a crashed job runs again.
+
+| job | when | does |
+| --- | --- | --- |
+| `episode_close` | every 5 min | closes a thread that has gone quiet or grown long; summarizes it and extracts candidate facts |
+| `promote` | hourly | reconciles those against the corpus and commits a patch plan |
+| `reflect` | nightly | writes the day's journal, recomputes salience, surfaces contradictions |
+| `reorganize` | weekly | merges duplicates, splits oversized files, repairs links, regenerates the listings |
+| `forget` | weekly | archives what stopped mattering, and collects the archive after a grace period |
+| `reindex` | every minute | rebuilds the search index and the manifest for changed blobs |
+
+An episode is scored before anything expensive happens to it, so small talk
+closes with a summary and costs nothing further. `forget` makes no model call at
+all — every input to it is already in the corpus — and runs supervised by
+default, opening a pull request rather than pushing.
 
 Nothing writes to the memory repo without going through a typed patch plan that
 deterministic code validates first, and no delete is ever a force-push.

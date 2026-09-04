@@ -213,6 +213,31 @@ class PromoteSettings(BaseModel):
     max_attempts: int = 3
 
 
+class ForgetSettings(BaseModel):
+    """When a memory stops being worth keeping, and how slowly.
+
+    Read alongside `MemorySettings.retention_floor_days`, which is the hard
+    floor the patch validator enforces on any deletion. Nothing here can lower
+    it: these numbers only decide how much *more* cautious than that a
+    particular installation wants to be.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Salience at which a live memory moves to `archive/`. At the default
+    #: decay curve this is roughly two months with no recall at all — and
+    #: `reflect` boosts on every recall, so a memory anybody has needed since
+    #: the summer is nowhere near it.
+    archive_below: float = 0.12
+    #: How long an archived memory sits before it is collected. Comfortably
+    #: past the retention floor on purpose: the floor is the line the validator
+    #: refuses to cross, and a policy that sat exactly on it would be relying
+    #: on the last check in the system rather than on its own judgement.
+    archive_grace_days: int = 60
+    #: Files this may touch in one week, across both transitions.
+    max_per_run: int = 20
+
+
 class ReorganizeSettings(BaseModel):
     """The weekly librarian pass: what it looks at, and how much it may do.
 
@@ -377,6 +402,7 @@ class Config(BaseModel):
     promote: PromoteSettings = Field(default_factory=PromoteSettings)
     reflect: ReflectSettings = Field(default_factory=ReflectSettings)
     reorganize: ReorganizeSettings = Field(default_factory=ReorganizeSettings)
+    forget: ForgetSettings = Field(default_factory=ForgetSettings)
     slack: SlackSettings = Field(default_factory=SlackSettings)
     llm: dict[str, ProviderConfig] = Field(default_factory=dict)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -596,6 +622,7 @@ def render_toml(cfg: Config) -> str:
         ("promote", cfg.promote),
         ("reflect", cfg.reflect),
         ("reorganize", cfg.reorganize),
+        ("forget", cfg.forget),
         ("agent", cfg.agent),
         ("context", cfg.context),
         ("store", cfg.store),

@@ -1,15 +1,16 @@
 """The jobs Kasa actually knows how to run.
 
-The rest of `docs/DESIGN.md` §6 arrives later: `forget` (#34). It will be a
-`JobSpec` registered here, and nothing else about the machinery changes when it
-is.
+All of `docs/DESIGN.md` §6 is here now. Adding another changes nothing else
+about the machinery: a job is a `JobSpec` with a handler and, if it runs on its
+own, a cron.
 
 What a spec is registered *on* is what this module decides, and the conditions
 differ. `episode_close` needs a model and no repo — it writes to SQLite, and it
-is what fills the queue `promote` drains. `reindex` needs a repo and no model.
-`promote` is the one that needs both, because it is the step that crosses
-between them. A build with neither registers nothing, which is why `kasa job
-list` still works on a machine with no API key.
+is what fills the queue `promote` drains. `reindex` and `forget` need a repo
+and no model; `forget` in particular has no judgement in it at all, which is
+deliberate for the one job that removes things. `promote`, `reflect` and
+`reorganize` need both. A build with neither registers nothing, which is why
+`kasa job list` still works on a machine with no API key.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.runner.cron import HOURLY, NIGHTLY, WEEKLY, Cron
 from kasa.runner.episodes import EpisodeCloser
+from kasa.runner.forget import Collector
 from kasa.runner.promote import Promoter
 from kasa.runner.reflect import Notifier, Reflector
 from kasa.runner.reorganize import Librarian
@@ -49,6 +51,11 @@ EVERY_FIVE_MINUTES = "*/5 * * * *"
 #: at: it is how long after a conversation ends before what was said in it is
 #: something a later conversation can recall.
 PROMOTE_CRON = HOURLY
+
+#: Weekly, like `reorganize`, but not at the same hour. Both take the memory
+#: write lease, and two jobs queued for the same minute means one of them waits
+#: out a lease for no reason every week.
+FORGET_CRON = "0 5 * * 0"
 
 
 def default_specs(
@@ -92,6 +99,11 @@ def default_specs(
             )
         )
     if cfg.ltm.configured:
+        # No model, so it registers on the repo alone. Everything it decides is
+        # already in the corpus.
+        specs.append(
+            JobSpec(kind="forget", handler=_forget(cfg, store), cron=Cron.parse(FORGET_CRON))
+        )
         # Polling the private repo is how a supervised PR becomes visible after
         # a human merges it. The job syncs first and then rebuilds both derived
         # views.
@@ -204,6 +216,17 @@ def _reorganize(cfg: Config, store: Store, models: Models) -> JobHandler:
                 job_id=job.id,
             ).run()
         log.info("reorganize: %s", result.summary())
+
+    return run
+
+
+def _forget(cfg: Config, store: Store) -> JobHandler:
+    async def run(job: Job) -> None:
+        memory = await MemoryStore.open(cfg, store)
+        result = await Collector(
+            store, memory, settings=cfg.forget, policy=cfg.memory, job_id=job.id
+        ).run()
+        log.info("forget: %s", result.summary())
 
     return run
 
