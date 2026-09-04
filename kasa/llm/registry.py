@@ -19,7 +19,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from kasa.errors import ConfigError, ContentFilterError, ContextOverflowError, LLMError
+from kasa.errors import (
+    BudgetExceededError,
+    ConfigError,
+    ContentFilterError,
+    ContextOverflowError,
+    LLMError,
+)
 from kasa.llm.base import LLMProvider
 from kasa.llm.cost import CostMeter, PriceBook
 from kasa.llm.types import ChatRequest, ChatResponse, Delta, MessageStop, Usage
@@ -93,6 +99,8 @@ class ProviderRegistry:
         tag: str | None = None,
         session_id: str | None = None,
     ) -> ChatResponse:
+        await self._guard_budget(role)
+
         async def call(provider: LLMProvider) -> ChatResponse:
             started = time.monotonic()
             try:
@@ -138,6 +146,7 @@ class ProviderRegistry:
         failure propagates rather than silently restarting on another provider
         and duplicating text.
         """
+        await self._guard_budget(role)
         providers = self.chain(role)
         last: LLMError | None = None
 
@@ -197,6 +206,14 @@ class ProviderRegistry:
                 if id(provider) not in seen:
                     seen.add(id(provider))
                     await provider.aclose()
+
+    async def _guard_budget(self, role: ModelRole) -> None:
+        # Conversation is deliberately the last service standing. Utility work
+        # is optional or recoverable, so it stops at the configured ceiling;
+        # the scheduler independently pauses background jobs, including those
+        # whose quality requires the chat model.
+        if role is ModelRole.UTILITY and await self._meter.daily_ceiling_reached():
+            raise BudgetExceededError("daily USD ceiling reached; utility calls are paused")
 
     # -- policy --------------------------------------------------------------
 

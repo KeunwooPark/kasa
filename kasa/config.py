@@ -429,6 +429,12 @@ class PriceSettings(BaseModel):
     cache_write: float = 0.0
 
 
+class BudgetSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    daily_usd_ceiling: float | None = Field(default=None, ge=0)
+
+
 class RetrySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -457,6 +463,7 @@ class Config(BaseModel):
     context: ContextSettings = Field(default_factory=ContextSettings)
     store: StoreSettings = Field(default_factory=StoreSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
+    budget: BudgetSettings = Field(default_factory=BudgetSettings)
     #: USD per million tokens, keyed by model-name prefix. Empty by default:
     #: a stale built-in price table is worse than an absent one.
     pricing: dict[str, PriceSettings] = Field(default_factory=dict)
@@ -492,6 +499,8 @@ class Config(BaseModel):
         meter = CostMeter(
             self.price_book(),
             sink=store.record_call if store is not None else _null_sink,
+            daily_usd_ceiling=self.budget.daily_usd_ceiling,
+            spent_since=store.spend_since if store is not None else None,
         )
         return ProviderRegistry(self.chains(), meter=meter, retry=self.retry.to_policy())
 
@@ -675,6 +684,7 @@ def render_toml(cfg: Config) -> str:
         ("context", cfg.context),
         ("store", cfg.store),
         ("retry", cfg.retry),
+        ("budget", cfg.budget),
     ):
         lines += _table(name, section)
     for model, price in cfg.pricing.items():

@@ -326,14 +326,32 @@ class Store:
             clause = "WHERE created_at >= ?" if since else ""
             params: tuple[Any, ...] = (since,) if since else ()
             async with self._conn.execute(
-                f"SELECT role, model, COUNT(*) AS calls,"
+                f"SELECT substr(created_at, 1, 10) AS day, role,"
+                f" CASE WHEN instr(COALESCE(tag, ''), '.') > 0"
+                f" THEN substr(tag, 1, instr(tag, '.') - 1)"
+                f" ELSE COALESCE(tag, 'untagged') END AS job_kind,"
+                f" model, COUNT(*) AS calls,"
                 f" SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,"
                 f" SUM(cache_read_tokens) AS cache_read_tokens,"
                 f" SUM(cost_usd) AS cost_usd"
-                f" FROM llm_calls {clause} GROUP BY role, model ORDER BY calls DESC",
+                f" FROM llm_calls {clause}"
+                f" GROUP BY day, role, job_kind, model"
+                f" ORDER BY day DESC, role, job_kind, model",
                 params,
             ) as cur:
                 return [dict(row) for row in await cur.fetchall()]
+
+    async def spend_since(self, day: str) -> float:
+        """Priced spend since the start of a UTC date."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) AS spent FROM llm_calls WHERE created_at >= ?",
+                (day,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+            return float(row["spent"]) if row else 0.0
 
     async def session_cost_summary(self, session_id: str) -> dict[str, Any]:
         """Token, spend, and prompt-cache health for one conversation."""

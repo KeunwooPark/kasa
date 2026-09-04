@@ -219,6 +219,31 @@ async def test_a_one_shot_runs_and_the_row_says_so(store: Store) -> None:
     assert row["finished_at"] is not None
 
 
+async def test_background_jobs_remain_pending_while_the_cost_gate_is_closed(
+    store: Store,
+) -> None:
+    paused = True
+    ran: list[Job] = []
+
+    async def gate() -> bool:
+        return paused
+
+    scheduler = Scheduler(
+        store,
+        [JobSpec(kind="reflect", handler=records(ran))],
+        pause_when=gate,
+    )
+    job_id = await scheduler.trigger("reflect")
+
+    assert await scheduler._drainer.drain_once() == 0
+    assert ran == []
+    assert (await scheduler._row(job_id))["state"] == "pending"
+
+    paused = False
+    assert await scheduler._drainer.drain_once() == 1
+    assert [job.kind for job in ran] == ["reflect"]
+
+
 async def test_a_payload_reaches_the_handler(store: Store) -> None:
     ran: list[Job] = []
     scheduler = Scheduler(store, [JobSpec(kind="reindex", handler=records(ran))])

@@ -292,7 +292,7 @@ def test_the_cost_table_does_not_truncate_the_model_name(deep: Path) -> None:
     # Folded, like `doctor`'s detail column: the name survives across two
     # lines of the same cell, so the column is read back column-wise.
     cells = [
-        line.split("\u2502")[2].strip()
+        line.split("\u2502")[4].strip()
         for line in result.output.splitlines()
         if line.count("\u2502") > 2
     ]

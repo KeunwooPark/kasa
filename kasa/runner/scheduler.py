@@ -66,6 +66,7 @@ class Job:
 
 
 JobHandler = Callable[[Job], Awaitable[None]]
+PauseGate = Callable[[], Awaitable[bool]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +105,13 @@ class JobQueue:
         lease_ttl: float = DEFAULT_LEASE_TTL,
         backoff: Backoff = DEFAULT_BACKOFF,
         retention: timedelta = DONE_RETENTION,
+        pause_when: PauseGate | None = None,
     ) -> None:
         self._store = store
         self._lease_ttl = lease_ttl
         self._backoff = backoff
         self._retention = retention
+        self._pause_when = pause_when
         self._kinds: set[str] = set()
         self._subscribers: list[Callable[[], None]] = []
 
@@ -150,6 +153,8 @@ class JobQueue:
     async def lease(
         self, *, limit: int = 1, exclude: Sequence[Any] = (), only: Sequence[Any] = ()
     ) -> list[Job]:
+        if self._pause_when is not None and await self._pause_when():
+            return []
         now = datetime.now(UTC)
         rows = await self._store.lease_jobs(
             kinds=self.kinds,
@@ -227,11 +232,12 @@ class Scheduler:
         lease_ttl: float = DEFAULT_LEASE_TTL,
         backoff: Backoff = DEFAULT_BACKOFF,
         reclaim_on_start: bool = True,
+        pause_when: PauseGate | None = None,
     ) -> None:
         self._store = store
         self._specs: dict[str, JobSpec] = {}
         self._schedule_failures: dict[str, int] = {}
-        self.queue = JobQueue(store, lease_ttl=lease_ttl, backoff=backoff)
+        self.queue = JobQueue(store, lease_ttl=lease_ttl, backoff=backoff, pause_when=pause_when)
         self._tick_interval = tick_interval
         # Two at a time by default: these call a frontier model, and the point
         # of running them in the background is that they stay out of the way of

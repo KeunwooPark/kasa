@@ -4,7 +4,13 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from kasa.errors import AuthError, ContextOverflowError, LLMError, TransientError
+from kasa.errors import (
+    AuthError,
+    BudgetExceededError,
+    ContextOverflowError,
+    LLMError,
+    TransientError,
+)
 from kasa.llm.cost import CallRecord, CostMeter, Price, PriceBook
 from kasa.llm.registry import ModelRole, ProviderRegistry, RetryPolicy
 from kasa.llm.types import (
@@ -204,6 +210,21 @@ async def test_unpriced_models_still_record_tokens() -> None:
 
     assert meter.total.input_tokens == 10
     assert meter.total_usd == 0.0
+
+
+async def test_ceiling_degrades_utility_before_chat() -> None:
+    async def over_budget(_day: str) -> float:
+        return 10.0
+
+    meter = CostMeter(PriceBook(), daily_usd_ceiling=10.0, spent_since=over_budget)
+    provider = FakeProvider("p1", [ok("chat still works")])
+    reg = registry(provider, meter=meter)
+
+    with pytest.raises(BudgetExceededError, match="utility calls are paused"):
+        await reg.complete(ModelRole.UTILITY, REQUEST)
+
+    assert (await reg.complete(ModelRole.CHAT, REQUEST)).text == "chat still works"
+    assert provider.calls == 1
 
 
 async def test_cache_hit_rate_is_reported_per_session() -> None:

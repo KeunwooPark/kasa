@@ -271,7 +271,9 @@ def cost(config: ConfigOption = None) -> None:
                 console.print("[dim]no calls recorded yet[/dim]")
                 return
             table = Table(show_header=True)
+            table.add_column("day", no_wrap=True)
             table.add_column("role", no_wrap=True)
+            table.add_column("job", no_wrap=True)
             # Folded, not truncated, for the same reason `doctor` folds its
             # detail: this column is the row's identity, and a provider's
             # canonical id is long. Truncated at rich's 80-column fallback,
@@ -285,7 +287,9 @@ def cost(config: ConfigOption = None) -> None:
             for row in rows:
                 usd = row["cost_usd"]
                 table.add_row(
+                    row["day"],
                     row["role"],
+                    row["job_kind"],
                     row["model"],
                     str(row["calls"]),
                     str(row["input_tokens"] or 0),
@@ -688,7 +692,11 @@ async def _serve_slack(cfg: Config) -> None:
         adapter = await SlackAdapter.connect(agent, cfg.slack)
         # The daemon is where background work belongs: it is the process that
         # stays up, and `kasa run` on a terminal is not.
-        scheduler = Scheduler(agent.store, default_specs(cfg, agent.store, agent.registry))
+        scheduler = Scheduler(
+            agent.store,
+            default_specs(cfg, agent.store, agent.registry),
+            pause_when=agent.registry.meter.daily_ceiling_reached,
+        )
         console.print(
             f"[green]Connected[/green] to Slack as {adapter.context.bot_user_id}"
             f" in {adapter.context.team_id}. Ctrl-C to stop."

@@ -118,6 +118,7 @@ async def run_init(
         context=cfg.context,
         store=cfg.store,
         retry=cfg.retry,
+        budget=cfg.budget,
         pricing=cfg.pricing,
     )
     write_config(cfg, target)

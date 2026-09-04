@@ -86,6 +86,10 @@ class ProviderProtocolError(LLMError):
     """
 
 
+class BudgetExceededError(LLMError):
+    """A non-interactive model call was stopped by the daily spend ceiling."""
+
+
 class ToolError(KasaError):
     """A tool could not be dispatched, or failed in a way the agent should see."""
 
