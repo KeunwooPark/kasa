@@ -577,6 +577,61 @@ class Store:
         ):
             return [dict(row) for row in await cur.fetchall()]
 
+    async def episode_summaries(
+        self, *, since: str, until: str, scope: str = "workspace"
+    ) -> list[dict[str, Any]]:
+        """Closed episodes from one window and one audience, oldest first.
+
+        Scoped, and the caller says to what. The one reader is the nightly
+        journal, which is a file in the repo: summarizing a DM into it would
+        put a private conversation somewhere the whole workspace can read.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT e.id, e.summary, e.signal_score, e.ended_at, s.scope FROM episodes e"
+                " JOIN sessions s ON s.id = e.session_id"
+                " WHERE e.state != 'open' AND e.summary IS NOT NULL AND s.scope = ?"
+                " AND e.ended_at >= ? AND e.ended_at < ? ORDER BY e.ended_at",
+                (scope, since, until),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+        # -- recall telemetry ----------------------------------------------------
+
+    async def record_memory_hits(self, memory_ids: Sequence[str]) -> None:
+        """Note that these memories were recalled into a conversation."""
+        if not memory_ids:
+            return
+        now = _now()
+        async with self._serial:
+            await self._conn.executemany(
+                "INSERT INTO memory_hits (memory_id, hit_at) VALUES (?, ?)",
+                [(memory_id, now) for memory_id in memory_ids],
+            )
+            await self._conn.commit()
+
+    async def memory_hits_since(self, since: str) -> dict[str, int]:
+        """How often each memory was recalled since `since`."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT memory_id, COUNT(*) AS hits FROM memory_hits WHERE hit_at >= ?"
+                " GROUP BY memory_id",
+                (since,),
+            ) as cur,
+        ):
+            return {str(row["memory_id"]): int(row["hits"]) for row in await cur.fetchall()}
+
+    async def purge_memory_hits(self, *, before: str) -> int:
+        """Drop hits older than the window `reflect` reads. They have already
+        been folded into a salience that lives in the repo."""
+        async with self._serial:
+            cur = await self._conn.execute("DELETE FROM memory_hits WHERE hit_at < ?", (before,))
+            await self._conn.commit()
+            return int(cur.rowcount)
+
     async def note_observation_attempt(self, ids: Sequence[str]) -> None:
         """Record that promotion was tried on these and did not land."""
         if not ids:

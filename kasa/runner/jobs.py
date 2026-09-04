@@ -1,8 +1,8 @@
 """The jobs Kasa actually knows how to run.
 
-The rest of `docs/DESIGN.md` §6 arrives later: `reflect` (#32), `reorganize`
-(#33), `forget` (#34). Each is a `JobSpec` registered here, and nothing else
-about the machinery changes when they do.
+The rest of `docs/DESIGN.md` §6 arrives later: `reorganize` (#33) and
+`forget` (#34). Each is a `JobSpec` registered here, and nothing else about the
+machinery changes when they do.
 
 What a spec is registered *on* is what this module decides, and the conditions
 differ. `episode_close` needs a model and no repo — it writes to SQLite, and it
@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from kasa.adapters.slack.notify import post_message
 from kasa.config import Config
 from kasa.llm.registry import ProviderRegistry
 from kasa.llm.tokens import default_tokenizer
@@ -27,9 +29,10 @@ from kasa.memory.lease import LeaseError
 from kasa.memory.ltm import MemoryStore
 from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
-from kasa.runner.cron import HOURLY, Cron
+from kasa.runner.cron import HOURLY, NIGHTLY, Cron
 from kasa.runner.episodes import EpisodeCloser
 from kasa.runner.promote import Promoter
+from kasa.runner.reflect import Notifier, Reflector
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
 from kasa.store import Store
 
@@ -74,6 +77,10 @@ def default_specs(
                 handler=_promote(cfg, store, models),
                 cron=Cron.parse(PROMOTE_CRON),
             )
+        )
+    if cfg.ltm.configured and "chat" in cfg.llm:
+        specs.append(
+            JobSpec(kind="reflect", handler=_reflect(cfg, store, models), cron=Cron.parse(NIGHTLY))
         )
     if cfg.ltm.configured:
         # Polling the private repo is how a supervised PR becomes visible after
@@ -155,6 +162,49 @@ def _promote(cfg: Config, store: Store, models: Models) -> JobHandler:
         log.info("promote: %s", result.summary())
 
     return run
+
+
+def _reflect(cfg: Config, store: Store, models: Models) -> JobHandler:
+    async def run(job: Job) -> None:
+        memory = await MemoryStore.open(cfg, store)
+        async with models.use() as registry:
+            result = await Reflector(
+                store,
+                memory,
+                registry,
+                settings=cfg.reflect,
+                policy=cfg.memory,
+                notify=_digest_sink(cfg),
+                job_id=job.id,
+            ).run()
+        log.info("reflect: %s", result.summary())
+
+    return run
+
+
+def _digest_sink(cfg: Config) -> Notifier | None:
+    """Where the nightly digest goes, if anywhere.
+
+    None unless both halves are configured, and it is not an error to have
+    neither: the digest is the one optional part of `reflect`, and a job that
+    refused to run because nobody wanted a Slack message would be refusing to
+    do the work that matters.
+    """
+    channel = cfg.reflect.digest_channel
+    token = os.environ.get(cfg.slack.bot_token_env or "")
+    if not channel:
+        return None
+    if not token:
+        log.warning(
+            "reflect: a digest channel is configured but %s is not set; nothing will be posted",
+            cfg.slack.bot_token_env or "the Slack bot token env var",
+        )
+        return None
+
+    async def post(text: str) -> None:
+        await post_message(token, channel, text)
+
+    return post
 
 
 def _reindex(cfg: Config, store: Store) -> JobHandler:

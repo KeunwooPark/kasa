@@ -1027,3 +1027,39 @@ async def test_an_explicit_search_still_counts_a_pinned_hit_against_its_limit(
 
     assert len(asked.kept) == 3, "no free slot for the pinned hits"
     assert any(c.pinned for c in asked.kept), "and they did compete, rather than being excluded"
+
+
+# -- recall telemetry ---------------------------------------------------------
+
+
+async def test_a_recall_is_recorded_when_the_retriever_serves_a_conversation(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """`reflect` boosts the salience of memories that earned their place. It
+    needs a record of them having been needed."""
+    result = await retriever(store, tokenizer, record_hits=True).retrieve(
+        "who owns the deploy pipeline?"
+    )
+
+    hits = await store.memory_hits_since("2000-01-01")
+    assert hits, "something was recalled and nothing said so"
+    assert set(hits) <= set(result.memory_ids)
+
+
+async def test_one_memory_packed_as_several_chunks_is_one_recall(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    await retriever(store, tokenizer, record_hits=True).retrieve("deploy pipeline runbook")
+
+    assert all(count == 1 for count in (await store.memory_hits_since("2000-01-01")).values())
+
+
+async def test_a_retriever_that_is_not_a_conversation_records_nothing(
+    corpus: dict[str, str], store: Store, tokenizer: Tokenizer
+) -> None:
+    """`kasa why` traces what *would* be recalled and `promote` reads
+    competition for a plan. Counting either would let a debugging session
+    decide what stays in long-term memory."""
+    await retriever(store, tokenizer).retrieve("who owns the deploy pipeline?")
+
+    assert await store.memory_hits_since("2000-01-01") == {}

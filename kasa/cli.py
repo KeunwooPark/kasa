@@ -596,6 +596,12 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
                     tokenizer=tokenizer,
                     budget_tokens=cfg.context.tokens_for_retrieval(),
                     scrub=scrub,
+                    # The one retriever that serves conversations, so the one
+                    # that counts a recall. `kasa why` traces what *would* be
+                    # recalled and `promote` reads competition for a plan;
+                    # counting either would let a debugging session decide what
+                    # stays in long-term memory.
+                    record_hits=True,
                 )
                 tools += memory_tools(retriever=retriever, memory=memory, store=store)
 

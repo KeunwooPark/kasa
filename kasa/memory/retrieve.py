@@ -318,6 +318,7 @@ class Retriever:
         limit: int = DEFAULT_LIMIT,
         rewriter: Rewriter | None = None,
         scrub: Scrubber | None = None,
+        record_hits: bool = False,
         now: datetime | None = None,
     ) -> None:
         self._store = store
@@ -329,6 +330,11 @@ class Retriever:
         # config — every caller that builds a prompt passes one, and there is a
         # test that says so.
         self._scrub = scrub
+        # Off by default, because most retrievers are not conversations. `kasa
+        # why` traces what *would* be recalled and `promote` reads competition
+        # for a plan; counting either as a recall would let a background job
+        # and a debugging session decide what stays in long-term memory.
+        self._record_hits = record_hits
         self._now = now
 
     async def retrieve(
@@ -388,12 +394,20 @@ class Retriever:
         if explain:
             trace.denied = await self._denied(match, scope)
 
-        return self._pack(
+        retrieval = self._pack(
             ranked,
             trace,
             limit if limit is not None else self._limit,
             reserve_pinned=include_pinned,
         )
+        if self._record_hits:
+            # What was packed, not what was ranked: a memory that lost to the
+            # budget was not recalled, and salience is meant to measure being
+            # useful rather than being nearly useful. Deduplicated because one
+            # memory can contribute several chunks to one prompt, and that is
+            # one recall.
+            await self._store.record_memory_hits(list(dict.fromkeys(retrieval.memory_ids)))
+        return retrieval
 
     # -- query ---------------------------------------------------------------
 
