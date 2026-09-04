@@ -294,6 +294,12 @@ async def _configure_providers(
             prompter, "chat", current.get("chat"), model_discovery=model_discovery
         )
     }
+    has_extra_roles = any(role in current for role in _OPTIONAL_ROLES)
+    if not prompter.confirm(
+        "Use different models for background jobs or embeddings?",
+        default=has_extra_roles,
+    ):
+        return providers
     for role, hint in _OPTIONAL_ROLES.items():
         prompter.say(f"The {role} model is optional — {hint}.")
         if prompter.confirm(f"Configure the {role} model?", default=role in current):

@@ -62,8 +62,7 @@ def bootstrap_with_init(rig: KasaRig, tmp_path: Path) -> Path:
         "\n"  # keep local fake-provider URL
         "\n"  # keep key environment variable
         "\n"  # keep model (from discovery when available)
-        "n\n"  # no utility provider
-        "n\n"  # no embedding provider
+        "n\n"  # no separate background or embedding models
         "n\n"  # no Slack
         "y\n"  # push the bootstrap commit
     )
