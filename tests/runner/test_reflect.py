@@ -503,3 +503,109 @@ async def test_a_journal_the_model_would_not_write_does_not_stop_the_rescore(
     assert not result.journalled
     assert result.rescored == 1
     assert MemoryDoc.parse((clone / path).read_text()).frontmatter.salience < 0.2
+
+
+# -- feedback ----------------------------------------------------------------
+
+
+async def endorsed(store: Store, memory_id: str, *, kind: str = "up", by: int = 1) -> None:
+    answer = await store.record_answer(
+        source="slack", external_id=f"slack:T:C:{memory_id}", memory_ids=[memory_id]
+    )
+    for n in range(by):
+        await store.add_memory_feedback(
+            memory_id=memory_id, kind=kind, answer_id=answer, author=f"U{n}"
+        )
+
+
+async def test_a_memory_somebody_vouched_for_outranks_one_merely_recalled(
+    clone: Path, store: Store
+) -> None:
+    """The whole point of #36. A recall says the ranker picked it; a thumbs-up
+    says a person read what came of it and agreed."""
+    vouched = MemoryDoc.new(type="fact", title="Vouched for", body="Somebody said so.")
+    vouched = vouched.model_copy(
+        update={"frontmatter": vouched.frontmatter.model_copy(update={"updated": aged(60)})}
+    )
+    recalled = MemoryDoc.new(type="fact", title="Merely recalled", body="Same age.")
+    recalled = recalled.model_copy(
+        update={"frontmatter": recalled.frontmatter.model_copy(update={"updated": aged(60)})}
+    )
+    vouched_path = write_memory(clone, vouched)
+    recalled_path = write_memory(clone, recalled)
+    await store.record_memory_hits([recalled.id])
+    await store.record_memory_hits([vouched.id])
+    await endorsed(store, vouched.id)
+
+    await reflector_for(clone, store, Scripted()).run(now=NIGHT)
+
+    assert (
+        MemoryDoc.parse((clone / vouched_path).read_text()).frontmatter.salience
+        > MemoryDoc.parse((clone / recalled_path).read_text()).frontmatter.salience
+    )
+
+
+async def test_a_memory_marked_wrong_loses_confidence(clone: Path, store: Store) -> None:
+    doc = MemoryDoc.new(type="fact", title="Doubted", body="Somebody says not.")
+    path = write_memory(clone, doc)
+    await endorsed(store, doc.id, kind="down")
+
+    result = await reflector_for(clone, store, Scripted()).run(now=NIGHT)
+
+    assert result.suspected == 1
+    assert MemoryDoc.parse((clone / path).read_text()).frontmatter.confidence == 0.56
+
+
+async def test_one_cross_lowers_confidence_once_however_many_nights_run(
+    clone: Path, store: Store
+) -> None:
+    """The asymmetry with salience. Confidence is not derived from anything, so
+    re-applying the same vote nightly would walk it to zero in a fortnight."""
+    doc = MemoryDoc.new(type="fact", title="Doubted", body="Somebody says not.")
+    path = write_memory(clone, doc)
+    await endorsed(store, doc.id, kind="down")
+    await reflector_for(clone, store, Scripted()).run(now=NIGHT)
+    after_one = MemoryDoc.parse((clone / path).read_text()).frontmatter.confidence
+
+    await reflector_for(clone, store, Scripted()).run(now=NIGHT + timedelta(days=1))
+
+    assert MemoryDoc.parse((clone / path).read_text()).frontmatter.confidence == after_one
+
+
+async def test_a_cross_does_not_archive_or_delete_the_memory(clone: Path, store: Store) -> None:
+    """One person disagreeing with one answer is a reason to trust a memory
+    less. The memory may have been right and the answer wrong about which
+    memory to use, and the review is where that judgement belongs."""
+    doc = MemoryDoc.new(type="fact", title="Doubted", body="Somebody says not.")
+    path = write_memory(clone, doc)
+    await endorsed(store, doc.id, kind="down")
+
+    await reflector_for(clone, store, Scripted()).run(now=NIGHT)
+
+    assert (clone / path).exists()
+    assert MemoryDoc.parse((clone / path).read_text()).frontmatter.confidence > 0
+
+
+async def test_a_cross_on_a_memory_that_is_gone_is_spent_rather_than_retried(
+    clone: Path, store: Store
+) -> None:
+    """It was merged away or deleted. There is nothing left to lower, and
+    leaving the row pending means reading it again every night forever."""
+    await endorsed(store, "mem_01K8XQ0000000000000000009", kind="down")
+
+    result = await reflector_for(clone, store, Scripted()).run(now=NIGHT)
+
+    assert result.suspected == 0
+    assert await store.unapplied_feedback("down") == []
+
+
+async def test_confidence_updates_are_bounded_like_salience_ones(clone: Path, store: Store) -> None:
+    for n in range(5):
+        doc = MemoryDoc.new(type="fact", title=f"Doubted {n}", body="Somebody says not.")
+        write_memory(clone, doc)
+        await endorsed(store, doc.id, kind="down")
+
+    result = await reflector_for(clone, store, Scripted(), max_suspect_updates=2).run(now=NIGHT)
+
+    assert result.suspected == 2
+    assert len(await store.unapplied_feedback("down")) == 3, "the rest keep their turn"

@@ -18,10 +18,13 @@ from kasa.adapters.slack.events import (
     Changed,
     Decision,
     Ignored,
+    Reacted,
     SlackContext,
     normalize,
+    reaction,
     scope_for,
 )
+from kasa.config import SlackSettings
 
 BOT = "U0KASA"
 TEAM = "T0TEAM"
@@ -610,3 +613,131 @@ def test_asking_for_the_adapter_is_what_needs_the_extra() -> None:
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
 
     assert done.returncode == 0, done.stderr
+
+
+# -- reactions ----------------------------------------------------------------
+
+#: The default map, which is what an install with no `[slack] reactions` gets.
+VERDICTS = SlackSettings().reactions
+
+
+def reacted(
+    emoji: str = "+1",
+    *,
+    on: str = "1700000001.000000",
+    channel: str = "D1",
+    user: str = HUMAN,
+    item_user: str | None = BOT,
+    removed: bool = False,
+    **extra: Any,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "type": "reaction_removed" if removed else "reaction_added",
+        "user": user,
+        "reaction": emoji,
+        "item": {"type": "message", "channel": channel, "ts": on},
+        "event_ts": "1700000009.000000",
+    }
+    if item_user is not None:
+        body["item_user"] = item_user
+    return body | extra
+
+
+def approved(decision: Decision) -> Reacted:
+    assert isinstance(decision, Reacted), decision
+    return decision
+
+
+async def test_a_thumbs_up_names_the_answer_it_is_on() -> None:
+    """The answer, not the question: a reaction names the message it sits on,
+    and the message it sits on is Kasa's reply."""
+    decision = approved(reaction(reacted(), context=context(), verdicts=VERDICTS))
+
+    assert decision.external_id == f"slack:{TEAM}:D1:1700000001.000000"
+    assert decision.verdict == "up"
+    assert decision.author == HUMAN
+    assert not decision.removed
+
+
+async def test_a_cross_is_a_down_vote() -> None:
+    assert approved(reaction(reacted("x"), context=context(), verdicts=VERDICTS)).verdict == "down"
+
+
+async def test_removing_a_reaction_is_a_retraction_not_a_vote_the_other_way() -> None:
+    decision = approved(reaction(reacted(removed=True), context=context(), verdicts=VERDICTS))
+
+    assert decision.removed and decision.verdict == "up"
+
+
+async def test_a_skin_tone_is_still_the_same_thumb() -> None:
+    """Slack appends `::skin-tone-3` to the name, so a configured `+1` would
+    match the default-toned thumb and silently ignore everybody else's."""
+    decision = approved(reaction(reacted("+1::skin-tone-5"), context=context(), verdicts=VERDICTS))
+
+    assert decision.verdict == "up"
+
+
+async def test_an_emoji_nobody_mapped_means_nothing() -> None:
+    """A 🎉 is not a verdict, and the whole value of the signal is that what
+    counts as one was chosen."""
+    decision = reaction(reacted("tada"), context=context(), verdicts=VERDICTS)
+
+    assert isinstance(decision, Ignored)
+    assert "not mapped" in decision.reason
+
+
+async def test_the_mapping_is_configurable() -> None:
+    """A workspace where ✅ means "I have actioned this" should be able to say
+    so, rather than have memory boosted on the strength of a checkbox."""
+    theirs = SlackSettings(reactions={"eyes": "down"}).reactions
+
+    assert approved(reaction(reacted("eyes"), context=context(), verdicts=theirs)).verdict == "down"
+    assert isinstance(reaction(reacted("+1"), context=context(), verdicts=theirs), Ignored)
+
+
+async def test_a_reaction_on_somebody_elses_message_is_not_feedback() -> None:
+    """People react to each other all day. Only a reaction on one of Kasa's own
+    answers says anything about memory."""
+    decision = reaction(reacted(item_user=HUMAN), context=context(), verdicts=VERDICTS)
+
+    assert isinstance(decision, Ignored)
+
+
+async def test_kasas_own_reaction_is_not_feedback() -> None:
+    decision = reaction(reacted(user=BOT), context=context(), verdicts=VERDICTS)
+
+    assert isinstance(decision, Ignored)
+
+
+async def test_a_reaction_on_a_file_is_not_feedback() -> None:
+    body = reacted() | {"item": {"type": "file", "file": "F0123"}}
+
+    assert isinstance(reaction(body, context=context(), verdicts=VERDICTS), Ignored)
+
+
+async def test_a_reaction_outside_the_allowlist_is_ignored() -> None:
+    decision = reaction(
+        reacted(channel="C0OTHER"), context=context(allowed=frozenset({"C1"})), verdicts=VERDICTS
+    )
+
+    assert isinstance(decision, Ignored)
+    assert "allowlist" in decision.reason
+
+
+async def test_a_message_is_not_a_reaction() -> None:
+    assert isinstance(reaction(dm(), context=context(), verdicts=VERDICTS), Ignored)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"type": "reaction_added", "reaction": "+1", "item": {"type": "message", "ts": "1.0"}},
+        {"type": "reaction_added", "reaction": "+1", "user": HUMAN, "item": "nope"},
+        {"type": "reaction_added", "user": HUMAN, "item": {"type": "message", "channel": "D1"}},
+    ],
+    ids=["no user or channel", "item is not an object", "no ts"],
+)
+async def test_a_reaction_that_names_nothing_is_ignored(body: dict[str, Any]) -> None:
+    """This runs on the ack path, where an exception is an event lost with
+    nothing recording that it arrived."""
+    assert isinstance(reaction(body, context=context(), verdicts=VERDICTS), Ignored)

@@ -20,12 +20,22 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from kasa.adapters.slack.events import Changed, Ignored, SlackContext, normalize
+from kasa.adapters.slack.events import (
+    Accepted,
+    Changed,
+    Ignored,
+    Reacted,
+    SlackContext,
+    message_id,
+    normalize,
+    reaction,
+)
 from kasa.adapters.slack.identity import Directory
 from kasa.adapters.slack.stream import DEFAULT_INTERVAL, LiveMessage, SlackRateLimited
 from kasa.config import SlackSettings
 from kasa.core.agent import Agent, AgentResult
 from kasa.core.events import InboundEvent
+from kasa.core.feedback import Feedback
 from kasa.core.revise import Reviser
 from kasa.core.runtime import DEFAULT_CONCURRENCY, Reply, Runtime, one_message
 from kasa.errors import ConfigError
@@ -59,14 +69,17 @@ class SlackAdapter:
         concurrency: int = DEFAULT_CONCURRENCY,
         stream: bool = True,
         interval: float = DEFAULT_INTERVAL,
+        reactions: Mapping[str, str] | None = None,
     ) -> None:
         self._app = app
         self._context = context
         self._app_token = app_token
         self._interval = interval
+        self._reactions = dict(reactions if reactions is not None else SlackSettings().reactions)
         self._unfinished: dict[str, str] = {}
         self.directory = Directory(agent.store, self._users_info, team_id=context.team_id)
         self.reviser = Reviser(agent.store)
+        self.feedback = Feedback(agent.store)
         self.runtime = Runtime(
             agent,
             self.open_reply if stream else one_message(self.reply),
@@ -103,6 +116,7 @@ class SlackAdapter:
             app_token=_token(settings.app_token_env, "app"),
             concurrency=concurrency,
             stream=settings.stream,
+            reactions=settings.reactions,
         )
 
     @property
@@ -148,12 +162,62 @@ class SlackAdapter:
         if isinstance(decision, Changed):
             await self.revise(decision)
             return
+        if not isinstance(decision, Accepted):
+            # `normalize` reads messages and never returns a reaction, but the
+            # decision type covers every surface event; saying so here is what
+            # keeps a future one from falling through into `submit` and being
+            # answered.
+            log.debug("a message decision this path does not handle: %s", decision)
+            return
         enqueued = await self.runtime.submit(decision.event)
         if enqueued.duplicate:
             # Either Slack re-sent the event, or the same message reached us as
             # both `app_mention` and `message`. Both are normal; both are the
             # unique constraint doing its job.
             log.debug("slack sent %s again; already queued", decision.event.external_id)
+
+    async def on_reaction(self, event: dict[str, Any]) -> None:
+        """An emoji on one of Kasa's answers, which is the whole feedback loop.
+
+        On the ack path with the revisions, and for the same reasons: a lookup
+        and an INSERT, no model and no network, and it must not reach the agent
+        — a 👍 is not a question.
+        """
+        try:
+            decision = reaction(event, context=self._context, verdicts=self._reactions)
+        except Exception:
+            log.exception("could not read a slack reaction (%r)", event.get("reaction"))
+            return
+        if not isinstance(decision, Reacted):
+            log.debug("ignoring a slack reaction: %s", getattr(decision, "reason", decision))
+            return
+
+        act = self.feedback.withdraw if decision.removed else self.feedback.record
+        outcome = await act(
+            source="slack",
+            external_id=decision.external_id,
+            verdict=decision.verdict,
+            author=decision.author,
+        )
+        log.debug("reaction on %s: %s", decision.external_id, outcome.summary())
+
+    async def remember_answer(self, event: InboundEvent, result: AgentResult, ts: str) -> None:
+        """Note which memories produced the message just posted at `ts`.
+
+        Recorded whatever it used, including nothing: a reaction on an answer
+        that recalled no memory is still a fact about the answer, and a row
+        that exists with an empty list is how a later 👍 tells "nothing to
+        boost" from "not one of ours" (#36).
+        """
+        if not event.channel or not ts:
+            return
+        await self.runtime.store.record_answer(
+            source="slack",
+            external_id=message_id(self._context.team_id, event.channel, ts),
+            memory_ids=result.memory_ids,
+            session_id=event.session_id,
+            scope=event.scope,
+        )
 
     async def revise(self, decision: Changed) -> None:
         """Apply an edit or a deletion, here on the ack path rather than behind
@@ -228,9 +292,10 @@ class SlackAdapter:
         if not text or not event.channel:
             log.warning("nothing to post for %s", event.external_id)
             return
-        await self.client.chat_postMessage(
+        posted = await self.client.chat_postMessage(
             channel=event.channel, thread_ts=event.reply_to, text=text
         )
+        await self.remember_answer(event, result, str(posted.get("ts") or ""))
 
     def _remember(self, external_id: str, ts: str) -> None:
         self._unfinished[external_id] = ts
@@ -272,6 +337,15 @@ class SlackAdapter:
         for name in ("app_mention", "message"):
             self._app.event(name)(listener)
 
+        async def reacted(event: dict[str, Any]) -> None:
+            await self.on_reaction(event)
+
+        # Their own listener, because a reaction is not a message: it has no
+        # text and nothing to answer, and everything `normalize` decides about
+        # a message is a question it cannot be asked.
+        for name in ("reaction_added", "reaction_removed"):
+            self._app.event(name)(reacted)
+
 
 def answer(result: AgentResult) -> str:
     """The finished message: what the model said, and why if it stopped early.
@@ -302,6 +376,8 @@ class _Live:
         # Only now: until the answer is in the thread, a redelivery of this
         # event should rewrite this message rather than post another.
         self._adapter._forget(self._event.external_id)
+        if self._message.ts is not None:
+            await self._adapter.remember_answer(self._event, result, self._message.ts)
 
     async def aclose(self) -> None:
         await self._message.aclose()

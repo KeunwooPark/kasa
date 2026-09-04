@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import user_config_dir, user_data_dir
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kasa.core.agent import AgentConfig
 from kasa.core.context import ContextBudget
@@ -126,6 +126,31 @@ class SlackSettings(BaseModel):
     #: shows no sign of life gets asked again, and that is a second model call
     #: and two answers. Off is a single message, and costs one API call a turn.
     stream: bool = True
+    #: Emoji name to verdict, for reactions on Kasa's own answers (#36). The
+    #: names are Slack's own, without colons and without a skin tone. Replacing
+    #: this replaces the whole map rather than adding to it: a workspace where
+    #: ✅ means "I have actioned this" should be able to say so, and a default
+    #: that could only be extended would keep boosting memory on the strength
+    #: of a checkbox.
+    reactions: dict[str, str] = Field(
+        default_factory=lambda: {
+            "+1": "up",
+            "thumbsup": "up",
+            "white_check_mark": "up",
+            "x": "down",
+            "-1": "down",
+            "thumbsdown": "down",
+        }
+    )
+
+    @field_validator("reactions")
+    @classmethod
+    def _known_verdicts(cls, value: dict[str, str]) -> dict[str, str]:
+        if unknown := {v for v in value.values() if v not in ("up", "down")}:
+            raise ValueError(f"a reaction maps to 'up' or 'down', not {', '.join(sorted(unknown))}")
+        # Slack sends the name without colons; accepting them written either
+        # way costs one line and saves a config that silently never matches.
+        return {name.strip().strip(":"): verdict for name, verdict in value.items()}
 
     @property
     def configured(self) -> bool:
@@ -314,6 +339,17 @@ class ReflectSettings(BaseModel):
     journal_tokens: int = 800
     #: Slack channel id for the nightly digest. None posts nothing.
     digest_channel: str | None = None
+    #: What a 👍 on an answer adds to the salience of the memories behind it,
+    #: and the ceiling on that (#36).
+    endorsement_boost: float = 0.2
+    max_endorsement_boost: float = 0.4
+    #: What an ❌ multiplies a memory's confidence by, once per reaction. A
+    #: person disagreeing with one answer is a reason to trust a memory less,
+    #: not a reason to stop believing it.
+    suspect_factor: float = 0.7
+    #: Confidence rewrites per run, under the same per-commit cap the salience
+    #: updates share.
+    max_suspect_updates: int = 10
 
     def decay(self) -> Decay:
         return Decay(
@@ -321,6 +357,8 @@ class ReflectSettings(BaseModel):
             half_life_days=self.half_life_days,
             per_hit=self.hit_boost,
             max_boost=self.max_hit_boost,
+            per_endorsement=self.endorsement_boost,
+            max_endorsement_boost=self.max_endorsement_boost,
             floor=self.salience_floor,
         )
 

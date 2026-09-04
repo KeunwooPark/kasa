@@ -60,6 +60,11 @@ class AgentResult:
     tool_calls: int = 0
     stop_reason: str = "end_turn"
     trace: PackTrace | None = None
+    #: Every long-term memory this turn read, best first, pre-injected recall
+    #: before anything a tool went and found. It is what a 👍 on the answer
+    #: boosts and an ❌ marks suspect (#36), so it has to be what actually
+    #: reached the model rather than what was ranked.
+    memory_ids: list[str] = field(default_factory=list)
 
     @property
     def note(self) -> str | None:
@@ -142,6 +147,7 @@ class Agent:
         usage = Usage()
         pinned: list[str] = []
         retrieved: list[str] = []
+        recalled: list[str] = []
         tool_calls = 0
         text = ""
         stop_reason = "end_turn"
@@ -156,7 +162,7 @@ class Agent:
             # every tool call would pay for it on each pass and thrash the
             # cacheable prefix for material that has not changed.
             if iteration == 1:
-                pinned, retrieved = await self._recall(user_text, history, scope)
+                pinned, retrieved, recalled = await self._recall(user_text, history, scope)
             packed = self._packer.pack(
                 system_prompt=self.config.system_prompt,
                 pinned=pinned,
@@ -208,6 +214,9 @@ class Agent:
             tool_calls=tool_calls,
             stop_reason=stop_reason,
             trace=trace,
+            # Tool calls append to the context as the turn runs, so this is
+            # read at the end rather than built alongside `recalled`.
+            memory_ids=list(dict.fromkeys([*recalled, *context.recalled])),
         )
 
     # -- internals -----------------------------------------------------------
@@ -233,7 +242,7 @@ class Agent:
 
     async def _recall(
         self, user_text: str, history: Sequence[Message], scope: str
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """Pre-inject what the question is likely to need.
 
         Failing here degrades the turn rather than ending it: an agent that
@@ -241,15 +250,15 @@ class Agent:
         far better than one that refuses to answer at all.
         """
         if self._retriever is None:
-            return [], []
+            return [], [], []
         try:
             recall = await self._retriever.retrieve(
                 user_text, scope=scope, recent=[m.text for m in history[-4:] if m.text]
             )
         except Exception:
             log.exception("retrieval failed; answering without memory")
-            return [], []
-        return recall.pinned, recall.snippets
+            return [], [], []
+        return recall.pinned, recall.snippets, recall.memory_ids
 
     async def _dispatch_all(
         self, session_id: str, uses: Sequence[ToolUseBlock], context: ToolContext

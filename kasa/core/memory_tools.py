@@ -79,6 +79,11 @@ def _search_tool(retriever: Retriever) -> Tool:
         # `limit` could only ever shrink a list of eight, and a request for
         # twenty was answered with eight and no indication of it (#61).
         retrieval = await retriever.retrieve(query, scope=scope, include_pinned=False, limit=limit)
+        # Noted on the turn, so that feedback on the answer reaches what the
+        # model went and found as well as what it was handed (#36). A search
+        # mid-turn is often where the memory that actually answered the
+        # question comes from.
+        context.recalled.extend(retrieval.memory_ids)
         if not retrieval.kept:
             return f"No memories matched {query!r}."
         return "\n\n".join(render_snippet(c) for c in retrieval.kept)
@@ -140,6 +145,10 @@ def _read_tool(memory: MemoryStore) -> Tool:
             log.info("refused a cross-scope memory_read of %s", memory_id)
             return f"No memory with id {memory_id}."
 
+        # After the scope check, never before it: a memory this conversation
+        # may not see did not contribute to its answer, and recording it here
+        # would put its id in front of whoever reads the feedback.
+        context.recalled.append(memory_id)
         return raw
 
     return Tool(

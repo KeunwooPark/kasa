@@ -10,11 +10,12 @@ socket.
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from kasa.core.events import InboundEvent
+from kasa.core.feedback import DOWN, UP, Verdict
 from kasa.core.revise import Revision
 
 SOURCE = "slack"
@@ -81,11 +82,25 @@ class Changed:
 
 
 @dataclass(frozen=True, slots=True)
+class Reacted:
+    """Somebody passed judgement on an answer Kasa posted."""
+
+    #: The answer's own key, not the question's — a reaction names the message
+    #: it is on, and the message it is on is Kasa's reply.
+    external_id: str
+    verdict: Verdict
+    author: str
+    #: A reaction taken off again. Un-clicking is a retraction, not a vote the
+    #: other way.
+    removed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class Ignored:
     reason: str
 
 
-Decision = Accepted | Changed | Ignored
+Decision = Accepted | Changed | Reacted | Ignored
 
 #: Whether Kasa already has a conversation under this session id — which is how
 #: a reply in a thread it is part of is told from chatter it should stay out of.
@@ -161,6 +176,75 @@ async def normalize(
             reply_to=thread,
         )
     )
+
+
+def reaction(
+    event: dict[str, Any], *, context: SlackContext, verdicts: Mapping[str, str]
+) -> Decision:
+    """What an emoji on a message means, if it means anything.
+
+    Separate from `normalize` because a reaction is not a message and has
+    nothing in common with one: no text, no thread, nothing to answer. What it
+    has instead is an opinion about an answer that already exists.
+
+    Deliberately strict. Every gate here is the difference between "somebody
+    told us this memory was right" and "somebody put a 🎉 on something", and
+    the whole value of the signal is that it is the former.
+    """
+    if str(event.get("type") or "").startswith("reaction_"):
+        removed = str(event["type"]) == "reaction_removed"
+    else:
+        return Ignored("not a reaction")
+
+    author = str(event.get("user") or "")
+    if not author:
+        return Ignored("a reaction from nobody")
+    if author == context.bot_user_id:
+        return Ignored("Kasa's own reaction")
+
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "message":
+        # Reactions land on files and file comments too, and neither is an
+        # answer Kasa gave.
+        return Ignored("a reaction on something that is not a message")
+
+    channel = str(item.get("channel") or "")
+    ts = str(item.get("ts") or "")
+    if not channel or not ts:
+        return Ignored("a reaction naming no message")
+    if (
+        not channel.startswith(_DM_PREFIX)
+        and context.allowed_channels
+        and channel not in context.allowed_channels
+    ):
+        return Ignored(f"channel {channel} is not on the allowlist")
+
+    #: `item_user` is who posted the message being reacted to. When Slack sends
+    #: it, it settles the question outright; when it does not, the answers
+    #: table is the check — it only holds messages Kasa posted.
+    item_user = str(event.get("item_user") or "")
+    if item_user and item_user != context.bot_user_id:
+        return Ignored("a reaction on somebody else's message")
+
+    verdict = verdicts.get(_emoji(str(event.get("reaction") or "")))
+    if verdict != UP and verdict != DOWN:
+        return Ignored(f"reaction {event.get('reaction')!r} is not mapped to a verdict")
+
+    return Reacted(
+        external_id=message_id(context.team_id, channel, ts),
+        verdict=verdict,
+        author=author,
+        removed=removed,
+    )
+
+
+def _emoji(name: str) -> str:
+    """The emoji, without the skin tone somebody happens to use.
+
+    Slack appends `::skin-tone-3` to the name, so a configured `+1` matches
+    only the default-toned thumb and silently ignores everybody else's.
+    """
+    return name.split("::", 1)[0].strip().strip(":")
 
 
 def _revision(event: dict[str, Any], subtype: str, context: SlackContext) -> Decision:

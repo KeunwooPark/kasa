@@ -617,3 +617,73 @@ def test_the_package_says_no_to_a_name_it_does_not_have() -> None:
 
     with pytest.raises(AttributeError, match="has no attribute 'Nonexistent'"):
         getattr(package, missing)
+
+
+# -- feedback -----------------------------------------------------------------
+
+
+def reaction_event(
+    emoji: str = "+1", *, on: str, user: str = HUMAN, removed: bool = False
+) -> dict[str, Any]:
+    return {
+        "type": "reaction_removed" if removed else "reaction_added",
+        "user": user,
+        "reaction": emoji,
+        "item": {"type": "message", "channel": "C0DEPLOY", "ts": on},
+        "item_user": BOT,
+        "event_ts": "1700000009.000000",
+    }
+
+
+async def test_an_answer_records_the_memories_behind_it(store: Store, tokenizer: Tokenizer) -> None:
+    """The chain #36 rests on: the reaction arrives days later, long after the
+    process that produced the answer has forgotten everything."""
+    adapter, client = make_adapter(store, tokenizer)
+    await answer_once(adapter, client)
+
+    answer = await store.answer_at("slack", f"slack:{TEAM}:C0DEPLOY:{client.posted[0]['ts']}")
+    assert answer is not None
+    assert answer["scope"] == "channel:C0DEPLOY"
+
+
+async def test_a_thumbs_up_reaches_the_memories_that_produced_the_answer(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    adapter, client = make_adapter(store, tokenizer)
+    await answer_once(adapter, client)
+    external = f"slack:{TEAM}:C0DEPLOY:{client.posted[0]['ts']}"
+    answer = await store.answer_at("slack", external)
+    assert answer is not None
+    # The scripted provider has no retriever behind it, so the memory is put on
+    # the answer directly: what is under test here is the wiring from a Slack
+    # reaction to a feedback row, not what the ranker packed.
+    await store.write(
+        "UPDATE answers SET memory_ids = ? WHERE id = ?",
+        ('["mem_01K8XQ0000000000000000001"]', answer["id"]),
+    )
+
+    await adapter.on_reaction(reaction_event(on=str(client.posted[0]["ts"])))
+
+    assert await store.endorsements_since("2000-01-01") == {"mem_01K8XQ0000000000000000001": 1}
+
+
+async def test_a_reaction_never_reaches_the_agent(store: Store, tokenizer: Tokenizer) -> None:
+    """A 👍 is not a question."""
+    provider = ScriptedProvider([says("noted")] * 4)
+    adapter, client = make_adapter(store, tokenizer, provider=provider)
+    await answer_once(adapter, client)
+
+    await adapter.on_reaction(reaction_event(on=str(client.posted[0]["ts"])))
+
+    assert await adapter.runtime.inbox.counts() == {"done": 1}
+    assert len(provider.requests) == 1
+
+
+async def test_a_reaction_on_a_message_kasa_never_posted_does_nothing(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    adapter, _ = make_adapter(store, tokenizer)
+
+    await adapter.on_reaction(reaction_event(on="1700009999.999999"))
+
+    assert await store.endorsements_since("2000-01-01") == {}

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,6 +34,12 @@ class ToolContext:
 
     session_id: str = "cli"
     scope: str = "workspace"
+    #: Memory ids the tools pulled into this turn, in the order they were
+    #: reached. Mutable inside a frozen context on purpose: the scope above is
+    #: a permission and must not be reassignable, while this is a notebook the
+    #: turn writes as it goes. It is what lets a 👍 on the answer reach the
+    #: memories a `memory_search` found, not only the ones pre-injected (#36).
+    recalled: list[str] = field(default_factory=list)
 
 
 ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[str]]

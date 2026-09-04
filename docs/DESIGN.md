@@ -797,6 +797,10 @@ bot_token_env = "SLACK_BOT_TOKEN"     # xoxb-
 allowed_channels = ["C0123ABCD"]
 stream = true                         # rewrite one message; false posts once
 
+[slack.reactions]                     # emoji → verdict on Kasa's own answers
+"+1" = "up"
+x    = "down"
+
 [memory]
 episode_idle_minutes = 20
 promote_interval     = "1h"
