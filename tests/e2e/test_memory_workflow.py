@@ -70,6 +70,8 @@ def bootstrap_with_init(rig: KasaRig, tmp_path: Path) -> Path:
     assert initialized.returncode == 0, (initialized.stdout, initialized.stderr)
     assert "Bootstrapped" in initialized.stdout
     assert clone.joinpath("memory", ".kasa", "schema.md").is_file()
+    git("config", "user.name", "E2E QA", cwd=clone)
+    git("config", "user.email", "e2e@example.invalid", cwd=clone)
     return clone
 
 

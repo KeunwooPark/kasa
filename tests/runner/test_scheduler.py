@@ -400,7 +400,10 @@ async def test_the_next_occurrence_is_queued_for_when_it_fires(store: Store) -> 
     scheduler = Scheduler(store, [JobSpec("reflect", records([]), cron=Cron.parse(NIGHTLY))])
 
     assert await scheduler.schedule_due(now=NOW) == ["reflect@2026-09-04T03:00+00:00"]
-    assert await scheduler.queue.lease(limit=1) == [], "not due for another sixteen hours"
+    rows = await store.raw("SELECT state, run_after FROM jobs")
+    assert [(row["state"], row["run_after"]) for row in rows] == [
+        ("pending", "2026-09-04T03:00:00.000+00:00")
+    ]
 
 
 async def test_queueing_the_same_occurrence_twice_queues_it_once(store: Store) -> None:
