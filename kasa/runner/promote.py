@@ -85,9 +85,13 @@ writing another file about the same thing.
 
 Return a JSON array of patch objects. The allowed operations are:
 
-- `{{"type": "create", "memory": <document>, "path": "memory/<dir>/<slug>.md"}}`
-  — a subject the corpus says nothing about yet. `path` is optional; omit it
-  and the conventional path for the document's `type` is used.
+- `{{"type": "create", "memory": {{"frontmatter": {{"id": "<memory id>",
+  "type": "fact", "title": "<title>", "tags": [], "visibility": "<scope>",
+  "created": "<timestamp>", "updated": "<timestamp>"}}, "body": "<prose>"}},
+  "path": "memory/<dir>/<slug>.md"}}` — a subject the corpus says nothing about
+  yet. The frontmatter fields must be nested under `memory.frontmatter`; they
+  are not fields of `memory` itself. `path` is optional; omit it and the
+  conventional path for the document's `type` is used.
 - `{{"type": "update", "id": "<memory id>", "body": "<full new body>",
   "frontmatter": {{...}}}}` — the corpus already covers this subject. `body`
   replaces the old body entirely, so write the whole thing, not the change.
@@ -101,7 +105,8 @@ Return a JSON array of patch objects. The allowed operations are:
 
 There is no delete. Nothing you return can remove a memory.
 
-Return `[]` when the corpus already says everything these observations say.
+Return raw JSON only, with no Markdown or code fences. Return `[]` when the
+corpus already says everything these observations say.
 That is a normal answer, and it is the right one for a restated fact whose
 memory is already accurate.
 

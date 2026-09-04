@@ -150,6 +150,20 @@ async def test_a_new_subject_becomes_a_file_in_the_repo(clone: Path, store: Stor
     assert result.sha in str(rows[0]["reason"]), "the reason says where to go and look"
 
 
+async def test_create_prompt_shows_the_nested_memory_document_shape(
+    clone: Path, store: Store
+) -> None:
+    await observe(store, "Bob", "Bob runs the rota.")
+    provider = Scripted("[]")
+
+    await (await promoter_for(clone, store, provider)).run()
+
+    prompt = provider.prompts[0]
+    assert '"memory": {"frontmatter": {"id": "<memory id>"' in prompt
+    assert "frontmatter fields must be nested under `memory.frontmatter`" in prompt
+    assert "Return raw JSON only, with no Markdown or code fences" in prompt
+
+
 async def test_the_commit_is_machine_readable(clone: Path, store: Store) -> None:
     await observe(store, "Priya Raman", "Priya Raman owns the deploy pipeline.")
     provider = Scripted(creating("Deploy pipeline ownership", "Priya Raman owns it."))
