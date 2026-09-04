@@ -172,7 +172,7 @@ class Agent:
             )
             trace = packed.trace
 
-            response = await self._call(self._request(packed), on_delta)
+            response = await self._call(session_id, self._request(packed), on_delta)
             usage = usage + response.usage
             stop_reason = response.stop_reason
             text = response.text or text
@@ -231,10 +231,14 @@ class Agent:
             temperature=self.config.temperature,
         )
 
-    async def _call(self, req: ChatRequest, on_delta: DeltaSink | None) -> ChatResponse:
+    async def _call(
+        self, session_id: str, req: ChatRequest, on_delta: DeltaSink | None
+    ) -> ChatResponse:
         primary = self._registry.primary(ModelRole.CHAT)
         acc = StreamAccumulator(model=req.model or primary.model, provider=primary.name)
-        async for delta in self._registry.stream(ModelRole.CHAT, req, tag="agent.turn"):
+        async for delta in self._registry.stream(
+            ModelRole.CHAT, req, tag="agent.turn", session_id=session_id
+        ):
             acc.feed(delta)
             if on_delta is not None:
                 await on_delta(delta)

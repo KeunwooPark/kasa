@@ -299,6 +299,32 @@ async def test_system_prompt_is_identical_across_turns(store: Store, tokenizer: 
     assert provider.requests[0].system == provider.requests[1].system
 
 
+async def test_twenty_turn_session_exceeds_eighty_percent_cache_hits(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    responses = [
+        ChatResponse(
+            message=Message.assistant(str(turn)),
+            stop_reason="end_turn",
+            usage=Usage(
+                input_tokens=10,
+                output_tokens=1,
+                cache_write_tokens=100 if turn == 0 else 0,
+                cache_read_tokens=0 if turn == 0 else 100,
+            ),
+            model="m",
+        )
+        for turn in range(20)
+    ]
+    agent, provider = build(store, tokenizer, responses)
+
+    for turn in range(20):
+        await agent.respond("long-session", f"turn {turn}")
+
+    assert len({request.system.encode() for request in provider.requests if request.system}) == 1
+    assert agent.registry.meter.session_cache_hit_rate("long-session") > 0.8
+
+
 # -- what the user is told when a turn does not simply end -------------------
 
 

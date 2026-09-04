@@ -206,6 +206,26 @@ async def test_unpriced_models_still_record_tokens() -> None:
     assert meter.total_usd == 0.0
 
 
+async def test_cache_hit_rate_is_reported_per_session() -> None:
+    meter = CostMeter(PriceBook())
+    first = ok().model_copy(
+        update={"usage": Usage(input_tokens=5, output_tokens=2, cache_write_tokens=100)}
+    )
+    hit = ok().model_copy(
+        update={"usage": Usage(input_tokens=5, output_tokens=2, cache_read_tokens=100)}
+    )
+    provider = FakeProvider("p1", [first, hit, hit])
+    reg = registry(provider, meter=meter)
+
+    await reg.complete(ModelRole.CHAT, REQUEST, session_id="s1")
+    await reg.complete(ModelRole.CHAT, REQUEST, session_id="s1")
+    await reg.complete(ModelRole.CHAT, REQUEST, session_id="s2")
+
+    assert meter.session_cache_hit_rate("s1") == pytest.approx(0.5)
+    assert meter.session_cache_hit_rate("s2") == 1.0
+    assert meter.session_cache_hit_rate("missing") == 0.0
+
+
 async def test_price_lookup_prefers_the_longest_matching_prefix() -> None:
     book = PriceBook({"claude": Price(input=1.0), "claude-opus": Price(input=9.0)})
     assert book.cost_usd("claude-opus-5-20260101", Usage(input_tokens=1_000_000)) == 9.0

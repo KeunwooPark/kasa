@@ -299,15 +299,16 @@ class Store:
         async with self._serial:
             await self._conn.execute(
                 "INSERT INTO llm_calls"
-                " (created_at, role, provider, model, tag, input_tokens, output_tokens,"
+                " (created_at, role, provider, model, tag, session_id, input_tokens, output_tokens,"
                 "  cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ok, error)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _now(),
                     record.role,
                     record.provider,
                     record.model,
                     record.tag,
+                    record.session_id,
                     record.usage.input_tokens,
                     record.usage.output_tokens,
                     record.usage.cache_read_tokens,
@@ -333,6 +334,28 @@ class Store:
                 params,
             ) as cur:
                 return [dict(row) for row in await cur.fetchall()]
+
+    async def session_cost_summary(self, session_id: str) -> dict[str, Any]:
+        """Token, spend, and prompt-cache health for one conversation."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT COUNT(*) AS calls,"
+                " COALESCE(SUM(input_tokens), 0) AS input_tokens,"
+                " COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+                " COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,"
+                " COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,"
+                " COALESCE(SUM(cost_usd), 0.0) AS cost_usd"
+                " FROM llm_calls WHERE session_id = ?",
+                (session_id,),
+            ) as cur,
+        ):
+            result = await cur.fetchone()
+            assert result is not None  # aggregate queries always return one row
+            row = dict(result)
+        eligible = row["cache_read_tokens"] + row["cache_write_tokens"]
+        row["cache_hit_rate"] = row["cache_read_tokens"] / eligible if eligible else 0.0
+        return row
 
     async def raw(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         """Run a query and return its rows.
