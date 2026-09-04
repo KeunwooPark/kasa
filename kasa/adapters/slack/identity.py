@@ -130,6 +130,25 @@ class Directory:
             log.exception("could not resolve Slack identities for %s", event.external_id)
             return event
 
+    async def rename_known(self, text: str) -> str:
+        """Resolve mentions from the cache alone, asking Slack nothing.
+
+        For the paths that run inside an ack budget rather than behind the
+        queue — an edit arriving for a message already stored (#25). A name
+        that is not cached stays an id, which is the same outcome `hydrate`
+        reaches when a lookup fails, and cheaper than a `users.info` inside
+        three seconds.
+        """
+        wanted = {match["user"] for match in MENTION.finditer(text)}
+        if not wanted:
+            return text
+        names = {}
+        for user_id in sorted(wanted):
+            row = await self._store.get_slack_user(self._team_id, user_id)
+            if row is not None:
+                names[user_id] = _from_row(row).name
+        return _render_mentions(text, names)
+
     async def resolve(self, user_id: str) -> SlackUser | None:
         """Who this id is, from cache while the cache is still warm.
 

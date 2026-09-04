@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -220,6 +220,7 @@ class Store:
         *,
         author: str | None = None,
         tokens: int | None = None,
+        external_id: str | None = None,
     ) -> str:
         async with self._serial:
             message_id = str(ULID())
@@ -237,8 +238,9 @@ class Store:
 
             await self._conn.execute(
                 "INSERT INTO messages"
-                " (id, session_id, episode_id, seq, role, author, content, tokens, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " (id, session_id, episode_id, seq, role, author, content, tokens, created_at,"
+                "  external_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     message_id,
                     session_id,
@@ -249,6 +251,7 @@ class Store:
                     _BLOCKS.dump_json(message.content).decode(),
                     tokens,
                     _now(),
+                    external_id,
                 ),
             )
             await self._conn.execute(
@@ -262,7 +265,15 @@ class Store:
             return [await self.append_message(session_id, m) for m in messages]
 
     async def recent_messages(self, session_id: str, limit: int = 100) -> list[Message]:
-        """Most recent `limit` messages, oldest first."""
+        """Most recent `limit` messages, oldest first.
+
+        A revised message is served as it stands now, because `revise_message`
+        rewrote the row: an edit replaces the words and a deletion replaces
+        them with a tombstone. Doing it there rather than here is what stops a
+        reader forgetting to — the packer, the extractor and this all read
+        `content`, and one of them treating a deleted message as still said is
+        the whole failure #25 is about.
+        """
         async with self._serial:
             async with self._conn.execute(
                 "SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
@@ -1062,6 +1073,122 @@ class Store:
             await self._conn.commit()
             return int(cur.rowcount)
 
+    # -- revisions -------------------------------------------------------------
+
+    async def message_by_external_id(self, external_id: str) -> dict[str, Any] | None:
+        """The stored message a surface's own id refers to, if Kasa kept one."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM messages WHERE external_id = ? ORDER BY seq LIMIT 1",
+                (external_id,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def revise_message(self, message_id: str, *, content: Message, state: str) -> None:
+        """Rewrite what a stored message says, and record that it was rewritten.
+
+        The row keeps its place in the sequence and its timestamps. Deleting it
+        would rewrite a conversation the assistant has already answered — the
+        reply is still in the transcript, and a reply to nothing reads as the
+        model having invented the question.
+        """
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE messages SET content = ?, state = ?, revised_at = ? WHERE id = ?",
+                (_BLOCKS.dump_json(content.content).decode(), state, _now(), message_id),
+            )
+            await self._conn.commit()
+
+    async def observations_from(self, message_id: str) -> list[dict[str, Any]]:
+        """Every candidate fact that cited this message as its source.
+
+        `source_refs` holds message ids, which is what makes this answerable at
+        all: the extractor resolves the line numbers a model cites back to the
+        rows they came from, precisely so that provenance survives into here.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM observations o WHERE EXISTS"
+                " (SELECT 1 FROM json_each(o.source_refs) WHERE value = ?)"
+                " ORDER BY created_at",
+                (message_id,),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def weaken_observations(self, ids: Sequence[str], *, factor: float, reason: str) -> int:
+        """Trust these less, without deciding they are false.
+
+        A retracted message is evidence about a claim, not a verdict on it: the
+        person may have deleted a typo, or thought better of saying it out
+        loud, or been wrong. Scaling the confidence lets `promote` weigh it
+        against everything else that was said instead of this one event
+        settling the matter.
+        """
+        if not ids:
+            return 0
+        async with self._serial:
+            cur = await self._conn.execute(
+                f"UPDATE observations SET confidence = MAX(0.0, confidence * ?), reason = ?"
+                f" WHERE id IN ({_marks(ids)}) AND state = 'pending'",
+                (factor, reason, *ids),
+            )
+            await self._conn.commit()
+            return cur.rowcount
+
+    # -- reviews ---------------------------------------------------------------
+
+    async def queue_review(
+        self,
+        *,
+        kind: str,
+        key: str,
+        subject: str,
+        detail: str = "",
+        refs: Sequence[str] = (),
+        scope: str = "workspace",
+    ) -> str | None:
+        """Ask for a person. Returns the id, or None if it was already asked.
+
+        Idempotent on `(kind, key)`, because the paths that raise reviews are
+        retried: Slack re-sends an event it did not hear an ack for, and three
+        deliveries of one deletion is one thing to look at.
+        """
+        review_id = str(ULID())
+        async with self._serial:
+            cur = await self._conn.execute(
+                "INSERT INTO reviews (id, kind, subject, detail, refs, scope, key, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (kind, key) DO NOTHING",
+                (review_id, kind, subject, detail, json_dumps(list(refs)), scope, key, _now()),
+            )
+            await self._conn.commit()
+            return review_id if cur.rowcount else None
+
+    async def open_reviews(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM reviews WHERE state = 'open' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def resolve_review(self, review_id: str) -> bool:
+        async with self._serial:
+            cur = await self._conn.execute(
+                "UPDATE reviews SET state = 'done', resolved_at = ?"
+                " WHERE id = ? AND state = 'open'",
+                (_now(), review_id),
+            )
+            await self._conn.commit()
+            return cur.rowcount > 0
+
     # -- slack identities ------------------------------------------------------
 
     async def upsert_slack_user(
@@ -1187,6 +1314,16 @@ class Store:
             async with self._conn.execute("SELECT * FROM leases WHERE name = ?", (name,)) as cur:
                 row = await cur.fetchone()
             return dict(row) if row else None
+
+
+def message_from_row(row: Mapping[str, Any]) -> Message:
+    """One `messages` row as the thing the model would be shown.
+
+    Here rather than at each caller because the content column's encoding is
+    this module's business, and a second place that knew how to decode it is a
+    second place to keep in step with the block types.
+    """
+    return Message(role=row["role"], content=_BLOCKS.validate_json(str(row["content"])))
 
 
 def json_dumps(value: Any) -> str:

@@ -128,9 +128,15 @@ class Agent:
         author: str | None = None,
         scope: str = "workspace",
         on_delta: DeltaSink | None = None,
+        external_id: str | None = None,
     ) -> AgentResult:
         await self._store.ensure_session(session_id, surface=surface, scope=scope)
-        await self._store.append_message(session_id, Message.user(user_text), author=author)
+        # `external_id` is the surface's own key for this message, and it is
+        # what lets an edit or a deletion arriving later find the row it
+        # invalidates (#25). Nothing in the turn reads it.
+        await self._store.append_message(
+            session_id, Message.user(user_text), author=author, external_id=external_id
+        )
         context = ToolContext(session_id=session_id, scope=scope)
 
         usage = Usage()

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kasa.core.events import InboundEvent
+from kasa.core.revise import Revision
 
 SOURCE = "slack"
 
@@ -46,6 +47,13 @@ _DM_PREFIX = "D"
 #: class of bug.
 _SPOKEN_SUBTYPES = frozenset({"file_share", "me_message", "thread_broadcast"})
 
+#: Somebody taking back or rewriting what they already said. Not chatter and
+#: not a new message: what these mean is that a message Kasa may already have
+#: stored, answered and drawn a candidate fact out of no longer says what it
+#: said (#25).
+_EDITED = "message_changed"
+_DELETED = "message_deleted"
+
 
 @dataclass(frozen=True, slots=True)
 class SlackContext:
@@ -66,11 +74,18 @@ class Accepted:
 
 
 @dataclass(frozen=True, slots=True)
+class Changed:
+    """A message already delivered has been edited or deleted."""
+
+    revision: Revision
+
+
+@dataclass(frozen=True, slots=True)
 class Ignored:
     reason: str
 
 
-Decision = Accepted | Ignored
+Decision = Accepted | Changed | Ignored
 
 #: Whether Kasa already has a conversation under this session id — which is how
 #: a reply in a thread it is part of is told from chatter it should stay out of.
@@ -99,10 +114,9 @@ async def normalize(
 ) -> Decision:
     """Turn one Slack event into something to answer, or say why not."""
     subtype = str(event.get("subtype") or "")
+    if subtype in (_EDITED, _DELETED):
+        return _revision(event, subtype, context)
     if subtype and subtype not in _SPOKEN_SUBTYPES:
-        # `message_changed` and `message_deleted` are real signals, and #25 is
-        # where they get handled. Until then, editing a message must not read
-        # as sending a new one.
         return Ignored(f"message subtype {subtype!r}")
     if event.get("bot_id"):
         return Ignored("posted by a bot")
@@ -147,6 +161,50 @@ async def normalize(
             reply_to=thread,
         )
     )
+
+
+def _revision(event: dict[str, Any], subtype: str, context: SlackContext) -> Decision:
+    """What an edit or a deletion refers to, or why it refers to nothing.
+
+    The timestamp is the trap. `event["ts"]` on one of these is the *change's*
+    own timestamp, not the message's — reading it would look up a message that
+    has never existed and quietly do nothing, which is the failure mode that
+    looks most like working. The message is `deleted_ts` on a deletion and
+    `message.ts` on an edit.
+    """
+    channel = str(event.get("channel") or "")
+    if not channel:
+        return Ignored("a revision with no channel")
+    if (
+        not channel.startswith(_DM_PREFIX)
+        and context.allowed_channels
+        and channel not in context.allowed_channels
+    ):
+        return Ignored(f"channel {channel} is not on the allowlist")
+
+    if subtype == _DELETED:
+        ts = str(event.get("deleted_ts") or "")
+        if not ts:
+            return Ignored("a deletion naming no message")
+        return Changed(Revision(external_id=message_id(context.team_id, channel, ts), text=None))
+
+    inner = event.get("message")
+    if not isinstance(inner, dict):
+        return Ignored("an edit carrying no message")
+    if inner.get("bot_id") or str(inner.get("user") or "") == context.bot_user_id:
+        # Kasa's own. A streamed reply is one `chat.update` per second (#22),
+        # and every one of them comes back as a `message_changed` — so without
+        # this a single answer would revise itself thirty times, and each pass
+        # would look up its own placeholder.
+        return Ignored("Kasa's own message changed")
+
+    ts = str(inner.get("ts") or "")
+    if not ts:
+        return Ignored("an edit naming no message")
+    text = _with_attachments(
+        _strip_mention(str(inner.get("text") or ""), context.bot_user_id), inner
+    )
+    return Changed(Revision(external_id=message_id(context.team_id, channel, ts), text=text))
 
 
 def scope_for(channel: str, author: str, *, is_dm: bool) -> str:

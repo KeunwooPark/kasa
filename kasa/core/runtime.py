@@ -178,6 +178,9 @@ class Runtime:
                 # private.
                 scope=turn.session.scope,
                 on_delta=reply.delta,
+                # So a later edit or deletion of this message can find what was
+                # stored for it (#25).
+                external_id=turn.event.external_id,
             )
         except BaseException:
             # Including cancellation, which is what a shutdown mid-turn is. A
