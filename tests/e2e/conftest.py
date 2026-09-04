@@ -110,15 +110,27 @@ class KasaRig:
     env: dict[str, str]
     server: FakeOpenAIServer
 
-    def run(self, script: str) -> subprocess.CompletedProcess[str]:
+    def command(
+        self,
+        *args: str,
+        input: str | None = None,
+        env: dict[str, str] | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, "-m", "kasa.cli", "run", "--config", str(self.config)],
-            input=script,
+            [sys.executable, "-m", "kasa.cli", *args, "--config", str(config or self.config)],
+            input=input,
             text=True,
             capture_output=True,
-            env=self.env,
+            env=env or self.env,
             timeout=15,
             check=False,
+        )
+
+    def run(self, script: str) -> subprocess.CompletedProcess[str]:
+        return self.command(
+            "run",
+            input=script,
         )
 
 
