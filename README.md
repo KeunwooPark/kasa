@@ -29,7 +29,7 @@ daemon: a restart loses nothing and a crashed job runs again.
 | --- | --- | --- |
 | `episode_close` | every 5 min | closes a thread that has gone quiet or grown long; summarizes it and extracts candidate facts |
 | `promote` | hourly | reconciles those against the corpus and commits a patch plan |
-| `reflect` | nightly | writes the day's journal, recomputes salience, surfaces contradictions |
+| `reflect` | nightly | writes the day's journal, recomputes salience, applies feedback, surfaces contradictions |
 | `reorganize` | weekly | merges duplicates, splits oversized files, repairs links, regenerates the listings |
 | `forget` | weekly | archives what stopped mattering, and collects the archive after a grace period |
 | `reindex` | every minute | rebuilds the search index and the manifest for changed blobs |
@@ -78,6 +78,11 @@ confidence of what was drawn from it. Neither rewrites the memory repo: when
 the claim is already a file there, Kasa queues a review — `kasa review list` —
 because a retraction is not a correction and the file may have been merged or
 built on since.
+
+Reactions on Kasa's own answers are the cheapest quality signal there is. 👍
+raises the salience of the memories that produced the answer; ❌ lowers their
+confidence and queues a review. One person is one vote per answer, and
+`slack.reactions` maps emoji to verdicts.
 
 `kasa init` walks through the private GitHub repo that holds long-term memory —
 creating it if it does not exist — clones it, lays out the memory skeleton, and

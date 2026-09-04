@@ -63,3 +63,39 @@ def test_a_clock_that_went_backwards_does_not_raise_salience() -> None:
 
     assert age_of(future, now) == timedelta(0)
     assert DECAY.score(age=age_of(future, now)) == DECAY.base
+
+
+def test_an_endorsement_is_worth_more_than_a_recall() -> None:
+    """A recall says the ranker picked this memory; an endorsement says a
+    person read what came of it and agreed. Only one of those is a judgement,
+    and it is the rarer of the two."""
+    age = timedelta(days=20)
+
+    assert DECAY.score(age=age, endorsements=1) > DECAY.score(age=age, hits=1)
+
+
+def test_endorsements_are_capped_like_recalls_are() -> None:
+    """A memory everybody agrees with should sit near the top of the corpus. It
+    should not be immune to a year of nobody needing it."""
+    age = timedelta(days=20)
+
+    assert DECAY.score(age=age, endorsements=100) == DECAY.score(age=age, endorsements=1_000)
+    assert DECAY.score(age=timedelta(days=3_650), endorsements=100) < 1.0
+
+
+def test_endorsement_and_recall_both_count() -> None:
+    age = timedelta(days=20)
+
+    both = DECAY.score(age=age, hits=1, endorsements=1)
+    assert both > DECAY.score(age=age, hits=1)
+    assert both > DECAY.score(age=age, endorsements=1)
+
+
+def test_endorsements_are_recomputed_like_everything_else() -> None:
+    """They arrive as a count within a window, which is what keeps a night that
+    runs twice landing where a night that runs once did."""
+    age = timedelta(days=12)
+
+    assert DECAY.score(age=age, hits=2, endorsements=3) == DECAY.score(
+        age=age, hits=2, endorsements=3
+    )

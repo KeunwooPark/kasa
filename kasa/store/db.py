@@ -1140,6 +1140,135 @@ class Store:
             await self._conn.commit()
             return cur.rowcount
 
+    # -- answers and feedback --------------------------------------------------
+
+    async def record_answer(
+        self,
+        *,
+        source: str,
+        external_id: str,
+        memory_ids: Sequence[str],
+        session_id: str | None = None,
+        scope: str = "workspace",
+    ) -> str:
+        """Remember which memories produced one answer.
+
+        Written even when nothing was recalled. A 👍 on an answer that used no
+        memory is still a fact about the answer, and a row that exists with an
+        empty list is how a later reaction can tell "nothing to boost" from
+        "this reply is not one of ours".
+        """
+        answer_id = str(ULID())
+        async with self._serial:
+            cur = await self._conn.execute(
+                "INSERT INTO answers"
+                " (id, source, external_id, session_id, scope, memory_ids, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (source, external_id) DO NOTHING",
+                (
+                    answer_id,
+                    source,
+                    external_id,
+                    session_id,
+                    scope,
+                    json_dumps(list(dict.fromkeys(memory_ids))),
+                    _now(),
+                ),
+            )
+            await self._conn.commit()
+            if cur.rowcount:
+                return answer_id
+            async with self._conn.execute(
+                "SELECT id FROM answers WHERE source = ? AND external_id = ?",
+                (source, external_id),
+            ) as existing:
+                row = await existing.fetchone()
+            return str(row["id"]) if row else answer_id
+
+    async def answer_at(self, source: str, external_id: str) -> dict[str, Any] | None:
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM answers WHERE source = ? AND external_id = ?",
+                (source, external_id),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def add_memory_feedback(
+        self, *, memory_id: str, kind: str, answer_id: str, author: str = ""
+    ) -> bool:
+        """Record one person's verdict on one memory. False if already recorded."""
+        async with self._serial:
+            cur = await self._conn.execute(
+                "INSERT INTO memory_feedback (memory_id, kind, answer_id, author, created_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (memory_id, answer_id, author, kind) DO NOTHING",
+                (memory_id, kind, answer_id, author, _now()),
+            )
+            await self._conn.commit()
+            return cur.rowcount > 0
+
+    async def drop_memory_feedback(self, *, answer_id: str, author: str, kind: str) -> int:
+        """Take a verdict back, while it is still only a row.
+
+        Somebody removing a reaction is retracting it, and until `reflect` has
+        acted on it there is nothing to undo but this. One that has already
+        been applied stays: the corpus has moved, and quietly un-applying it
+        here would leave the row and the file disagreeing with nobody able to
+        tell which was right.
+        """
+        async with self._serial:
+            cur = await self._conn.execute(
+                "DELETE FROM memory_feedback"
+                " WHERE answer_id = ? AND author = ? AND kind = ? AND applied_at IS NULL",
+                (answer_id, author, kind),
+            )
+            await self._conn.commit()
+            return cur.rowcount
+
+    async def endorsements_since(self, since: str) -> dict[str, int]:
+        """How many people vouched for each memory since `since`.
+
+        A window and a count, exactly like `memory_hits_since`, because it
+        feeds the same recomputed number and has to leave it idempotent.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT memory_id, COUNT(*) AS votes FROM memory_feedback"
+                " WHERE kind = 'up' AND created_at >= ? GROUP BY memory_id",
+                (since,),
+            ) as cur,
+        ):
+            return {str(row["memory_id"]): int(row["votes"]) for row in await cur.fetchall()}
+
+    async def unapplied_feedback(self, kind: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Verdicts nothing has acted on yet, oldest first."""
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT * FROM memory_feedback WHERE kind = ? AND applied_at IS NULL"
+                " ORDER BY created_at LIMIT ?",
+                (kind, limit),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def mark_feedback_applied(self, ids: Sequence[int]) -> int:
+        """Spend these verdicts. Called after the commit that acted on them."""
+        if not ids:
+            return 0
+        async with self._serial:
+            cur = await self._conn.execute(
+                f"UPDATE memory_feedback SET applied_at = ?"
+                f" WHERE id IN ({_marks(ids)}) AND applied_at IS NULL",
+                (_now(), *ids),
+            )
+            await self._conn.commit()
+            return cur.rowcount
+
     # -- reviews ---------------------------------------------------------------
 
     async def queue_review(

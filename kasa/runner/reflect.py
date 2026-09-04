@@ -57,6 +57,12 @@ log = logging.getLogger(__name__)
 
 JOB = "reflect"
 
+#: How many more down-votes are read than can be acted on. Several of them
+#: land on one memory, and several more name memories that have since been
+#: merged away — both are spent without producing a patch, so reading exactly
+#: the budget would spend a night's whole allowance on rows that write nothing.
+_FEEDBACK_SLACK = 4
+
 #: The journal is a workspace document. Every other scope is deliberately
 #: absent from it — see the module docstring.
 JOURNAL_SCOPE = "workspace"
@@ -119,6 +125,9 @@ class Reflection:
     episodes: int = 0
     journalled: bool = False
     rescored: int = 0
+    #: Memories whose confidence was lowered because somebody marked an answer
+    #: that used them as wrong (#36).
+    suspected: int = 0
     conflicts: list[Conflict] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)
     sha: str | None = None
@@ -131,6 +140,8 @@ class Reflection:
         parts.append("journal written" if self.journalled else "no journal")
         if self.rescored:
             parts.append(f"{self.rescored} salience update(s)")
+        if self.suspected:
+            parts.append(f"{self.suspected} memory(s) marked suspect")
         if self.conflicts:
             parts.append(f"{len(self.conflicts)} contradiction(s) surfaced")
         return ", ".join(parts)
@@ -202,13 +213,24 @@ class Reflector:
         # salience update silently restores yesterday's prose. It gets its turn
         # tomorrow, with the salience its new age implies.
         rescored = await self._salience(manifest, moment, skip=_targets(patches))
+        # Before the rescore in the plan and after it here: a memory can be
+        # both endorsed and doubted in one window, and the two updates touch
+        # different fields of one file. `_compile` projects the plan as it
+        # goes, so the later patch is applied on top of the earlier one rather
+        # than overwriting it.
+        suspect, spent = await self._suspect(manifest, skip=_targets(patches))
 
-        result = await self._apply(patches, rescored, day)
+        result = await self._apply(patches, [*rescored, *suspect], day)
+        if result.sha or result.pull_request_url:
+            # Spent only once the commit exists. A down-vote marked applied by
+            # a run that then failed is a correction nobody will ever make.
+            await self._store.mark_feedback_applied(spent)
         outcome = Reflection(
             day=day,
             episodes=len(episodes),
             journalled=bool(patches) and result.sha is not None,
             rescored=len(rescored) if result.sha else 0,
+            suspected=len(suspect) if result.sha else 0,
             conflicts=conflicts,
             changed=list(result.changed),
             sha=result.sha,
@@ -280,9 +302,12 @@ class Reflector:
         than one commit can hold, the memories furthest from their true score
         are the ones to fix, and the rest are fixed on the following nights.
         """
-        hits = await self._store.memory_hits_since(
-            _stamp(now - timedelta(days=self._settings.hit_window_days))
-        )
+        window = _stamp(now - timedelta(days=self._settings.hit_window_days))
+        hits = await self._store.memory_hits_since(window)
+        # The same window, because it feeds the same recomputed number and has
+        # to leave it idempotent: a 👍 counts for as long as a recall does, and
+        # then stops (#36).
+        endorsed = await self._store.endorsements_since(window)
         decay = self._settings.decay()
         moves: list[tuple[float, MemoryPatch]] = []
         for memory_id, entry in manifest.memories.items():
@@ -299,7 +324,9 @@ class Reflector:
             # gets through twenty files a night converge rather than
             # double-count the ones it did reach.
             updated = decay.score(
-                age=age_of(doc.frontmatter.updated, now), hits=hits.get(memory_id, 0)
+                age=age_of(doc.frontmatter.updated, now),
+                hits=hits.get(memory_id, 0),
+                endorsements=endorsed.get(memory_id, 0),
             )
             move = abs(updated - current)
             if move < self._settings.min_salience_move:
@@ -308,6 +335,76 @@ class Reflector:
 
         moves.sort(key=lambda pair: pair[0], reverse=True)
         return [patch for _, patch in moves[: self._settings.max_salience_updates]]
+
+    # -- feedback ------------------------------------------------------------
+
+    async def _suspect(
+        self, manifest: Manifest, *, skip: frozenset[str] = frozenset()
+    ) -> tuple[list[MemoryPatch], list[int]]:
+        """Lower the confidence of memories somebody marked wrong (#36).
+
+        An event applied exactly once, not a number recomputed — which is the
+        opposite of how salience works two methods up, and deliberately so.
+        Confidence is not derived from anything: it is a number a model set and
+        nothing recalculates, so a ❌ re-applied every night would walk it to
+        zero inside a fortnight.
+
+        Which makes spending the rows the delicate part, and it happens in two
+        places. A row that produced a patch is spent by `run`, once the commit
+        exists — marking it before that is a correction nobody will ever make.
+        A row that produced *nothing* is spent here: its memory has been merged
+        away, or its confidence is already at the floor, and there is no commit
+        for it to wait for. Leaving those pending would have the night read
+        them again for the life of the installation.
+
+        The memory is not archived, deleted, or contradicted here. One person
+        disagreeing with one answer is a reason to trust a memory less — the
+        memory may have been right and the answer wrong about which memory to
+        use — and the review this raised at the time is where that judgement
+        belongs.
+
+        Returns the patches, and the row ids the commit is responsible for.
+        """
+        pending = await self._store.unapplied_feedback(
+            "down", limit=self._settings.max_suspect_updates * _FEEDBACK_SLACK
+        )
+        patches: list[MemoryPatch] = []
+        spent: list[int] = []
+        # Rows with nothing left to do, spent below rather than waiting for a
+        # commit there is no reason to expect.
+        moot: list[int] = []
+        seen: set[str] = set()
+        for row in pending:
+            memory_id = str(row["memory_id"])
+            entry = manifest.memories.get(memory_id)
+            if entry is None:
+                # Merged away or deleted since somebody doubted it.
+                moot.append(int(row["id"]))
+                continue
+            if memory_id in seen or memory_id in skip:
+                # Already covered by this night's plan, or by the journal's. It
+                # keeps its turn rather than being spent on somebody else's
+                # patch.
+                continue
+            if len(patches) >= self._settings.max_suspect_updates:
+                continue
+            try:
+                doc = MemoryDoc.parse(self._memory.read(entry.path), source=entry.path)
+            except (MemoryStoreError, MemoryError_) as exc:
+                log.warning("reflect: skipping %s: %s", entry.path, exc)
+                continue
+            lowered = round(max(doc.frontmatter.confidence * self._settings.suspect_factor, 0.0), 4)
+            if lowered == doc.frontmatter.confidence:
+                # Already at the floor: nothing to write, and nothing a later
+                # night would write either.
+                moot.append(int(row["id"]))
+                continue
+            seen.add(memory_id)
+            spent.append(int(row["id"]))
+            patches.append(Update(id=memory_id, frontmatter={"confidence": lowered}))
+
+        await self._store.mark_feedback_applied(moot)
+        return patches, spent
 
     # -- contradictions ------------------------------------------------------
 
