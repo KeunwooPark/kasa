@@ -831,6 +831,29 @@ is removed and no `tool_use_id` changes, so the transcript still replays, and
 the store keeps every result in full for consolidation to read later. `/trace`
 reports compaction separately from dropped groups.
 
+### 8.5.1 How much work one turn may do
+
+Two bounds, both in `[agent]`, and a turn that reaches either writes up what it
+has rather than returning nothing.
+
+`max_tool_iterations` is rounds of tool calls, not tool calls: a round may ask
+for several at once. Forty is a budget for a piece of work — *find five people
+and check each one's page* needs a round per person plus the rounds that got
+there — where the old eight was a budget for answering a question and never
+reached the first page. The model is told how many rounds remain on every pass,
+so it can spend them rather than be surprised by the end of them.
+
+`max_turn_seconds` is the wall clock, checked between rounds and never enforced
+mid-dispatch: a turn is stopped where its findings are intact and can still be
+written up. It exists because forty rounds is far too loose to be the only
+bound on a person waiting in a Slack thread, and because `[budget]`'s daily
+ceiling pauses utility calls, not the chat model. Neither dial bounds spend
+directly; a turn's cost is metered like any other and shows up in `kasa cost`.
+
+Raising `max_tool_iterations` costs context as well as money: every round adds
+its results to the turn, and past the recent share those results start being
+elided (§8.5) rather than sent in full.
+
 ### 8.6 Explainability
 
 `kasa why "<question>"` prints the constructed query, every candidate with its
@@ -1196,6 +1219,12 @@ max_files_per_commit = 25
 max_per_owner          = 20           # per person, counting active and paused
 min_interval_minutes   = 15           # floor on the gap the expression actually produces
 disable_after_failures = 5            # consecutive failed runs before it is paused
+
+[agent]                               # how much work one turn may do
+max_tool_iterations = 40              # rounds of tool calls before it must answer
+max_turn_seconds    = 600             # wall clock, checked between rounds
+max_tokens          = 4096
+history_limit       = 200
 
 [budget]
 daily_usd_ceiling = 10.0

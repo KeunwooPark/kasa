@@ -315,6 +315,65 @@ async def test_a_turn_with_no_tools_is_told_nothing_about_a_budget(
     assert STATUS_HEADER not in (provider.requests[0].context or "")
 
 
+async def test_a_turn_can_do_a_piece_of_work_not_just_answer_a_question() -> None:
+    """#203: eight rounds never reached the first of five profile pages."""
+    assert AgentConfig().max_tool_iterations >= 30
+
+
+async def test_a_turn_that_runs_out_of_clock_answers_with_what_it_found(
+    store: Store, tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forty rounds is far too loose to be the only bound on a waiting person."""
+    agent, provider = build(
+        store,
+        tokenizer,
+        [calls("weather"), calls("weather"), says("4C in Seoul, and nothing else yet")],
+        config=AgentConfig(max_tool_iterations=40, max_turn_seconds=5.0),
+    )
+    ticks = iter([0.0, 0.0, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr("kasa.core.agent.monotonic", lambda: next(ticks, 100.0))
+
+    result = await agent.respond("s1", "weather in five cities?")
+
+    assert result.stop_reason == "max_duration"
+    assert result.text == "4C in Seoul, and nothing else yet"
+    assert result.note is not None
+    assert "ran out of time" in result.note
+    # It stopped well short of the iteration ceiling, and it still landed.
+    assert result.iterations < 40
+    assert provider.requests[-1].tools == ()
+
+
+async def test_the_clock_stops_a_turn_between_rounds_not_mid_dispatch(
+    store: Store, tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn stopped mid-dispatch loses the round it was in the middle of."""
+    agent, _ = build(
+        store,
+        tokenizer,
+        [calls("weather", "weather"), says("both cities done")],
+        config=AgentConfig(max_turn_seconds=5.0),
+    )
+    monkeypatch.setattr("kasa.core.agent.monotonic", lambda: 0.0)
+
+    result = await agent.respond("s1", "two cities?")
+
+    # The deadline had not passed when the round started, so both calls ran.
+    assert result.tool_calls == 2
+    assert result.stop_reason == "end_turn"
+
+
+def test_an_exhausted_clock_and_an_exhausted_ceiling_read_differently() -> None:
+    """Two dials in `[agent]`, so the note has to say which one ran out."""
+    by_clock = AgentResult(text="what I found", stop_reason="max_duration", tool_calls=9).note
+    by_rounds = AgentResult(text="what I found", stop_reason="max_iterations", tool_calls=9).note
+
+    assert by_clock is not None and by_rounds is not None
+    assert "ran out of time" in by_clock
+    assert "ran out of time" not in by_rounds
+    assert "budget of 9 tool call(s)" in by_rounds
+
+
 async def test_running_out_of_tool_budget_still_answers_with_what_it_found(
     store: Store, tokenizer: Tokenizer
 ) -> None:

@@ -14,6 +14,7 @@ from kasa.config import (
     load_config,
     write_config,
 )
+from kasa.core.agent import AgentConfig
 from kasa.errors import ConfigError
 from kasa.llm.registry import ModelRole
 
@@ -101,6 +102,7 @@ model = "test-model"
 
 [agent]
 max_tool_iterations = 3
+max_turn_seconds = 90.0
 
 [pricing."test-model"]
 input = 1.0
@@ -111,7 +113,22 @@ output = 2.0
 
     assert cfg.llm["chat"].model == "test-model"
     assert cfg.agent_config().max_tool_iterations == 3
+    assert cfg.agent_config().max_turn_seconds == 90.0
     assert cfg.price_book().lookup("test-model") is not None
+
+
+def test_both_bounds_on_a_turn_are_dials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn is bounded by rounds and by clock, and either can be tuned alone."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[llm.chat]\nkind = "anthropic"\nmodel = "m"\n\n[agent]\nmax_turn_seconds = 30.0\n'
+    )
+
+    config = load_config(path).agent_config()
+
+    assert config.max_turn_seconds == 30.0
+    assert config.max_tool_iterations == AgentConfig().max_tool_iterations
 
 
 def test_malformed_toml_reports_the_path(tmp_path: Path) -> None:

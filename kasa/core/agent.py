@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from time import monotonic
 
 from kasa.core.context import ContextPacker, PackedContext, PackTrace
 from kasa.core.tools import ToolContext, ToolRegistry
@@ -77,7 +78,28 @@ OUT_OF_TOOL_BUDGET = (
 @dataclass(slots=True)
 class AgentConfig:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    max_tool_iterations: int = 8
+    max_tool_iterations: int = 40
+    """How much work one turn may do, counted in rounds of tool calls.
+
+    Eight was a budget for answering a question. It is now the bound on a piece
+    of work — "find five people and check each one's page" needs a round per
+    person plus the rounds that got there, and eight never reached the first
+    page (#203). It is only safe this high because the turn in flight now
+    carries less of its own history as it grows (#202); before that, a turn
+    this long exceeded the context window instead of the ceiling.
+    """
+
+    max_turn_seconds: float = 600.0
+    """Wall-clock bound on one turn, checked before each new round of tools.
+
+    The iteration ceiling used to be the only thing bounding how long a turn
+    could run and how much it could spend, and at forty rounds it is far too
+    loose to be that. Somebody is waiting on the other end of a Slack thread,
+    and the daily USD ceiling pauses utility calls, not this. Checked between
+    rounds rather than enforced with a timeout: a turn is stopped where its
+    findings are intact and can still be written up, never mid-dispatch.
+    """
+
     max_tokens: int = 4096
     temperature: float | None = None
     history_limit: int = 200
@@ -119,6 +141,19 @@ class AgentResult:
                 operational = (
                     f"this used up its budget of {self.tool_calls} tool call(s), so the "
                     "answer covers only what it had found by then."
+                )
+            # Told apart from the iteration ceiling because the fixes differ:
+            # one turn wanted more rounds, the other wanted more clock, and
+            # `[agent]` has a separate dial for each.
+            case "max_duration" if self.text.strip():
+                operational = (
+                    "this turn ran out of time, so the answer covers only what it had "
+                    f"found in {self.tool_calls} tool call(s) by then."
+                )
+            case "max_duration":
+                operational = (
+                    f"stopped after {self.tool_calls} tool call(s) without an answer — the "
+                    "turn ran out of time. Try a narrower question."
                 )
             case "max_iterations":
                 operational = (
@@ -269,6 +304,7 @@ class Agent:
         if origin == "scheduled":
             system_prompt = f"{system_prompt}\n\n{SCHEDULED_TURN}"
 
+        deadline = monotonic() + self.config.max_turn_seconds
         usage = Usage()
         pinned: list[str] = []
         retrieved: list[str] = []
@@ -318,12 +354,16 @@ class Agent:
             if response.stop_reason != "tool_use" or not tool_uses:
                 break
 
-            if iteration > self.config.max_tool_iterations:
-                # Out of iterations with calls outstanding. Answer them with an
+            if iteration > self.config.max_tool_iterations or monotonic() > deadline:
+                # Out of budget with calls outstanding. Answer them with an
                 # error rather than leaving an unanswered `tool_use` behind: no
                 # provider will accept that transcript on the next turn.
                 await self._store.append_message(session_id, _refused(tool_uses))
-                stop_reason = "max_iterations"
+                stop_reason = (
+                    "max_iterations"
+                    if iteration > self.config.max_tool_iterations
+                    else "max_duration"
+                )
                 # Everything the turn found is sitting in the transcript. One
                 # more call, with no tools to reach for, is what turns it into
                 # an answer instead of throwing it away (#200).
