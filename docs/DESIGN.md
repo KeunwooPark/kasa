@@ -750,7 +750,12 @@ measured at the target, it reached a loopback server. So:
   aborted before it is sent.
 - **Most are never made.** `image`, `media` and `font` are aborted on resource
   type alone, before any resolution — 5,265 of 5,341 on that page, with all 24
-  showtimes still recovered.
+  showtimes still recovered. They cost no network and no DNS, so they are not
+  counted against the request budget either: doing so stopped a render at 600
+  that had actually fetched about 70, and then described a page that had lost
+  nothing as cut off (#197). The budget bounds what is fetched; a separate,
+  absolute ceiling on how often a page may be *declined* exists only because
+  free is not unlimited.
 - **A host is judged once per render**, not once per request. A page making a
   thousand calls to one CDN would otherwise be a thousand resolutions of one
   name, and would time out before the guard finished.
@@ -768,6 +773,14 @@ measured at the target, it reached a loopback server. So:
 Waiting for the network to fall idle is what ordinary automation does and it
 does not survive a page that polls — the measured page never went idle at all.
 A fixed settle does.
+
+**Cut and incomplete are different things**, on both paths, and are reported in
+different words. *Truncated* is "there is more text here than you are being
+shown", set when the readable text did not fit the character budget.
+*Incomplete* is "there may have been more of this page", set by the byte cap on
+a served page and the request cap on a rendered one. They were one flag until
+#197, which reported a complete answer as cut off — and a model told its
+evidence is incomplete hedges on an answer that was not.
 
 **The residual, stated rather than hidden.** Subresources are approved by URL,
 but Chromium resolves them itself, so the pin covers the document and not every

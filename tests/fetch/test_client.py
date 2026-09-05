@@ -204,21 +204,34 @@ async def test_json_is_readable_too() -> None:
 
 
 async def test_a_body_bigger_than_the_cap_stops_being_read() -> None:
+    """Incomplete, not truncated. The download stopped; the text that arrived
+    was not then cut to fit anything (#197)."""
     page = await fetcher(
         serving("<p>" + "word " * 100_000 + "</p>"), max_bytes=4_096, max_chars=100_000
     ).fetch("https://example.invalid/")
 
-    assert page.truncated
+    assert page.incomplete
+    assert not page.truncated
     assert len(page.text) < 10_000
 
 
 async def test_a_page_longer_than_the_char_budget_is_cut() -> None:
+    """Truncated, not incomplete. The whole page arrived; more of it exists
+    than the model is being shown."""
     page = await fetcher(serving("<p>" + "word " * 5_000 + "</p>"), max_chars=500).fetch(
         "https://example.invalid/"
     )
 
     assert page.truncated
+    assert not page.incomplete
     assert len(page.text) < 700
+
+
+async def test_a_page_that_fitted_is_neither_cut_nor_incomplete() -> None:
+    page = await fetcher(serving()).fetch("https://example.invalid/")
+
+    assert not page.truncated
+    assert not page.incomplete
 
 
 async def test_a_page_with_nothing_readable_in_it_says_so() -> None:

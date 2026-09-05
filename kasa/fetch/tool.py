@@ -166,7 +166,22 @@ def _render(page: Page, *, can_render: bool = False) -> str:
         where += f" (after {page.redirects} redirect(s))"
     if page.title:
         where += f" — {page.title!r}"
-    cut = " The page was longer than the limit and is cut off." if page.truncated else ""
+    # Two facts, two sentences, and neither said when neither happened. They
+    # were one flag until #197, which reported a page that had lost nothing as
+    # cut off — and a model told its evidence is incomplete hedges on an answer
+    # that was complete.
+    cut = (
+        " The page was longer than the limit, so the text below is cut off."
+        if page.truncated
+        else ""
+    )
+    if page.incomplete:
+        cut += (
+            " The page was still loading when this render reached its limits, so some of it "
+            "may be missing."
+            if page.rendered
+            else " The page was larger than the download limit, so the end of it was not read."
+        )
     # The one line that turns "this page is empty" into a next step. Outside
     # the delimiter, because it is Kasa's observation and not the page's — and
     # different advice depending on whether there is a browser to give it, so

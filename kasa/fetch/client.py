@@ -79,7 +79,18 @@ class Page:
     title: str | None
     text: str
     truncated: bool
+    """Whether the readable text was cut to fit the character budget.
+
+    "There is more text here than you can see." Distinct from `incomplete`,
+    which says the page may not have finished arriving — two different facts
+    that were one flag until #197, and were reported with one sentence that was
+    wrong for half of them.
+    """
     redirects: int
+    #: Whether acquisition stopped before the page was finished: the byte cap
+    #: on a served page, the request cap on a rendered one. "There may have
+    #: been more of this page."
+    incomplete: bool = False
     #: Whether a browser ran the page, rather than the served HTML being read.
     rendered: bool = False
     #: Set when the served HTML looks like a shell that fills itself in later —
@@ -190,8 +201,9 @@ class WebFetcher:
             content_type="text/html",
             title=title,
             text=text,
-            truncated=cut or page.truncated,
+            truncated=cut,
             redirects=0,
+            incomplete=page.incomplete,
             rendered=True,
         )
 
@@ -267,8 +279,9 @@ class WebFetcher:
             content_type=content_type,
             title=title,
             text=text,
-            truncated=cut or oversize,
+            truncated=cut,
             redirects=redirects,
+            incomplete=oversize,
             scripted=_is_shell(decoded, content_type),
         )
 

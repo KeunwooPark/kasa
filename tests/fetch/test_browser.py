@@ -286,40 +286,84 @@ async def test_a_host_is_judged_once_per_render_not_once_per_request() -> None:
 # -- the caps -----------------------------------------------------------------
 
 
-async def test_a_page_that_will_not_stop_asking_is_cut_off() -> None:
+async def test_a_page_that_will_not_stop_fetching_is_cut_off() -> None:
     browser = FakeBrowser()
     requests = [(f"https://example.invalid/{n}.js", "script") for n in range(10)]
 
-    # Four allowed in total, and the document is the first of them.
+    # Four fetches in total, and the document is the first of them.
     outcomes = await routed(browser, *requests, max_requests=4)
 
     assert outcomes[:3] == ["continue"] * 3
     assert outcomes[3:] == ["abort"] * 7
 
 
-async def test_a_render_that_hit_a_cap_says_it_was_cut() -> None:
-    """So the model can tell a page that finished from a page that was stopped
-    part-way, and weigh what it read accordingly."""
+async def test_what_is_never_fetched_does_not_consume_the_budget() -> None:
+    """#197. A measured page intercepted 4,381 requests of which 4,311 were
+    images; counting those against the cap stopped a render at 600 that had
+    fetched about 70, and reported a complete page as cut off."""
+    browser = FakeBrowser()
+    requests = [(f"https://example.invalid/{n}.png", "image") for n in range(200)]
+    requests.append(("https://example.invalid/late.js", "script"))
+
+    outcomes = await routed(browser, *requests, max_requests=4)
+
+    assert outcomes[:200] == ["abort"] * 200, "every image aborted"
+    assert outcomes[200] == "continue", "and the script that came after still went"
+
+
+async def test_a_render_that_only_aborted_images_is_not_incomplete() -> None:
+    """The bug as the model saw it: a page that lost nothing, described as
+    though it had."""
+    browser = FakeBrowser()
+    browser.subrequests = [(f"https://example.invalid/{n}.png", "image") for n in range(500)]
+    r, _ = renderer(browser, max_requests=10)
+
+    page = await r.render("https://example.invalid/a")
+
+    assert not page.incomplete
+    assert page.blocked == 500
+    assert page.fetched == 1, "the document, and nothing else"
+
+
+async def test_a_page_that_asks_pathologically_often_is_still_stopped() -> None:
+    """The cap on fetches is the budget; this is the runaway guard, and it is
+    absolute rather than a multiple of that budget. Free is not unlimited."""
+    browser = FakeBrowser()
+    browser.subrequests = [("https://example.invalid/x.png", "image")] * 300
+    r, _ = renderer(browser, max_requests=2, max_intercepts=100)
+
+    page = await r.render("https://example.invalid/a")
+
+    assert page.incomplete
+    assert page.fetched == 1, "the document, and nothing after the ceiling"
+    assert page.requests == 301, "it keeps counting how often it was asked"
+    assert set(browser.outcomes) == {"abort", "continue"}
+
+
+async def test_a_render_stopped_by_the_fetch_cap_says_it_was_incomplete() -> None:
+    """So the model can tell a page that finished from one stopped part-way,
+    and weigh what it read accordingly."""
     browser = FakeBrowser()
     browser.subrequests = [(f"https://example.invalid/{n}.js", "script") for n in range(10)]
     r, _ = renderer(browser, max_requests=3)
 
     page = await r.render("https://example.invalid/a")
 
-    assert page.truncated
-    assert page.requests > 3
+    assert page.incomplete
+    assert page.fetched == 3
     assert browser.outcomes[3:] == ["abort"] * 8, "everything past the cap"
 
 
-async def test_a_render_that_stayed_inside_its_caps_is_not_marked_cut() -> None:
+async def test_a_render_that_stayed_inside_its_caps_is_not_marked_incomplete() -> None:
     browser = FakeBrowser()
     browser.subrequests = [("https://example.invalid/a.js", "script")]
     r, _ = renderer(browser, max_requests=50)
 
     page = await r.render("https://example.invalid/a")
 
-    assert not page.truncated
+    assert not page.incomplete
     assert page.blocked == 0
+    assert page.fetched == 2, "the document and its script"
 
 
 async def test_the_count_of_what_was_refused_comes_back() -> None:
