@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from kasa.errors import ConfigError
 from kasa.llm.tokens import Tokenizer, count_message
-from kasa.llm.types import Message, ToolDef
+from kasa.llm.types import Message, ToolDef, ToolResultBlock
 
 #: Counts tokens in a string.
 Counter = Callable[[str], int]
@@ -44,6 +44,22 @@ PINNED_HEADER = "# Pinned memory"
 #: operational fact about the turn, and the sentence that scopes the memory
 #: sections must not be able to reach it.
 STATUS_HEADER = "# Turn status"
+
+#: What is left of a tool result once the turn it belongs to has outgrown its
+#: share: this many characters from the head, and this many from the tail.
+#:
+#: A tail rather than a head alone, for two reasons. Tool results tend to put
+#: the summary at the end — the source list, the total, the last row — and
+#: `kasa/untrusted.py` closes its nonce delimiter there. Cutting only from the
+#: right would leave an untrusted block that never closes, and the model would
+#: read everything after it as untrusted too.
+ELIDED_HEAD_CHARS = 400
+ELIDED_TAIL_CHARS = 200
+
+#: Said in place of what was cut. It names a number because "some of this is
+#: missing" and "38,000 characters of this are missing" call for different
+#: decisions about whether to go and fetch the page again.
+ELISION_MARKER = "\n[…{n} characters elided to fit this turn in context…]\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +104,12 @@ class SegmentTrace:
     kept: int
     dropped: int
     truncated: bool = False
+    #: Tool results shortened in place rather than dropped (#202). Its own
+    #: field because the two are different events with different fixes: a
+    #: dropped group is history the model lost, a compacted one is history it
+    #: still has in outline. A single flag covering both would send anybody
+    #: reading `/trace` after a bad answer looking in the wrong place.
+    compacted: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,9 +122,10 @@ class PackTrace:
         lines = [f"budget {self.total_budget} tokens, used {self.used}"]
         for seg in self.segments:
             note = " (truncated)" if seg.truncated else ""
+            compacted = f" compacted={seg.compacted}" if seg.compacted else ""
             lines.append(
                 f"  {seg.name:<10} {seg.used:>7}/{seg.budget:<7} "
-                f"kept={seg.kept} dropped={seg.dropped}{note}"
+                f"kept={seg.kept} dropped={seg.dropped}{compacted}{note}"
             )
         return "\n".join(lines)
 
@@ -270,11 +293,20 @@ class ContextPacker:
 
         kept: list[list[Message]] = []
         used = 0
+        compacted = 0
         # Newest first: the most recent exchange is the one that must survive.
         for group in reversed(groups):
             cost = sum(count_message(m, self._tok) for m in group)
-            if used + cost > budget and kept:
-                break
+            if used + cost > budget:
+                if kept:
+                    break
+                # The newest group is the turn in flight, and it cannot be
+                # dropped: an assistant `tool_use` whose `tool_result` went
+                # missing is a hard 400. So a turn that has outgrown the budget
+                # on its own tool output has one way left to fit, which is to
+                # carry less of its own history (#202).
+                group, compacted = compact_tool_results(group, budget, self._tok)
+                cost = sum(count_message(m, self._tok) for m in group)
             kept.append(group)
             used += cost
 
@@ -286,6 +318,7 @@ class ContextPacker:
             used=used,
             kept=len(kept),
             dropped=len(groups) - len(kept),
+            compacted=compacted,
         )
 
 
@@ -311,6 +344,73 @@ def group_turns(messages: Sequence[Message]) -> list[list[Message]]:
     if current:
         groups.append(current)
     return groups
+
+
+def compact_tool_results(
+    group: Sequence[Message], budget: int, tokenizer: Tokenizer
+) -> tuple[list[Message], int]:
+    """Shrink a turn's own tool output until the turn fits. Never drop a block.
+
+    A long-horizon turn accumulates its results in one group, and that group is
+    the one the packer is forbidden to trim — so without this it grows until it
+    exceeds the model's window and the turn fails outright. The eight-iteration
+    ceiling used to hide that by stopping the turn first.
+
+    Oldest first, and only as far as it has to go: a search page from twelve
+    rounds ago is not what the model is reasoning about, and the result that
+    just came back is. The newest survives intact unless eliding everything
+    before it still was not enough, in which case a shortened result is still a
+    better answer than a rejected request.
+
+    Returns the messages and how many results were shortened. `tool_use_id` is
+    never touched and no block is ever removed: the shape of the transcript is
+    exactly what makes it replayable.
+    """
+    cost = sum(count_message(m, tokenizer) for m in group)
+    if cost <= budget:
+        return list(group), 0
+
+    messages = list(group)
+    elided = 0
+    for index, message in enumerate(messages):
+        if cost <= budget:
+            break
+        if not message.tool_results_in:
+            continue
+
+        blocks = []
+        saved = 0
+        for block in message.content:
+            if isinstance(block, ToolResultBlock):
+                short = _elide(block.content)
+                if len(short) < len(block.content):
+                    saved += tokenizer.count(block.content) - tokenizer.count(short)
+                    elided += 1
+                    block = block.model_copy(update={"content": short})
+            blocks.append(block)
+
+        if saved:
+            messages[index] = message.model_copy(update={"content": tuple(blocks)})
+            cost -= saved
+
+    return messages, elided
+
+
+def _elide(content: str) -> str:
+    """Head, a marker naming what went, and tail. Line boundaries where there are any."""
+    cut = len(content) - ELIDED_HEAD_CHARS - ELIDED_TAIL_CHARS
+    if cut <= len(ELISION_MARKER.format(n=cut)):
+        return content
+
+    head = content[:ELIDED_HEAD_CHARS]
+    if (edge := head.rfind("\n", int(ELIDED_HEAD_CHARS * 0.8))) > 0:
+        head = head[:edge]
+
+    tail = content[-ELIDED_TAIL_CHARS:]
+    if (edge := tail.find("\n")) >= 0:
+        tail = tail[edge + 1 :]
+
+    return head + ELISION_MARKER.format(n=len(content) - len(head) - len(tail)) + tail
 
 
 def _fit(items: list[str], budget: int, count: Counter) -> tuple[list[str], int]:

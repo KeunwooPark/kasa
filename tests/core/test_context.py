@@ -20,6 +20,7 @@ from kasa.llm.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from kasa.untrusted import delimit
 
 
 def exchange(n: int, size: int = 200) -> list[Message]:
@@ -39,6 +40,21 @@ def tool_exchange() -> list[Message]:
         Message.tool_results([ToolResultBlock(tool_use_id="t1", content="12:00")]),
         Message.assistant("noon"),
     ]
+
+
+def research_turn(rounds: int, size: int = 4000) -> list[Message]:
+    """One turn that keeps fetching: a `tool_use` and a big result per round."""
+    messages: list[Message] = [Message.user("find five book bloggers")]
+    for n in range(rounds):
+        messages.append(
+            Message(
+                role="assistant",
+                content=(ToolUseBlock(id=f"t{n}", name="web_fetch", input={"url": f"u{n}"}),),
+            )
+        )
+        body = f"page {n} opens here\n" + f"filler {n} " * (size // 10) + f"\npage {n} ends here"
+        messages.append(Message.tool_results([ToolResultBlock(tool_use_id=f"t{n}", content=body)]))
+    return messages
 
 
 def test_budget_shares_must_sum_to_one() -> None:
@@ -131,6 +147,109 @@ def test_truncation_never_orphans_a_tool_result(tokenizer: Tokenizer) -> None:
     used = {b.id for m in packed.messages for b in m.tool_uses}
     answered = {b.tool_use_id for m in packed.messages for b in m.tool_results_in}
     assert used == answered
+
+
+def test_a_turn_that_outgrows_the_budget_on_its_own_tool_output_still_fits(
+    tokenizer: Tokenizer,
+) -> None:
+    """#202: the group the packer may not drop is the one that grows without bound.
+
+    The newest group is always admitted whole, because splitting it orphans a
+    `tool_result`. Before this, a research turn just kept growing until the
+    request exceeded the window.
+    """
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+    turn = research_turn(rounds=12)
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=turn)
+
+    recent = next(seg for seg in packed.trace.segments if seg.name == "recent")
+    assert count_messages(packed.messages, tokenizer) > 0
+    assert recent.used <= recent.budget
+    assert recent.compacted > 0
+    # Nothing was dropped: every round is still represented.
+    assert len(packed.messages) == len(turn)
+
+
+def test_compaction_keeps_the_newest_results_verbatim(tokenizer: Tokenizer) -> None:
+    """The page that just came back is what the model is reasoning about."""
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+    turn = research_turn(rounds=12)
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=turn)
+
+    results = [b.content for m in packed.messages for b in m.tool_results_in]
+    assert "elided" in results[0]
+    assert results[-1] == [b.content for m in turn for b in m.tool_results_in][-1]
+
+
+def test_compaction_never_orphans_a_tool_result(tokenizer: Tokenizer) -> None:
+    """Shortening content is allowed; changing the shape of the transcript is not."""
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=research_turn(rounds=12))
+
+    used = {b.id for m in packed.messages for b in m.tool_uses}
+    answered = {b.tool_use_id for m in packed.messages for b in m.tool_results_in}
+    assert used == answered
+    assert len(used) == 12
+
+
+def test_compaction_leaves_the_stored_messages_alone(tokenizer: Tokenizer) -> None:
+    """Packing shortens a request. Consolidation reads the rows afterwards."""
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+    turn = research_turn(rounds=12)
+    before = [b.content for m in turn for b in m.tool_results_in]
+
+    packer.pack(system_prompt="You are Kasa.", recent=turn)
+
+    assert [b.content for m in turn for b in m.tool_results_in] == before
+
+
+def test_compaction_keeps_the_end_of_an_untrusted_block(tokenizer: Tokenizer) -> None:
+    """Cutting only the tail would leave a delimiter that never closes.
+
+    Everything after an unclosed `<<<BEGIN …>>>` reads as untrusted, which is
+    the rest of the turn and Kasa's own words with it.
+    """
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+    turn = research_turn(rounds=12)
+    turn[2] = Message.tool_results(
+        [ToolResultBlock(tool_use_id="t0", content=delimit("a page " * 4000))]
+    )
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=turn)
+
+    first = next(b.content for m in packed.messages for b in m.tool_results_in)
+    assert "elided" in first
+    begin = first.split(">>>")[0].removeprefix("<<<BEGIN ").strip()
+    assert f"<<<END {begin}>>>" in first
+
+
+def test_a_turn_inside_its_budget_is_not_compacted(tokenizer: Tokenizer) -> None:
+    """Compaction is a last resort, not a policy."""
+    packer = ContextPacker(ContextBudget(total=200_000), tokenizer=tokenizer)
+    turn = research_turn(rounds=3)
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=turn)
+
+    recent = next(seg for seg in packed.trace.segments if seg.name == "recent")
+    assert recent.compacted == 0
+    assert [b.content for m in packed.messages for b in m.tool_results_in] == [
+        b.content for m in turn for b in m.tool_results_in
+    ]
+
+
+def test_the_trace_tells_compacted_apart_from_dropped(tokenizer: Tokenizer) -> None:
+    """Different events, different fixes: lost history versus history in outline."""
+    packer = ContextPacker(ContextBudget(total=20_000), tokenizer=tokenizer)
+
+    packed = packer.pack(system_prompt="You are Kasa.", recent=research_turn(rounds=12))
+
+    recent = next(seg for seg in packed.trace.segments if seg.name == "recent")
+    assert recent.dropped == 0
+    assert recent.compacted > 0
+    assert f"compacted={recent.compacted}" in packed.trace.render()
 
 
 def test_tool_result_only_messages_do_not_start_a_new_group() -> None:

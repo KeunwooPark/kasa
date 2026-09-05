@@ -821,6 +821,16 @@ Enforced by a tokenizer-aware packer with a fixed allocation:
 Segments are filled in priority order and truncated at their own boundary, so an
 overlong retrieval never evicts the recent turns.
 
+Recent turns truncate by whole exchanges, never inside one: an assistant
+`tool_use` whose `tool_result` was dropped is rejected outright by both provider
+families. That leaves the turn in flight, which cannot be dropped at all and
+which a long research turn grows without bound. It fits by carrying less of its
+own history instead — older tool results in that turn are elided in place,
+oldest first and only as far as it takes, keeping the newest verbatim. Nothing
+is removed and no `tool_use_id` changes, so the transcript still replays, and
+the store keeps every result in full for consolidation to read later. `/trace`
+reports compaction separately from dropped groups.
+
 ### 8.6 Explainability
 
 `kasa why "<question>"` prints the constructed query, every candidate with its
