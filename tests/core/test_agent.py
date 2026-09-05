@@ -261,6 +261,73 @@ async def test_iteration_limit_still_answers_outstanding_calls(
     assert used == answered
 
 
+async def test_running_out_of_tool_budget_still_answers_with_what_it_found(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """#200: eight rounds of research must not be thrown away at the ceiling.
+
+    Asked to find five people, the loop spent its budget finding four and was
+    cut off mid-plan. What reached the user was a leftover preamble and a note
+    blaming the question. The work was in the transcript the whole time.
+    """
+    agent, provider = build(
+        store,
+        tokenizer,
+        [
+            calls("weather", text="checking Seoul next"),
+            calls("weather"),
+            calls("weather"),
+            says("4C in Seoul; I did not get to the other four cities."),
+        ],
+        config=AgentConfig(max_tool_iterations=2),
+    )
+    result = await agent.respond("s1", "weather in five cities?")
+
+    assert result.stop_reason == "max_iterations"
+    assert result.text == "4C in Seoul; I did not get to the other four cities."
+    # Not the preamble the old loop left behind.
+    assert "checking Seoul next" not in result.text
+    assert result.note is not None
+    assert "only what it had found" in result.note
+    # The closing call read what the turn had gathered.
+    assert len(provider.requests) == 4
+
+
+async def test_the_closing_call_is_sent_with_no_tools(store: Store, tokenizer: Tokenizer) -> None:
+    """Omitting the tools is what makes prose the only possible reply."""
+    agent, provider = build(
+        store,
+        tokenizer,
+        [calls("weather"), calls("weather"), calls("weather"), says("partial answer")],
+        config=AgentConfig(max_tool_iterations=2),
+    )
+    await agent.respond("s1", "loop forever")
+
+    assert [t.name for t in provider.requests[0].tools] == ["weather"]
+    assert provider.requests[-1].tools == ()
+    # Same cacheable prefix as every other pass: only the tools are missing.
+    assert provider.requests[-1].system == provider.requests[0].system
+
+
+async def test_a_stray_tool_call_in_the_closing_reply_is_still_answered(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """A model handed no tools should not ask for one; the store survives it if it does."""
+    agent, _ = build(
+        store,
+        tokenizer,
+        [calls("weather") for _ in range(4)],
+        config=AgentConfig(max_tool_iterations=2),
+    )
+    result = await agent.respond("s1", "loop forever")
+
+    assert result.stop_reason == "max_iterations"
+    stored = await store.recent_messages("s1", limit=100)
+    used = {b.id for m in stored for b in m.tool_uses}
+    answered = {b.tool_use_id for m in stored for b in m.tool_results_in}
+    assert used == answered
+
+
 async def test_cancellation_leaves_no_unanswered_tool_use(
     store: Store, tokenizer: Tokenizer
 ) -> None:
@@ -408,7 +475,9 @@ async def test_hitting_the_iteration_limit_leaves_something_to_show_the_user(
     """#46: the loop handled the cap correctly and nobody read the result.
 
     A model that only ever calls tools produced an empty reply, a dim tool-count
-    line, and a fresh prompt — no answer and no reason for its absence.
+    line, and a fresh prompt — no answer and no reason for its absence. Since
+    #200 the closing call is the one that usually saves this; here even that
+    reply is tool calls, so the note is all there is.
     """
     agent, _ = build(
         store,
@@ -436,6 +505,16 @@ def test_every_way_a_turn_can_end_badly_has_something_to_say(
     stop_reason: str, expected: str
 ) -> None:
     assert expected in (AgentResult(text="", stop_reason=stop_reason).note or "")
+
+
+def test_an_exhausted_turn_that_answered_is_reported_as_partial() -> None:
+    """Not user error: the model did the work, the budget ran out (#200)."""
+    note = AgentResult(text="four of the five", stop_reason="max_iterations", tool_calls=16).note
+
+    assert note is not None
+    assert "16 tool call(s)" in note
+    assert "only what it had found" in note
+    assert "narrower question" not in note
 
 
 def test_an_ordinary_answer_says_nothing_extra() -> None:
