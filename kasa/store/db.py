@@ -1153,6 +1153,155 @@ class Store:
             await self._conn.commit()
             return int(cur.rowcount)
 
+    # -- tasks -----------------------------------------------------------------
+    #
+    # A standing task is the intent; the `jobs` rows it produces are the runs.
+    # Nothing here schedules — the clock reads these rows and enqueues a job —
+    # so this section is storage and counting, and every judgement about what a
+    # task is allowed to be lives in `kasa/runner/tasks.py`.
+
+    async def create_task(
+        self,
+        *,
+        task_id: str,
+        owner: str,
+        surface: str,
+        session_id: str,
+        channel: str | None,
+        reply_to: str | None,
+        scope: str,
+        prompt: str,
+        cron: str,
+        timezone: str | None,
+        fire_once: bool,
+    ) -> None:
+        """Insert a task. The caller has already decided it is allowed."""
+        async with self._serial:
+            await self._conn.execute(
+                "INSERT INTO tasks (id, owner, surface, session_id, channel, reply_to, scope,"
+                " prompt, cron, timezone, fire_once, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    owner,
+                    surface,
+                    session_id,
+                    channel,
+                    reply_to,
+                    scope,
+                    prompt,
+                    cron,
+                    timezone,
+                    int(fire_once),
+                    _now(),
+                ),
+            )
+            await self._conn.commit()
+
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        async with self._serial:
+            async with self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_tasks(
+        self,
+        *,
+        state: str | None = None,
+        owner: str | None = None,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Tasks, oldest first, narrowed however the caller is allowed to see.
+
+        `owner` and `session_id` are the narrowing the `schedule_*` tools use,
+        and they are the reason this takes them rather than filtering in Python:
+        a tool that read every row and then discarded the ones it should not
+        show has already had them (§7.1).
+        """
+        narrowing = [
+            (column, value)
+            for column, value in (("state", state), ("owner", owner), ("session_id", session_id))
+            if value is not None
+        ]
+        where = "".join(f" AND {column} = ?" for column, _ in narrowing)
+        async with (
+            self._serial,
+            self._conn.execute(
+                f"SELECT * FROM tasks WHERE 1 = 1{where} ORDER BY created_at, id",
+                tuple(value for _, value in narrowing),
+            ) as cur,
+        ):
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def count_owner_tasks(self, owner: str) -> int:
+        """How many schedules this person has that will still fire.
+
+        `done` is excluded: a fired one-shot is history, and counting it against
+        somebody forever would mean a person who used the feature correctly runs
+        out of it.
+        """
+        async with (
+            self._serial,
+            self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE owner = ? AND state IN ('active', 'paused')",
+                (owner,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def set_task_state(self, task_id: str, *, state: str, error: str | None = None) -> bool:
+        """Move a task between active, paused and done. False if it is gone.
+
+        A task coming back to `active` has its failure count cleared: whoever
+        resumed it is saying the reason it stopped has been dealt with, and
+        resuming into one-failure-from-paused would be a trap.
+        """
+        async with self._serial:
+            if state == "active":
+                statement = (
+                    "UPDATE tasks SET state = 'active', consecutive_failures = 0,"
+                    " last_error = NULL WHERE id = ?"
+                )
+                params: tuple[Any, ...] = (task_id,)
+            else:
+                statement = (
+                    "UPDATE tasks SET state = ?, last_error = COALESCE(?, last_error) WHERE id = ?"
+                )
+                params = (state, error, task_id)
+            cur = await self._conn.execute(statement, params)
+            await self._conn.commit()
+            return bool(cur.rowcount)
+
+    async def delete_task(self, task_id: str) -> bool:
+        async with self._serial:
+            cur = await self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            await self._conn.commit()
+            return bool(cur.rowcount)
+
+    async def record_task_run(self, task_id: str, *, job_id: str) -> None:
+        """A run that reached the inbox. Clears whatever went wrong before it."""
+        async with self._serial:
+            await self._conn.execute(
+                "UPDATE tasks SET last_run_at = ?, last_job_id = ?, last_error = NULL,"
+                " consecutive_failures = 0 WHERE id = ?",
+                (_now(), job_id, task_id),
+            )
+            await self._conn.commit()
+
+    async def record_task_failure(self, task_id: str, *, error: str) -> int:
+        """A run that did not. Returns the new consecutive-failure count."""
+        async with self._serial:
+            async with self._conn.execute(
+                "UPDATE tasks SET last_run_at = ?, last_error = ?,"
+                " consecutive_failures = consecutive_failures + 1"
+                " WHERE id = ? RETURNING consecutive_failures",
+                (_now(), error, task_id),
+            ) as cur:
+                row = await cur.fetchone()
+            await self._conn.commit()
+            return int(row["consecutive_failures"]) if row else 0
+
     # -- revisions -------------------------------------------------------------
 
     async def message_by_external_id(self, external_id: str) -> dict[str, Any] | None:

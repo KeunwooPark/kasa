@@ -64,6 +64,18 @@ class InboundEvent(BaseModel):
     channel: str | None = None
     reply_to: str | None = None
 
+    #: What put this in the queue. `message` is somebody speaking; `scheduled`
+    #: is a standing task firing (#179), where nobody said anything just now.
+    #: The turn needs to know the difference — an answer that opens "as you
+    #: asked" when the thread has been quiet since Tuesday reads as a
+    #: hallucination.
+    #:
+    #: Defaulted rather than required so that every payload written before this
+    #: field existed still parses. A row in the inbox is a record of what
+    #: arrived, and a queue that stops being able to read its own backlog after
+    #: an upgrade is a queue that drops messages.
+    origin: str = "message"
+
     def to_json(self) -> str:
         return self.model_dump_json()
 

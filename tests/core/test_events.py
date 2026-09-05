@@ -41,3 +41,13 @@ def test_scope_defaults_to_the_widest() -> None:
     """Adapters narrow it; nothing here silently guesses a private scope."""
     event = InboundEvent(source="cli", external_id="E1", session_id="cli:1")
     assert event.scope == "workspace"
+
+
+def test_a_payload_written_before_origin_existed_still_reads() -> None:
+    """The inbox holds rows across an upgrade. A field added without a default
+    would make everything queued at the moment of the restart undeliverable —
+    which is a queue that drops messages, and the reason the field is
+    defaulted rather than required (#179)."""
+    queued = '{"source": "slack", "external_id": "Ev1", "session_id": "s", "text": "hi"}'
+
+    assert InboundEvent.from_json(queued).origin == "message"

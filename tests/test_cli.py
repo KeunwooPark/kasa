@@ -501,6 +501,133 @@ def test_job_list_names_what_this_build_knows_when_nothing_is_queued(
     assert "reindex" in result.output
 
 
+def test_task_add_reads_the_next_fires_back_in_the_zone_it_was_given(tmp_path: Path) -> None:
+    """A person cannot check `0 9 * * 1-5`, and can check "Mon 07 Sep 09:00
+    Asia/Seoul". Confirmation is the whole reason `add` prints anything."""
+    config = config_for(tmp_path / "kasa.db")
+
+    add = ["task", "add", "the overnight AI news", "--cron", "0 9 * * 1-5"]
+    result = runner.invoke(app, [*add, "--tz", "Asia/Seoul", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "created" in result.output
+    assert result.output.count("Asia/Seoul") == 3, result.output
+
+
+def test_task_add_says_so_when_nothing_in_this_build_will_ever_fire_it(tmp_path: Path) -> None:
+    """A schedule that silently never runs is the worst thing this command
+    could do. No Slack means no daemon, and a terminal is not alive at nine."""
+    config = config_for(tmp_path / "kasa.db")
+
+    result = runner.invoke(
+        app,
+        ["task", "add", "morning news", "--cron", "0 9 * * *", "--config", str(config)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "no daemon is configured" in result.output
+
+
+def test_task_add_refuses_a_schedule_that_fires_too_often(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "kasa.db")
+
+    result = runner.invoke(
+        app, ["task", "add", "spam me", "--cron", "* * * * *", "--config", str(config)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "the floor is 15" in result.output
+
+
+def test_task_list_shows_a_schedule_that_stopped_reading_rather_than_a_blank(
+    tmp_path: Path,
+) -> None:
+    """A zone this machine has no database entry for is exactly what `kasa task
+    list` is for. An empty cell would say nothing was wrong."""
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+    runner.invoke(
+        app, ["task", "add", "morning news", "--cron", "0 9 * * *", "--config", str(config)]
+    )
+
+    async def break_it() -> None:
+        async with await Store.open(db) as store:
+            await store.write("UPDATE tasks SET timezone = 'Mars/Olympus'")
+
+    asyncio.run(break_it())
+
+    result = runner.invoke(app, ["task", "list", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "not a time zone" in result.output
+
+
+def test_task_pause_resume_and_rm_move_the_row_and_say_which(tmp_path: Path) -> None:
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+    runner.invoke(
+        app, ["task", "add", "morning news", "--cron", "0 9 * * *", "--config", str(config)]
+    )
+
+    async def only_task() -> str:
+        async with await Store.open(db) as store:
+            return str((await store.list_tasks())[0]["id"])
+
+    task_id = asyncio.run(only_task())
+
+    assert (
+        "paused" in runner.invoke(app, ["task", "pause", task_id, "--config", str(config)]).output
+    )
+    listed = runner.invoke(app, ["task", "list", "--config", str(config)])
+    assert "paused" in listed.output
+
+    assert (
+        "active" in runner.invoke(app, ["task", "resume", task_id, "--config", str(config)]).output
+    )
+    assert "deleted" in runner.invoke(app, ["task", "rm", task_id, "--config", str(config)]).output
+    assert (
+        "no standing tasks" in runner.invoke(app, ["task", "list", "--config", str(config)]).output
+    )
+
+
+def test_task_commands_on_an_id_that_is_not_there_exit_non_zero(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "kasa.db")
+
+    for command in ("rm", "pause", "resume", "run"):
+        result = runner.invoke(app, ["task", command, "01NOPE", "--config", str(config)])
+        assert result.exit_code == 1, (command, result.output)
+        assert "01NOPE" in result.output
+
+
+def test_task_run_queues_the_turn_without_waiting_for_the_clock(tmp_path: Path) -> None:
+    """It queues; it does not answer. What answers an inbox row is a running
+    dispatcher, and this is how a terminal checks that a task reaches the queue
+    with the right session and scope."""
+    db = tmp_path / "kasa.db"
+    config = config_for(db)
+    add = ["task", "add", "morning news", "--cron", "0 9 * * *", "--session", "cli:1"]
+    runner.invoke(app, [*add, "--config", str(config)])
+
+    async def only_task() -> str:
+        async with await Store.open(db) as store:
+            return str((await store.list_tasks())[0]["id"])
+
+    result = runner.invoke(app, ["task", "run", asyncio.run(only_task()), "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "queued a turn" in result.output
+
+    async def queued() -> list[InboundEvent]:
+        async with await Store.open(db) as store:
+            rows = await store.raw("SELECT payload FROM inbox")
+            return [InboundEvent.from_json(row["payload"]) for row in rows]
+
+    (event,) = asyncio.run(queued())
+    assert event.text == "morning news"
+    assert event.session_id == "cli:1"
+    assert event.origin == "scheduled"
+
+
 def test_job_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
     db = tmp_path / "kasa.db"
     config = config_for(db)

@@ -37,6 +37,7 @@ from kasa.runner.promote import Promoter
 from kasa.runner.reflect import Notifier, Reflector
 from kasa.runner.reorganize import Librarian
 from kasa.runner.scheduler import Job, JobHandler, JobSpec
+from kasa.runner.tasks import TASK_KIND, Task, TaskNotifier, task_handler
 from kasa.store import Store
 from kasa.vault import resolve
 
@@ -77,7 +78,19 @@ def default_specs(
     working on a config with no API key at all.
     """
     models = Models(cfg, store, registry)
-    specs = []
+    # Registered on nothing at all, and first. A standing task's handler needs
+    # neither a model nor a repo — it writes one inbox row — and the schedules
+    # it runs are rows a person created, so a build that cannot run it is a
+    # build where those rows silently never fire. `cron=None` because the
+    # occurrences come from the tasks table rather than from an expression
+    # here; this spec exists so the queue accepts the kind and the drainer has
+    # a handler for it.
+    specs = [
+        JobSpec(
+            kind=TASK_KIND,
+            handler=task_handler(store, cfg.tasks, notify=_task_sink(cfg)),
+        )
+    ]
     if "chat" in cfg.llm:
         specs.append(
             JobSpec(
@@ -263,6 +276,32 @@ def _identity(cfg: Config, store: Store) -> JobHandler:
         log.info("identity: %s", result.summary())
 
     return run
+
+
+def _task_sink(cfg: Config) -> TaskNotifier | None:
+    """How a paused task's owner is told, if there is any way to tell them.
+
+    Into the thread the task was created in, which is the only place the
+    message means anything — and never anywhere else: the channel and thread
+    come off the task row, which copied them from the conversation that asked
+    for the task and cannot be made to point elsewhere (§11.1).
+
+    None on a build with no Slack, and that is not an error. A task created
+    from a terminal has no thread to be told in, and refusing to pause a
+    failing task because nobody could be notified would keep the failures
+    coming.
+    """
+    token = resolve(cfg.slack.bot_token_env or "")
+    if not token:
+        return None
+
+    async def post(task: Task, text: str) -> None:
+        if not task.channel:
+            log.warning("task %s has nowhere to post; not telling %s", task.id, task.owner)
+            return
+        await post_message(token, task.channel, text, thread_ts=task.reply_to)
+
+    return post
 
 
 def _digest_sink(cfg: Config) -> Notifier | None:

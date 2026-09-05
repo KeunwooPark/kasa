@@ -318,6 +318,25 @@ async def test_system_prompt_is_identical_across_turns(store: Store, tokenizer: 
     assert provider.requests[0].system == provider.requests[1].system
 
 
+async def test_a_scheduled_turn_says_so_in_the_system_block(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """A standing task's fire arrives as a user message nobody typed (#179).
+    Without this the model's only reading of "the overnight AI news" appearing
+    from nowhere is that it was just asked for, and it opens by thanking
+    somebody who has been asleep for eight hours."""
+    agent, provider = build(store, tokenizer, [says("Three things happened."), says("and again")])
+
+    await agent.respond("s1", "the overnight AI news", origin="scheduled")
+    await agent.respond("s1", "and now?")
+
+    assert "standing task" in provider.requests[0].system
+    # Only that turn. A scheduled fire in a thread does not change what the
+    # next thing somebody actually says is answered against.
+    assert "standing task" not in provider.requests[1].system
+    assert provider.requests[1].system == agent.config.system_prompt
+
+
 async def test_twenty_turn_session_exceeds_eighty_percent_cache_hits(
     store: Store, tokenizer: Tokenizer
 ) -> None:

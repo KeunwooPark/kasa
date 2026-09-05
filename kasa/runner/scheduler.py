@@ -20,7 +20,7 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from ulid import ULID
 
@@ -84,6 +84,37 @@ class JobSpec:
 class Queued:
     id: str
     duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Occurrence:
+    """One firing of a schedule the scheduler did not have compiled in.
+
+    A `JobSpec`'s cron is known at build time and the clock can walk it itself.
+    A standing task's is a row somebody created, and the clock has no business
+    knowing what a task is — so a `Clock` hands it these instead: a job id, a
+    kind, and when.
+    """
+
+    job_id: str
+    kind: str
+    fire_at: datetime
+    payload: dict[str, Any] | None = None
+    #: How to name this in a log line. The job id alone says which occurrence
+    #: without saying which schedule produced it.
+    label: str = ""
+
+
+class Clock(Protocol):
+    """Somewhere else that knows when something should run.
+
+    One implementation today — the tasks table (#179). It is a protocol rather
+    than a direct call so that `scheduler.py` keeps knowing only about jobs:
+    the failure isolation a source needs is *per schedule*, and only the source
+    can tell its schedules apart.
+    """
+
+    async def occurrences(self, moment: datetime) -> Sequence[Occurrence]: ...
 
 
 def scheduled_id(kind: str, fire_at: datetime) -> str:
@@ -233,10 +264,12 @@ class Scheduler:
         backoff: Backoff = DEFAULT_BACKOFF,
         reclaim_on_start: bool = True,
         pause_when: PauseGate | None = None,
+        clocks: Sequence[Clock] = (),
     ) -> None:
         self._store = store
         self._specs: dict[str, JobSpec] = {}
         self._schedule_failures: dict[str, int] = {}
+        self._clocks = tuple(clocks)
         self.queue = JobQueue(store, lease_ttl=lease_ttl, backoff=backoff, pause_when=pause_when)
         self._tick_interval = tick_interval
         # Two at a time by default: these call a frontier model, and the point
@@ -347,6 +380,53 @@ class Scheduler:
             if not result.duplicate:
                 log.debug("queued %s for %s", spec.kind, fire_at)
                 queued.append(result.id)
+        queued += await self._schedule_clocks(moment)
+        return queued
+
+    async def _schedule_clocks(self, moment: datetime) -> list[str]:
+        """Queue the next occurrence of everything a `Clock` knows about.
+
+        The same insert, under the same kind of id, so a standing task gets the
+        idempotency and the no-stampede-after-downtime behaviour for free. A
+        clock that cannot be read at all is one tick lost rather than a tick
+        that takes the compiled-in jobs down with it — those are the ones
+        holding the system together, and they must be queued even on the tick
+        where the tasks table is unreadable.
+        """
+        queued = []
+        for clock in self._clocks:
+            try:
+                occurrences = await clock.occurrences(moment)
+            except Exception:
+                log.exception("could not read a schedule source")
+                continue
+            for occurrence in occurrences:
+                if occurrence.kind not in self._specs:
+                    log.error(
+                        "%s wants to run %r, which this build cannot run",
+                        occurrence.label or occurrence.job_id,
+                        occurrence.kind,
+                    )
+                    continue
+                # Per occurrence, for the reason the spec loop is per spec: one
+                # that cannot be queued must not stop the ones behind it.
+                try:
+                    result = await self.queue.enqueue(
+                        occurrence.kind,
+                        occurrence.payload,
+                        run_after=occurrence.fire_at,
+                        job_id=occurrence.job_id,
+                    )
+                except Exception:
+                    log.exception("could not queue %s", occurrence.label or occurrence.job_id)
+                    continue
+                if not result.duplicate:
+                    log.debug(
+                        "queued %s for %s",
+                        occurrence.label or occurrence.job_id,
+                        occurrence.fire_at,
+                    )
+                    queued.append(result.id)
         return queued
 
     # -- internals -----------------------------------------------------------
