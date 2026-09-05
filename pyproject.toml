@@ -24,6 +24,10 @@ slack = [
     "aiohttp>=3.9",
     "slack-bolt[async]>=1.18",
 ]
+# Rendering a page that draws itself in the browser (#195). Its own extra
+# because the wheel is the small part: `playwright install chromium` pulls
+# roughly 650MB, and a render costs a few hundred MB of RSS while it runs.
+browser = ["playwright>=1.40"]
 
 [project.scripts]
 kasa = "kasa.cli:main"
@@ -63,14 +67,20 @@ warn_unreachable = true
 plugins = []
 
 [[tool.mypy.overrides]]
-module = ["ulid.*", "tiktoken.*", "sqlite_vec.*"]
+# `playwright` is the `browser` extra, which CI does not install: the renderer
+# is tested against a protocol, not against 650MB of Chromium.
+module = ["ulid.*", "tiktoken.*", "sqlite_vec.*", "playwright.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The browser tests need 650MB of Chromium that CI does not install. Opt in
+# with `uv run pytest -m browser`.
+addopts = "-m 'not browser'"
 filterwarnings = ["error"]
 markers = [
     "e2e: black-box subprocess tests",
     "external: tests that require real third-party services",
+    "browser: tests that need a real headless browser installed",
 ]

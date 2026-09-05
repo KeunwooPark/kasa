@@ -268,14 +268,57 @@ else between the check and the socket. Only http and https, only ports 80 and
 knows: no cookies, no `Authorization`, and no header the model can name — the
 tool takes a url and nothing else.
 
-Two limits worth knowing, because they are the ones you will meet:
-
-- **No scripts are run.** A page that draws itself in the browser comes back
-  with its content missing. A cinema timetable loaded over XHR is not on the
-  page Kasa reads.
-- **Long pages are cut**, and say so.
+Long pages are cut, and say so. Pages that draw themselves in the browser are
+the other limit, and the next section is what it is for.
 
 `kasa doctor` reports whether fetching is on and what the limits are.
+
+## Running a page
+
+Some pages do not put their content in the HTML they serve. Ask for a cinema
+timetable and the document arrives with no showtimes in it — they turn up over
+XHR a second later. `web_fetch(url, render=true)` runs the page in a headless
+browser and reads what it drew.
+
+On that timetable, measured:
+
+| | as served | rendered |
+| --- | --- | --- |
+| showtimes | 0 | 24 |
+| time | ~0.3s | ~5s |
+| memory while it runs | — | ~768 MB |
+| requests made | 1 | 147 |
+
+**Off by default, and its own extra**, because unlike fetching this is not free:
+
+```bash
+uv sync --extra browser
+uv run playwright install chromium   # ~650MB
+```
+
+```toml
+[browser]
+enabled = true
+```
+
+Until then the `render` parameter is not in the tool's schema at all, so Kasa
+never claims a capability this install does not have. When a served page comes
+back with almost no text for its size and a lot of script, Kasa says so — either
+"ask again with render" or, without a browser, "its content is missing rather
+than absent", so an empty page is not mistaken for an empty answer.
+
+That last row of the table is the security problem. A browser makes hundreds of
+requests nobody chose, and a bare headless browser is a live SSRF — it reaches
+`localhost`. So every request goes through the same guard a static fetch uses;
+images, media and fonts are never fetched at all; a host is judged once per
+render rather than once per request; and the page's own address is pinned to the
+one the guard approved, with the certificate still checked against the name.
+Nothing is clicked, typed, or submitted — Kasa navigates, waits, and reads.
+
+One residual, since it is better said than hidden: subresources are approved by
+URL but Chromium resolves them itself, so the DNS pin covers the document rather
+than every subresource. Chromium's own private-network policy is what keeps that
+narrow.
 
 ## Development
 

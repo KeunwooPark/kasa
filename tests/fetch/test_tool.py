@@ -15,7 +15,7 @@ import pytest
 from kasa.core.tools import ToolContext, ToolRegistry
 from kasa.errors import Blocked, FetchError
 from kasa.fetch.client import Page
-from kasa.fetch.tool import OVER_BUDGET, web_fetch_tool
+from kasa.fetch.tool import OVER_BUDGET, WITH_RENDER, WITHOUT_RENDER, web_fetch_tool
 from kasa.llm.cost import CallRecord, CostMeter, Price, PriceBook
 from kasa.llm.types import ToolUseBlock, Usage
 
@@ -33,12 +33,13 @@ PAGE = Page(
 class FakeFetcher:
     """A fetcher that answers from a script and records what it was asked."""
 
-    def __init__(self, *replies: Page | Exception) -> None:
+    def __init__(self, *replies: Page | Exception, can_render: bool = False) -> None:
         self.replies: list[Page | Exception] = list(replies) or [PAGE]
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, bool]] = []
+        self.can_render = can_render
 
-    async def fetch(self, url: str) -> Page:
-        self.calls.append(url)
+    async def fetch(self, url: str, *, render: bool = False) -> Page:
+        self.calls.append((url, render))
         reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         if isinstance(reply, Exception):
             raise reply
@@ -60,9 +61,15 @@ def tool(fetcher: object, **kwargs: Any) -> Any:
     return web_fetch_tool(fetcher=fetcher, **kwargs)  # type: ignore[arg-type]
 
 
-async def call(fetcher: object, url: str = "https://example.invalid/deploys", **kwargs: Any) -> str:
+async def call(
+    fetcher: object,
+    url: str = "https://example.invalid/deploys",
+    *,
+    args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> str:
     handler = tool(fetcher, **kwargs).handler
-    return await handler({"url": url}, ToolContext(session_id="s1"))
+    return await handler({"url": url, **(args or {})}, ToolContext(session_id="s1"))
 
 
 # -- the boundary -------------------------------------------------------------
@@ -109,6 +116,97 @@ async def test_redirects_are_reported() -> None:
     fetcher = FakeFetcher(replace(PAGE, redirects=2))
 
     assert "2 redirect(s)" in await call(fetcher)
+
+
+# -- rendering ----------------------------------------------------------------
+
+
+async def test_render_is_not_offered_when_there_is_no_browser() -> None:
+    """Absent from the schema, not present and refused: a model shown a
+    parameter will spend a call finding out it does nothing."""
+    schema = tool(FakeFetcher()).input_schema
+
+    assert "render" not in schema["properties"]
+    assert tool(FakeFetcher()).description == WITHOUT_RENDER
+
+
+async def test_render_is_offered_when_there_is_one() -> None:
+    schema = tool(FakeFetcher(can_render=True)).input_schema
+
+    assert "render" in schema["properties"]
+    assert tool(FakeFetcher(can_render=True)).description == WITH_RENDER
+
+
+async def test_the_cheap_path_is_the_default() -> None:
+    fetcher = FakeFetcher(can_render=True)
+
+    await call(fetcher)
+
+    assert fetcher.calls == [("https://example.invalid/deploys", False)]
+
+
+async def test_asking_to_render_renders() -> None:
+    fetcher = FakeFetcher(can_render=True)
+
+    await call(fetcher, args={"render": True})
+
+    assert fetcher.calls == [("https://example.invalid/deploys", True)]
+
+
+async def test_a_rendered_page_says_it_was_rendered() -> None:
+    """So an answer can be weighed against how it was got, and so `kasa cost`
+    is not the only place the expensive path is visible."""
+    fetcher = FakeFetcher(replace(PAGE, rendered=True), can_render=True)
+
+    out = await call(fetcher, args={"render": True})
+
+    assert out.startswith("Rendered https://example.invalid/deploys")
+
+
+async def test_asking_to_render_where_there_is_no_browser_still_answers() -> None:
+    """Downgraded rather than refused. The page is still readable the ordinary
+    way, and a turn should not end because the expensive path was absent."""
+    fetcher = FakeFetcher(can_render=False)
+
+    out = await call(fetcher, args={"render": True})
+
+    assert fetcher.calls == [("https://example.invalid/deploys", False)]
+    assert "They run on Tuesday." in out
+
+
+async def test_a_shell_page_is_told_it_can_be_rendered() -> None:
+    """#195's whole point: the difference between the model giving up and the
+    model asking for the version with the timetable in it."""
+    fetcher = FakeFetcher(replace(PAGE, scripted=True), can_render=True)
+
+    preamble = (await call(fetcher)).partition("<<<BEGIN")[0]
+
+    assert "render: true" in preamble
+
+
+async def test_a_shell_page_without_a_browser_is_told_to_say_so() -> None:
+    """Advice it can act on either way. Without this the honest reading of an
+    empty page is that the information does not exist."""
+    fetcher = FakeFetcher(replace(PAGE, scripted=True), can_render=False)
+
+    preamble = (await call(fetcher)).partition("<<<BEGIN")[0]
+
+    assert "render: true" not in preamble
+    assert "missing rather than absent" in preamble
+
+
+async def test_a_render_is_metered_apart_from_a_fetch() -> None:
+    """Thirty seconds in a browser should not look like six static fetches."""
+    seen = Collector()
+
+    await call(
+        FakeFetcher(replace(PAGE, rendered=True), can_render=True),
+        args={"render": True},
+        meter=meter_for(seen),
+    )
+
+    assert seen.records[0].tag == "web_render"
+    assert seen.records[0].model == "web/render"
 
 
 # -- failing visibly ----------------------------------------------------------

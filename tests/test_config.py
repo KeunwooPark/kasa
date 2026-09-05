@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from kasa.config import (
+    BrowserSettings,
     Config,
     FetchSettings,
     SearchSettings,
@@ -397,3 +398,38 @@ def test_a_bound_that_is_not_a_bound_is_refused(kwargs: dict[str, float]) -> Non
     choice; a cap of fifty is the absence of one."""
     with pytest.raises(ValidationError):
         FetchSettings(**kwargs)
+
+
+# -- page rendering ----------------------------------------------------------
+
+
+def test_rendering_is_off_until_it_is_asked_for() -> None:
+    """The opposite default from `[fetch]`, and not an inconsistency: this one
+    needs an extra whose browser is ~650MB and costs a few hundred MB of RSS
+    per render. A price like that is a choice an install makes (#195)."""
+    assert not Config().browser.enabled
+
+
+def test_the_browser_settings_survive_the_round_trip(tmp_path: Path) -> None:
+    cfg = Config(browser=BrowserSettings(enabled=True, settle_ms=500, max_requests=50))
+    path = tmp_path / "config.toml"
+    write_config(cfg, path)
+
+    assert load_config(path) == cfg
+
+
+def test_a_default_config_says_nothing_about_the_browser(tmp_path: Path) -> None:
+    """A config that mentions it is one where somebody turned it on."""
+    path = tmp_path / "config.toml"
+    write_config(Config(), path)
+
+    assert "[browser]" not in path.read_text()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"timeout_seconds": 0}, {"settle_ms": -1}, {"settle_ms": 999_999}, {"max_requests": 0}],
+)
+def test_a_render_bound_that_is_not_a_bound_is_refused(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValidationError):
+        BrowserSettings(**kwargs)

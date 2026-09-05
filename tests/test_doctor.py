@@ -6,11 +6,19 @@ from typing import Any
 import httpx
 import pytest
 
-from kasa.config import Config, FetchSettings, SearchSettings, SlackSettings, write_config
+from kasa.config import (
+    BrowserSettings,
+    Config,
+    FetchSettings,
+    SearchSettings,
+    SlackSettings,
+    write_config,
+)
 from kasa.doctor import (
     Check,
     Report,
     Status,
+    _browser,
     _fetch,
     _search,
     _slack,
@@ -585,6 +593,51 @@ async def test_fetching_turned_off_is_a_skip_not_a_failure() -> None:
 
     assert check.status is Status.SKIP
     assert "cannot open a page" in check.detail
+
+
+# -- page rendering ----------------------------------------------------------
+
+
+async def test_rendering_off_says_what_that_costs() -> None:
+    """Skip, not warn — but it names the symptom, because "the page had no
+    content" is otherwise indistinguishable from "the page had no content"."""
+    check = _browser(Config())
+
+    assert check.status is Status.SKIP
+    assert "draws itself in the browser" in check.detail
+
+
+async def test_rendering_is_moot_when_fetching_is_off() -> None:
+    check = _browser(
+        Config(fetch=FetchSettings(enabled=False), browser=BrowserSettings(enabled=True))
+    )
+
+    assert check.status is Status.SKIP
+    assert "nothing to render" in check.detail
+
+
+async def test_rendering_enabled_without_the_extra_fails_here_not_mid_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`playwright` importing is what separates "off because nobody asked" from
+    "on, and it will fail on the first render somebody waits for"."""
+    monkeypatch.setitem(__import__("sys").modules, "playwright", None)
+    cfg = Config(browser=BrowserSettings(enabled=True))
+
+    check = _browser(cfg)
+
+    assert check.status is Status.FAIL
+    assert "browser extra is not installed" in check.detail
+
+
+async def test_rendering_enabled_with_the_extra_says_its_limits() -> None:
+    pytest.importorskip("playwright")
+    cfg = Config(browser=BrowserSettings(enabled=True, max_requests=42))
+
+    check = _browser(cfg)
+
+    assert check.status is Status.OK
+    assert "42 request(s)" in check.detail
 
 
 async def test_the_key_is_resolved_from_the_vault_as_well_as_the_environment(

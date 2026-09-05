@@ -21,7 +21,7 @@ from rich.table import Table
 
 from kasa import __version__
 from kasa.adapters.cli import run_repl
-from kasa.config import Config, config_path, load_config
+from kasa.config import BrowserSettings, Config, config_path, load_config
 from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
 from kasa.core.inbox import Inbox
@@ -30,7 +30,7 @@ from kasa.core.schedule_tools import schedule_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError, KasaError
-from kasa.fetch import WebFetcher, web_fetch_tool
+from kasa.fetch import BrowserRenderer, WebFetcher, web_fetch_tool
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
 from kasa.memory.document import Problem
@@ -997,7 +997,16 @@ async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
         # there is a tool for opening a result. A model told there is none will
         # not go looking for one.
         if cfg.fetch.enabled:
-            fetcher = cfg.fetch.build()
+            # Built here rather than inside `FetchSettings.build` so that an
+            # install with `[browser] enabled` but no extra fails once, loudly,
+            # at start — instead of on the first turn that asks for a render.
+            renderer: BrowserRenderer | None = None
+            if cfg.browser.enabled:
+                try:
+                    renderer = await _renderer(cfg.browser)
+                except KasaError as exc:
+                    err.print(f"[yellow]![/yellow] page rendering unavailable — {exc}")
+            fetcher = cfg.fetch.build(renderer)
             tools.append(
                 web_fetch_tool(
                     fetcher=fetcher,
@@ -1073,6 +1082,23 @@ async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
                 await search.aclose()
             if fetcher is not None:
                 await fetcher.aclose()
+
+
+async def _renderer(settings: BrowserSettings) -> BrowserRenderer:
+    """Build a renderer, having checked that there is a browser behind it.
+
+    The check is a real launch. `playwright` importing proves the wheel is
+    installed and says nothing about whether `playwright install chromium` was
+    ever run — and the difference between those two is a turn that fails thirty
+    seconds in, on a question somebody is waiting for.
+    """
+    renderer = settings.build()
+    try:
+        await renderer.warm()
+    except KasaError:
+        await renderer.aclose()
+        raise
+    return renderer
 
 
 async def _repl(cfg: Config) -> None:

@@ -715,10 +715,9 @@ name, because the tool takes a URL and nothing else.
 What comes back is §7.2's block, unchanged: delimited, labelled, and unable to
 become a memory. Error bodies are never quoted, only what went wrong.
 
-Two limits worth stating plainly, because they are the ones people meet. No
-scripts are run, so a page that draws itself in the browser comes back with its
-content missing — the timetable is in an XHR the reader never makes. And a long
-page is cut.
+A long page is cut, and says so. The other limit — no scripts are run, so a page
+that draws itself in the browser comes back with its content missing — is what
+§8.4 is for.
 
 Unlike search, fetching is **on by default**. Search cannot work without a key
 somebody went and got, so its absence is honest; fetching needs nothing, and a
@@ -727,7 +726,73 @@ on the day it was needed. What makes it safe is the guard, not the flag —
 `[fetch] enabled = false` is for an install that wants the outbound surface gone
 rather than for one that has not thought about it yet.
 
-### 8.4 Context budget
+### 8.4 Running the page
+
+`web_fetch(url, render=true)` runs the page in a headless browser and reads what
+it drew. It is the same errand as §8.3 and a different bill, so it is a flag on
+the one tool rather than a second one: "read this page" is one intent, and the
+cheap path stays the default.
+
+Measured against a cinema timetable that is not in the served HTML (#195):
+
+| | served HTML | rendered |
+| --- | --- | --- |
+| showtimes recovered | 0 | 24 |
+| time | ~0.3s | 4.7-6.2s |
+| RSS while it runs | — | ~768 MB |
+| requests made | 1 | 147 |
+
+That last row is the design problem. §8.3 judges one URL per hop; a browser
+makes hundreds nobody chose, and a bare headless browser **is a live SSRF** —
+measured at the target, it reached a loopback server. So:
+
+- **Every request goes through `guard.approve`**, and anything it refuses is
+  aborted before it is sent.
+- **Most are never made.** `image`, `media` and `font` are aborted on resource
+  type alone, before any resolution — 5,265 of 5,341 on that page, with all 24
+  showtimes still recovered.
+- **A host is judged once per render**, not once per request. A page making a
+  thousand calls to one CDN would otherwise be a thousand resolutions of one
+  name, and would time out before the guard finished.
+- **The document's address is pinned** with `--host-resolver-rules` to the one
+  the guard approved. Chromium obeys it — a name pinned at a black hole fails to
+  connect — and still verifies the certificate against the *name*, so §8.3's
+  pin survives into render mode without weakening TLS. Both are asserted by
+  tests that run a real browser.
+- **Nothing is operated.** Navigate, settle, read. No clicking, typing, form
+  submission or downloads: a rendered page is full of controls, and the text
+  beside them was written by a stranger who would like them pressed.
+- One ephemeral context per render, background networking off, one render at a
+  time, and caps on wall time, request count and bytes.
+
+Waiting for the network to fall idle is what ordinary automation does and it
+does not survive a page that polls — the measured page never went idle at all.
+A fixed settle does.
+
+**The residual, stated rather than hidden.** Subresources are approved by URL,
+but Chromium resolves them itself, so the pin covers the document and not every
+subresource. What keeps that small is Chromium's own private-network-access
+policy, which blocks public-to-private subresource requests — somebody else's
+decision, which is why it is a residual and not a control. Closing it means
+serving every request from Kasa's own pinned client through `route.fulfill`,
+which is its own issue.
+
+**Off by default, and its own extra.** The opposite of §8.3, and for a reason
+that does not contradict it: fetching needed nothing, and this needs ~650MB of
+browser and a few hundred MB of RSS per render. A price like that is a choice an
+install makes. Until it does, the `render` parameter is absent from the schema
+rather than present and refused — a model shown a parameter will spend a call
+finding out it does nothing.
+
+**Telling the model when to reach for it.** A served page that comes back with
+almost no text for its size, behind a lot of script, is flagged and the tool
+says so. The threshold is measured, not guessed: the shell carried 2.4% of its
+bytes as readable text, while every content-bearing page checked ran from 5.1%
+to 23%. Where there is no browser the same flag produces different advice — say
+the content is missing rather than absent — because the honest reading of an
+empty page is otherwise that the information does not exist.
+
+### 8.5 Context budget
 
 Enforced by a tokenizer-aware packer with a fixed allocation:
 
@@ -743,7 +808,7 @@ Enforced by a tokenizer-aware packer with a fixed allocation:
 Segments are filled in priority order and truncated at their own boundary, so an
 overlong retrieval never evicts the recent turns.
 
-### 8.4 Explainability
+### 8.6 Explainability
 
 `kasa why "<question>"` prints the constructed query, every candidate with its
 lexical/vector/fused/final scores, what was dropped by scope filtering, and the
@@ -935,6 +1000,7 @@ kasa/
   fetch/
     guard.py           where a fetch may go, decided before a byte is sent
     client.py          one GET, bounded in time, bytes, hops, and content type
+    browser.py         the same page, run rather than read (optional extra)
     readable.py        HTML to the words a reader would have seen
     tool.py            web_fetch, and the boundary around what it returns
   search/
@@ -1017,6 +1083,7 @@ optimization of a thing that must already work.
 | Prompt injection via channel text | Typed patch plan + validator; no shell, no direct git; `promote` cannot delete |
 | Prompt injection via a search result or a fetched page | Same delimited block; tool results never enter the extraction transcript; no response body is ever quoted into an error |
 | SSRF via a url the model read off a page | Addresses judged, not names; every DNS answer checked; the approved address is the one connected to; every redirect hop re-judged; http(s) on 80/443 only (§8.3) |
+| SSRF via the hundreds of requests a rendered page makes | Every request through the same guard; image/media/font never fetched; the document pinned to the approved address; nothing clicked or submitted; off by default (§8.4) |
 | DM content leaking into public channels | `visibility` in the data model from day one; filter before ranking |
 | LTM repo grows unboundedly | `forget` + archive tier; `reorganize` splits and merges |
 | A standing task spends money every day with nobody watching | Per-owner cap and an interval floor (`[tasks]`); every firing is metered like any other turn and shows up in `kasa cost`; `kasa task list` shows every task and what it last did. Note that `[budget]`'s ceiling pauses utility calls, not a scheduled answer — the cap and the floor are what actually bound this |
@@ -1059,6 +1126,7 @@ token_env   = "KASA_GITHUB_TOKEN"
 supervised  = ["forget"]              # these jobs open PRs instead of pushing
 
 [fetch]                               # optional; on by default, `enabled = false` removes the tool
+[browser]                             # optional; off by default, needs the `browser` extra
 [search]                              # optional; omit and the tool is not registered
 kind              = "brave"
 key_env           = "BRAVE_SEARCH_API_KEY"
