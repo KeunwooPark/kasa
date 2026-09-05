@@ -37,6 +37,14 @@ EPISODE_HEADER = "## Conversation so far"
 #: conversation must not read as though the operator wrote it.
 PINNED_HEADER = "# Pinned memory"
 
+#: Kasa's own note about the turn in progress, and the reason it is a headed
+#: section rather than a loose line (#201). Everything else in `context` is
+#: recalled material the system prompt tells the model to treat as background
+#: rather than as instructions. The tool budget is the opposite of that — it is
+#: operational fact about the turn, and the sentence that scopes the memory
+#: sections must not be able to reach it.
+STATUS_HEADER = "# Turn status"
+
 
 @dataclass(frozen=True, slots=True)
 class ContextBudget:
@@ -125,13 +133,21 @@ class ContextPacker:
         episode_summary: str | None = None,
         recent: Sequence[Message] = (),
         tools: Sequence[ToolDef] = (),
+        status: str | None = None,
     ) -> PackedContext:
+        """`status` is what Kasa has to say about the turn itself, if anything.
+
+        It rides in `context` rather than the prefix because it changes on
+        every pass — a tool-budget countdown in the cached prefix would
+        invalidate the cache on every request, which is the whole reason the
+        two are separate.
+        """
         traces: list[SegmentTrace] = []
 
-        system_text, prefix_traces = self._pack_prefix(system_prompt, pinned, tools)
+        system_text, prefix_traces = self._pack_prefix(system_prompt, pinned, tools, status)
         traces.extend(prefix_traces)
 
-        context_text, context_traces = self._pack_context(retrieved, episode_summary)
+        context_text, context_traces = self._pack_context(retrieved, episode_summary, status)
         traces.extend(context_traces)
 
         messages, recent_trace = self._pack_recent(recent)
@@ -148,7 +164,11 @@ class ContextPacker:
     # -- segments ------------------------------------------------------------
 
     def _pack_prefix(
-        self, system_prompt: str, pinned: Sequence[str], tools: Sequence[ToolDef]
+        self,
+        system_prompt: str,
+        pinned: Sequence[str],
+        tools: Sequence[ToolDef],
+        status: str | None = None,
     ) -> tuple[str, list[SegmentTrace]]:
         # Tool schemas are serialized into the prompt by every provider, so they
         # are charged against the system share even though they are not ours to
@@ -178,7 +198,11 @@ class ContextPacker:
             SegmentTrace(
                 name="system",
                 budget=system_budget,
-                used=self._tok.count(system_prompt) + tool_tokens,
+                # Tool schemas and the turn status are both charged here rather
+                # than where they sit on the wire. Neither is memory competing
+                # for a share; both are prompt Kasa wrote, and the system share
+                # is the only row a reader can hold responsible for them.
+                used=self._tok.count(system_prompt) + tool_tokens + self._tok.count(status or ""),
                 kept=1 if system_prompt else 0,
                 dropped=0,
             ),
@@ -192,7 +216,7 @@ class ContextPacker:
         ]
 
     def _pack_context(
-        self, retrieved: Sequence[str], episode_summary: str | None
+        self, retrieved: Sequence[str], episode_summary: str | None, status: str | None = None
     ) -> tuple[str | None, list[SegmentTrace]]:
         traces: list[SegmentTrace] = []
         sections: list[str] = []
@@ -229,9 +253,16 @@ class ContextPacker:
             )
         )
 
-        if not sections:
+        # Status leads, and stays outside the working-context block: it is not
+        # recalled material and must not be read as any.
+        blocks: list[str] = []
+        if status:
+            blocks.append(f"{STATUS_HEADER}\n{status}")
+        if sections:
+            blocks.append(f"{CONTEXT_HEADER}\n\n" + "\n\n".join(sections))
+        if not blocks:
             return None, traces
-        return f"{CONTEXT_HEADER}\n\n" + "\n\n".join(sections), traces
+        return "\n\n".join(blocks), traces
 
     def _pack_recent(self, recent: Sequence[Message]) -> tuple[tuple[Message, ...], SegmentTrace]:
         budget = self.budget.tokens_for(self.budget.recent)

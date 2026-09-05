@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 
 from kasa.core.agent import DEFAULT_SYSTEM_PROMPT
-from kasa.core.context import PINNED_HEADER, ContextBudget, ContextPacker, group_turns
+from kasa.core.context import (
+    CONTEXT_HEADER,
+    PINNED_HEADER,
+    STATUS_HEADER,
+    ContextBudget,
+    ContextPacker,
+    group_turns,
+)
 from kasa.errors import ConfigError
 from kasa.llm.tokens import Tokenizer, count_messages
 from kasa.llm.types import (
@@ -203,6 +210,67 @@ def test_the_system_prompt_requires_tools_to_ground_unknown_information() -> Non
     assert "information that is current" in DEFAULT_SYSTEM_PROMPT
     assert "conversation or memory" in DEFAULT_SYSTEM_PROMPT
     assert "cannot verify it rather than inventing an answer" in DEFAULT_SYSTEM_PROMPT
+
+
+def test_turn_status_leads_the_context_and_stays_out_of_the_working_block(
+    tokenizer: Tokenizer,
+) -> None:
+    """#201: it is Kasa's own fact about the turn, not recalled material.
+
+    The system prompt tells the model to treat working context as background
+    rather than as instructions. A budget line inside that block would be
+    covered by that sentence, which is exactly the reading it must not get.
+    """
+    packed = ContextPacker(tokenizer=tokenizer).pack(
+        system_prompt="You are Kasa.",
+        retrieved=["Jane owns the deploy pipeline"],
+        status="3 tool rounds are left in this turn.",
+    )
+
+    assert packed.context is not None
+    assert packed.context.startswith(STATUS_HEADER)
+    assert packed.context.index(STATUS_HEADER) < packed.context.index(CONTEXT_HEADER)
+    assert "3 tool rounds" in packed.context.split(CONTEXT_HEADER)[0]
+
+
+def test_turn_status_stands_alone_when_nothing_was_recalled(tokenizer: Tokenizer) -> None:
+    """No memory to report is not a reason to drop the turn's own status."""
+    packed = ContextPacker(tokenizer=tokenizer).pack(
+        system_prompt="You are Kasa.", status="One tool round is left in this turn."
+    )
+
+    assert packed.context is not None
+    assert packed.context.startswith(STATUS_HEADER)
+    assert CONTEXT_HEADER not in packed.context
+
+
+def test_turn_status_never_reaches_the_cacheable_prefix(tokenizer: Tokenizer) -> None:
+    """It changes every pass; in the prefix it would void the cache every pass."""
+    packer = ContextPacker(tokenizer=tokenizer)
+
+    first = packer.pack(system_prompt="You are Kasa.", status="8 tool rounds are left.")
+    second = packer.pack(system_prompt="You are Kasa.", status="1 tool round is left.")
+
+    assert first.system == second.system
+    assert STATUS_HEADER not in first.system
+
+
+def test_turn_status_is_charged_to_the_system_share(tokenizer: Tokenizer) -> None:
+    """Prompt Kasa wrote, not memory competing for a share."""
+    packer = ContextPacker(tokenizer=tokenizer)
+
+    without = packer.pack(system_prompt="You are Kasa.")
+    with_status = packer.pack(system_prompt="You are Kasa.", status="8 tool rounds are left.")
+
+    assert without.trace.segments[0].name == "system"
+    assert with_status.trace.segments[0].used > without.trace.segments[0].used
+    assert with_status.trace.used > without.trace.used
+
+
+def test_the_system_prompt_frames_the_turn_status_by_name() -> None:
+    """The header only works if the prompt says whose voice it is."""
+    assert STATUS_HEADER in DEFAULT_SYSTEM_PROMPT
+    assert "operational fact" in DEFAULT_SYSTEM_PROMPT
 
 
 def test_the_trace_separates_the_prompt_from_the_memory_in_it(tokenizer: Tokenizer) -> None:

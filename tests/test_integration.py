@@ -80,8 +80,13 @@ async def test_tool_using_turn_end_to_end(store: Store, tokenizer: Tokenizer) ->
         for message in seen[1]["messages"]
         for block in message["content"]
     )
-    # Prompt caching depends on this holding for the life of the session.
-    assert seen[0]["system"] == seen[1]["system"]
+    # Prompt caching depends on the cached block holding for the life of the
+    # session. The per-turn block behind it is where anything that changes goes,
+    # and since #201 the tool-budget countdown is one of those things.
+    assert seen[0]["system"][0] == seen[1]["system"][0]
+    assert "8 tool rounds are left" in seen[0]["system"][1]["text"]
+    assert "7 tool rounds are left" in seen[1]["system"][1]["text"]
+    assert "cache_control" not in seen[1]["system"][1]
 
     # The transcript replays.
     stored = await store.recent_messages("cli:1", limit=100)
