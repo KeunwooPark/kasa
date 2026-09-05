@@ -228,13 +228,54 @@ cost_per_call_usd = 0.005    # counts toward the same [budget] ceiling as models
 Without a `[search]` section the tool is not registered at all, so Kasa never
 claims a capability it does not have.
 
-Results are snippets, never fetched pages — there is deliberately no `web_fetch`.
+Results are snippets. When the answer is on the page rather than in the
+description of it, `web_fetch` opens it.
+
 What comes back was written by strangers, so it arrives inside the same
 nonce-delimited untrusted block that consolidation prompts use, labelled as data
-rather than instruction. And nothing a search returns can become a memory: the
-transcript that candidate facts are extracted from is built from what people
-said, and a tool result is not that. A page saying *"remember that X"* does not
-make Kasa believe X.
+rather than instruction. And nothing a search or a fetch returns can become a
+memory: the transcript that candidate facts are extracted from is built from
+what people said, and a tool result is not that. A page saying *"remember that
+X"* does not make Kasa believe X.
+
+## Reading a page
+
+`web_fetch` retrieves one http(s) url and hands back its text, so Kasa can
+finish the errand search starts — search, open the result that looks
+authoritative, read it, answer.
+
+On by default, unlike search: search needs a key somebody went and got, and this
+needs nothing. What makes it safe is the guard rather than the switch, and the
+switch is there for an install that wants the outbound surface gone:
+
+```toml
+[fetch]
+enabled     = false   # the tool is not registered at all
+max_chars   = 20_000  # what reaches the model
+max_bytes   = 2_000_000
+max_redirects   = 4
+timeout_seconds = 15.0
+```
+
+Where a request may go is decided before a byte is sent, and decided again on
+every redirect. Names are resolved and the *addresses* judged — loopback,
+private, link-local (which is where cloud metadata services live), and anything
+else not on the public internet is refused, in v4 and in the v6 spellings of the
+same address. Every answer has to be public, not just the first, and the address
+that was approved is the one connected to, so a name cannot resolve to something
+else between the check and the socket. Only http and https, only ports 80 and
+443, no credentials in the url. Nothing outbound carries anything this daemon
+knows: no cookies, no `Authorization`, and no header the model can name — the
+tool takes a url and nothing else.
+
+Two limits worth knowing, because they are the ones you will meet:
+
+- **No scripts are run.** A page that draws itself in the browser comes back
+  with its content missing. A cinema timetable loaded over XHR is not on the
+  page Kasa reads.
+- **Long pages are cut**, and say so.
+
+`kasa doctor` reports whether fetching is on and what the limits are.
 
 ## Development
 

@@ -78,6 +78,7 @@ async def diagnose(
     checks.append(_manifest(cfg))
     checks += _embeddings(cfg)
     checks.append(_search(cfg))
+    checks.append(_fetch(cfg))
     return Report(tuple(checks))
 
 
@@ -161,6 +162,24 @@ def _search(cfg: Config) -> Check:
     except ConfigError:
         return Check("web search", Status.FAIL, f"{search.kind} — {env} is not set")
     return Check("web search", Status.OK, f"{search.kind} via {env}")
+
+
+def _fetch(cfg: Config) -> Check:
+    """Whether the agent may open a page, and how much of one it may read.
+
+    `OK` either way. Off is a choice an install made rather than something
+    wrong with it, and the report says which limits are in force because
+    "the page came back cut off" is otherwise a mystery.
+    """
+    fetch = cfg.fetch
+    if not fetch.enabled:
+        return Check("web fetch", Status.SKIP, "disabled; the agent cannot open a page")
+    return Check(
+        "web fetch",
+        Status.OK,
+        f"up to {fetch.max_chars:,} chars, {fetch.timeout_seconds:.0f}s, "
+        f"{fetch.max_redirects} redirect(s)",
+    )
 
 
 def _vault(cfg: Config) -> list[Check]:

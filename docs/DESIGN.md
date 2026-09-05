@@ -587,7 +587,9 @@ cannot name it.
 §7.1 was written for text arriving through the inbox, from someone who can type
 into a channel. `web_search` (§8.2) opens a second door: text arriving through a
 `tool_result` — a channel that until then had only ever carried Kasa's own
-output — written by whoever runs the sites that happened to rank.
+output — written by whoever runs the sites that happened to rank. `web_fetch`
+(§8.3) opens it wider: a whole page rather than a snippet, from an address the
+model chose rather than one a provider ranked.
 
 Three things hold it, and none of them is a filter:
 
@@ -598,8 +600,9 @@ Three things hold it, and none of them is a filter:
 - **Nothing read can be remembered.** A page that says *"remember that X"* must
   not thereby teach Kasa that X. What prevents it is structural: the transcript
   episode extraction reads is built from text blocks, and a tool result is not
-  one. A search result therefore cannot reach `promote`, and the write path stays
-  exactly as narrow as it was.
+  one. A search result or a fetched page therefore cannot reach `promote`, and
+  the write path stays exactly as narrow as it was. Pinned by a test per tool,
+  since it is a property of a module neither of them is in.
 - **The write path is unchanged.** A search result reaches a model that can
   propose an observation and nothing else. The worst case is still a rejected
   plan in a log.
@@ -661,9 +664,10 @@ larger capability grant for the same result, and letting the agent author its ow
 tools would be larger still. Both remain arguable later, on their own merits and
 in their own issues.
 
-Snippets only, and no `web_fetch`. What comes back is a few hundred words the
-provider already extracted, not a document to retrieve, render, and strip —
-which keeps both the token cost and §7.2's surface small.
+Snippets, which is a few hundred words the provider already extracted. When the
+answer is *on* the page rather than in the description of it, §8.3 is what opens
+it — and `web_search`'s description says which of the two worlds it is in, since
+"there is no tool for fetching a page" is a sentence a model will believe.
 
 The provider is behind a `SearchProvider` protocol (`kasa/search/base.py`) rather
 than another `ProviderKind`: search shares nothing with a model call but HTTP —
@@ -673,7 +677,57 @@ cost meter, so a search lands in `llm_calls` beside the model calls and the same
 `search.cost_per_call_usd`, configured for the same reason `[pricing]` is: a
 stale built-in number is worse than none.
 
-### 8.3 Context budget
+### 8.3 Reading the page itself
+
+`web_fetch(url)` retrieves one HTTP(S) URL and hands back its text. Search alone
+could not finish an ordinary research errand — search, pick the authoritative
+result, read it, answer — and the alternative to a general reader is a tool per
+site, which does not scale past the second site (#186).
+
+It is a bigger capability than search by every measure, so the design is a list
+of bounds rather than a list of features. `kasa/fetch/guard.py` decides where a
+request may go, and it is the only part that has to be right:
+
+- **Addresses, not names.** The host is resolved and every answer judged. A
+  blocklist of hostnames is defeated by a hostname; a check on the address is
+  not. Loopback, private, link-local (which is where `169.254.169.254` lives),
+  multicast, reserved, and anything else not globally routable are refused.
+- **Both spellings.** A v4 address tunnelled inside a v6 one — mapped, 6to4,
+  Teredo — is judged as the v4 address it will come out as, *and* as the v6
+  address it is written as.
+- **Every answer, not the first.** A name resolving to one public address and
+  one private one is answering with the private one to whoever asks next.
+- **The approved address is the one connected to.** The URL's host is replaced
+  by it and the name goes back into `Host` and TLS SNI, so the certificate is
+  still checked against the name. Resolving a second time at connect — what any
+  ordinary client does — is the window a rebinding attack lives in.
+- **http and https, ports 80 and 443, no credentials in the URL.** A site on a
+  non-standard port is a URL somebody can paste into a browser instead, which is
+  a smaller loss than a model reaching 6379 on a public host.
+
+And the fetcher bounds the rest: a small redirect limit with every hop
+re-judged, one timeout for the whole chain, a byte cap enforced while streaming
+rather than trusting `Content-Length`, a content-type allowlist, and a character
+cap on what reaches the model. Nothing outbound carries anything this daemon
+knows — no cookies between hops, no `Authorization`, and no header the model can
+name, because the tool takes a URL and nothing else.
+
+What comes back is §7.2's block, unchanged: delimited, labelled, and unable to
+become a memory. Error bodies are never quoted, only what went wrong.
+
+Two limits worth stating plainly, because they are the ones people meet. No
+scripts are run, so a page that draws itself in the browser comes back with its
+content missing — the timetable is in an XHR the reader never makes. And a long
+page is cut.
+
+Unlike search, fetching is **on by default**. Search cannot work without a key
+somebody went and got, so its absence is honest; fetching needs nothing, and a
+capability that has to be discovered and enabled is a capability that is missing
+on the day it was needed. What makes it safe is the guard, not the flag —
+`[fetch] enabled = false` is for an install that wants the outbound surface gone
+rather than for one that has not thought about it yet.
+
+### 8.4 Context budget
 
 Enforced by a tokenizer-aware packer with a fixed allocation:
 
@@ -878,6 +932,11 @@ kasa/
     context.py         tokenizer-aware packer
     tools.py           memory_search / memory_read / memory_write
     schedule_tools.py  schedule_create / schedule_list / schedule_cancel
+  fetch/
+    guard.py           where a fetch may go, decided before a byte is sent
+    client.py          one GET, bounded in time, bytes, hops, and content type
+    readable.py        HTML to the words a reader would have seen
+    tool.py            web_fetch, and the boundary around what it returns
   search/
     base.py            SearchProvider protocol + SearchResult
     brave.py           the one backend
@@ -956,7 +1015,8 @@ optimization of a thing that must already work.
 | Two daemons racing on push | Single-writer lease (SQLite row + flock); startup check |
 | Retrieval quality is opaque | `kasa why` from week one |
 | Prompt injection via channel text | Typed patch plan + validator; no shell, no direct git; `promote` cannot delete |
-| Prompt injection via a search result | Same delimited block; tool results never enter the extraction transcript; snippets only, no page fetch |
+| Prompt injection via a search result or a fetched page | Same delimited block; tool results never enter the extraction transcript; no response body is ever quoted into an error |
+| SSRF via a url the model read off a page | Addresses judged, not names; every DNS answer checked; the approved address is the one connected to; every redirect hop re-judged; http(s) on 80/443 only (§8.3) |
 | DM content leaking into public channels | `visibility` in the data model from day one; filter before ranking |
 | LTM repo grows unboundedly | `forget` + archive tier; `reorganize` splits and merges |
 | A standing task spends money every day with nobody watching | Per-owner cap and an interval floor (`[tasks]`); every firing is metered like any other turn and shows up in `kasa cost`; `kasa task list` shows every task and what it last did. Note that `[budget]`'s ceiling pauses utility calls, not a scheduled answer — the cap and the floor are what actually bound this |
@@ -998,6 +1058,7 @@ branch      = "main"
 token_env   = "KASA_GITHUB_TOKEN"
 supervised  = ["forget"]              # these jobs open PRs instead of pushing
 
+[fetch]                               # optional; on by default, `enabled = false` removes the tool
 [search]                              # optional; omit and the tool is not registered
 kind              = "brave"
 key_env           = "BRAVE_SEARCH_API_KEY"
