@@ -201,6 +201,11 @@ class Runtime:
                 # session's is not an alternative here: origin is a property of
                 # the event, and a thread can carry both kinds.
                 origin=turn.event.origin,
+                # Where this conversation's answers go, for the tools that
+                # create something which will answer here later (#180). The
+                # surface put them on the event; nothing in between edits them.
+                channel=turn.event.channel,
+                reply_to=turn.event.reply_to,
             )
         except BaseException:
             # Including cancellation, which is what a shutdown mid-turn is. A

@@ -318,6 +318,42 @@ async def test_system_prompt_is_identical_across_turns(store: Store, tokenizer: 
     assert provider.requests[0].system == provider.requests[1].system
 
 
+async def test_a_tool_is_told_where_the_turn_is_happening(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """`schedule_create` writes the destination onto the task it creates, so
+    the destination has to reach a tool from the session rather than from an
+    argument (#180). This is that path: event -> respond -> `ToolContext`."""
+    seen: list[ToolContext] = []
+
+    async def capture(args: dict[str, Any], context: ToolContext) -> str:
+        seen.append(context)
+        return "noted"
+
+    agent, _ = build(
+        store,
+        tokenizer,
+        [calls("capture"), says("done")],
+        tools=[Tool(name="capture", description="d", input_schema=SCHEMA, handler=capture)],
+    )
+
+    await agent.respond(
+        "slack:T01:C0123:1756890000.123",
+        "every weekday at nine, the AI news",
+        surface="slack",
+        author="U01",
+        scope="channel:C0123",
+        channel="C0123",
+        reply_to="1756890000.123",
+    )
+
+    (context,) = seen
+    assert context.author == "U01"
+    assert context.channel == "C0123"
+    assert context.reply_to == "1756890000.123"
+    assert context.scope == "channel:C0123"
+
+
 async def test_a_scheduled_turn_says_so_in_the_system_block(
     store: Store, tokenizer: Tokenizer
 ) -> None:

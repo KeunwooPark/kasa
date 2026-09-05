@@ -176,6 +176,8 @@ class Agent:
         external_id: str | None = None,
         credential_scrubbed: bool = False,
         origin: str = "message",
+        channel: str | None = None,
+        reply_to: str | None = None,
     ) -> AgentResult:
         await self._store.ensure_session(session_id, surface=surface, scope=scope)
         # `external_id` is the surface's own key for this message, and it is
@@ -186,7 +188,17 @@ class Agent:
         await self._store.append_message(
             session_id, Message.user(user_text), author=author, external_id=external_id
         )
-        context = ToolContext(session_id=session_id, scope=scope)
+        # Everything a tool is allowed to know about *where* it is being called
+        # from. Passed explicitly rather than read out of ambient state: these
+        # decide what a tool may see and where anything it creates will post,
+        # and the model supplies none of them.
+        context = ToolContext(
+            session_id=session_id,
+            scope=scope,
+            author=author,
+            channel=channel,
+            reply_to=reply_to,
+        )
         # Built once, outside the loop: it is the same on every pass, and the
         # system block is the head of the cacheable prefix.
         system_prompt = self.config.system_prompt

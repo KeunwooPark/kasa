@@ -652,8 +652,8 @@ def test_job_retry_puts_a_dead_letter_back(tmp_path: Path) -> None:
 # -- the web_search tool is registered only when it is configured -------------
 
 
-async def _tool_names(cfg: Config) -> set[str]:
-    async with _agent(cfg) as agent:
+async def _tool_names(cfg: Config, *, daemon: bool = False) -> set[str]:
+    async with _agent(cfg, daemon=daemon) as agent:
         return {d.name for d in agent.tools.defs()}
 
 
@@ -698,3 +698,28 @@ async def test_a_search_key_that_will_not_resolve_does_not_stop_the_daemon(
 
     assert "web_search" not in names
     assert "current_time" in names, "and the rest of the session still works"
+
+
+# -- the scheduling tools are registered only where something will fire them --
+
+
+SCHEDULE_TOOLS = {"schedule_create", "schedule_list", "schedule_cancel"}
+
+
+async def test_the_repl_gets_no_scheduling_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal is not alive at nine in the morning. A tool that quietly
+    created rows nothing would ever fire is worse than one that is absent —
+    and `kasa task add`, which says so, is still there."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    assert not SCHEDULE_TOOLS & await _tool_names(_searchable(tmp_path))
+
+
+async def test_the_daemon_gets_them(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    names = await _tool_names(_searchable(tmp_path), daemon=True)
+
+    assert names >= SCHEDULE_TOOLS
