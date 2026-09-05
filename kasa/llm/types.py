@@ -102,6 +102,17 @@ class Message(BaseModel):
         return tuple(b for b in self.content if isinstance(b, ToolResultBlock))
 
 
+def starts_turn(message: Message) -> bool:
+    """True if `message` opens an exchange rather than continuing one.
+
+    The one place this is decided. A tool result is carried on a `user` message
+    — that is how both provider families take it — so role alone says nothing,
+    and a reader that assumes otherwise cuts a turn in half. The store widens a
+    slice to a boundary and the packer groups by one; both ask here.
+    """
+    return message.role == "user" and not message.tool_results_in
+
+
 class ToolDef(BaseModel):
     model_config = ConfigDict(frozen=True)
 

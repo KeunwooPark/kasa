@@ -10,7 +10,7 @@ from kasa.core.events import InboundEvent
 from kasa.core.inbox import Inbox
 from kasa.errors import StoreError
 from kasa.llm.cost import CallRecord
-from kasa.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
+from kasa.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage, starts_turn
 from kasa.memory.observation import ObservationDraft
 from kasa.redact import Redactor
 from kasa.store import Store
@@ -85,6 +85,81 @@ async def test_recent_messages_returns_oldest_first_within_the_limit(store: Stor
 
     recent = await store.recent_messages("s1", limit=3)
     assert [m.text for m in recent] == ["m7", "m8", "m9"]
+
+
+async def a_long_tool_using_turn(store: Store, session: str, rounds: int) -> None:
+    """One turn that keeps calling tools: two rows per round, as a real one writes."""
+    await store.append_message(session, Message.user("find five book bloggers"))
+    for n in range(rounds):
+        await store.append_message(
+            session,
+            Message(
+                role="assistant",
+                content=(ToolUseBlock(id=f"t{n}", name="web_fetch", input={"url": f"u{n}"}),),
+            ),
+        )
+        await store.append_message(
+            session, Message.tool_results([ToolResultBlock(tool_use_id=f"t{n}", content=f"p{n}")])
+        )
+
+
+async def test_a_limit_that_falls_inside_a_turn_widens_to_its_head(store: Store) -> None:
+    """#204: a slice taken by count alone can start with an orphaned tool result.
+
+    Both provider families reject a `tool_result` whose `tool_use` was cut, and
+    Anthropic wants the first message to be a real user message besides.
+    """
+    await store.ensure_session("s1", surface="cli")
+    await store.append_message("s1", Message.user("something older"))
+    await store.append_message("s1", Message.assistant("answered"))
+    await a_long_tool_using_turn(store, "s1", rounds=6)
+
+    recent = await store.recent_messages("s1", limit=5)
+
+    assert starts_turn(recent[0])
+    assert recent[0].text == "find five book bloggers"
+    assert len(recent) == 13
+
+
+async def test_widening_keeps_every_tool_result_with_its_call(store: Store) -> None:
+    """The invariant, stated where the messages are produced."""
+    await store.ensure_session("s1", surface="cli")
+    await a_long_tool_using_turn(store, "s1", rounds=20)
+
+    recent = await store.recent_messages("s1", limit=4)
+
+    used = {b.id for m in recent for b in m.tool_uses}
+    answered = {b.tool_use_id for m in recent for b in m.tool_results_in}
+    assert used == answered
+    assert len(used) == 20
+
+
+async def test_the_turn_in_flight_is_widened_to_not_trimmed_away(store: Store) -> None:
+    """Cutting back to the next boundary would drop what the answer depends on."""
+    await store.ensure_session("s1", surface="cli")
+    await a_long_tool_using_turn(store, "s1", rounds=8)
+
+    recent = await store.recent_messages("s1", limit=3)
+
+    assert [b.content for m in recent for b in m.tool_results_in] == [f"p{n}" for n in range(8)]
+
+
+async def test_a_limit_that_lands_on_a_boundary_is_left_alone(store: Store) -> None:
+    """Widening is what a mid-turn cut costs, not something every read pays."""
+    await store.ensure_session("s1", surface="cli")
+    for i in range(10):
+        await store.append_message("s1", Message.user(f"m{i}"))
+
+    recent = await store.recent_messages("s1", limit=3)
+
+    assert [m.text for m in recent] == ["m7", "m8", "m9"]
+
+
+def test_a_tool_result_never_opens_a_turn() -> None:
+    """Role alone says nothing: both providers carry tool results on a user message."""
+    assert starts_turn(Message.user("what time is it"))
+    assert not starts_turn(Message.assistant("noon"))
+    assert not starts_turn(Message.tool_results([ToolResultBlock(tool_use_id="t1", content="x")]))
 
 
 async def test_sessions_are_isolated(store: Store) -> None:

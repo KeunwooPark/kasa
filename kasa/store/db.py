@@ -16,7 +16,7 @@ from ulid import ULID
 
 from kasa.errors import KasaError, StoreError
 from kasa.llm.cost import CallRecord
-from kasa.llm.types import ContentBlock, Message
+from kasa.llm.types import ContentBlock, Message, starts_turn
 from kasa.memory.observation import ObservationDraft
 from kasa.memory.subject import normalize_subject
 
@@ -304,7 +304,22 @@ class Store:
             return [await self.append_message(session_id, m) for m in messages]
 
     async def recent_messages(self, session_id: str, limit: int = 100) -> list[Message]:
-        """Most recent `limit` messages, oldest first.
+        """The most recent messages, oldest first, starting at a turn boundary.
+
+        At least `limit` of them, and more where the limit fell inside a turn.
+        A turn writes two rows per round of tool calls, so a long one runs past
+        any limit, and a slice taken by count alone can begin with a
+        `tool_result` whose `tool_use` was left behind. Both provider families
+        reject that outright, and Anthropic additionally requires the first
+        message to be a real user message — which is exactly what a turn head
+        is (#204).
+
+        Widened rather than trimmed. Cutting back to the next boundary would
+        throw away the turn in flight, which is the one the model is in the
+        middle of and the one whose tool results the answer depends on. The
+        packer is what decides how much of the extra fits (§8.5): it can
+        neither drop nor split the newest turn, so it shortens the turn's own
+        older tool results instead.
 
         A revised message is served as it stands now, because `revise_message`
         rewrote the row: an edit replaces the words and a deletion replaces
@@ -314,15 +329,35 @@ class Store:
         the whole failure #25 is about.
         """
         async with self._serial:
-            async with self._conn.execute(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
-                (session_id, limit),
-            ) as cur:
-                rows = list(await cur.fetchall())
-            return [
-                Message(role=row["role"], content=_BLOCKS.validate_json(row["content"]))
-                for row in reversed(rows)
-            ]
+            rows = await self._messages_before(session_id, before=None, limit=limit)
+            # Every session opens with something somebody said, so this walks
+            # back to the head of one turn at worst, never past the first row.
+            while rows and not starts_turn(rows[0][1]):
+                older = await self._messages_before(session_id, before=rows[0][0], limit=limit)
+                if not older:
+                    break
+                # The newest head in the batch, not the oldest row in it: this
+                # is reaching back for the turn already in hand, not for the
+                # conversation before it.
+                head = next((i for i in reversed(range(len(older))) if starts_turn(older[i][1])), 0)
+                rows = older[head:] + rows
+            return [message for _, message in rows]
+
+    async def _messages_before(
+        self, session_id: str, *, before: int | None, limit: int
+    ) -> list[tuple[int, Message]]:
+        """`(seq, message)` for the newest `limit` rows older than `before`, oldest first."""
+        sql = "SELECT seq, role, content FROM messages WHERE session_id = ?"
+        params: tuple[object, ...] = (session_id, limit)
+        if before is not None:
+            sql += " AND seq < ?"
+            params = (session_id, before, limit)
+        async with self._conn.execute(f"{sql} ORDER BY seq DESC LIMIT ?", params) as cur:
+            rows = list(await cur.fetchall())
+        return [
+            (row["seq"], Message(role=row["role"], content=_BLOCKS.validate_json(row["content"])))
+            for row in reversed(rows)
+        ]
 
     async def message_count(self, session_id: str) -> int:
         async with self._serial:
