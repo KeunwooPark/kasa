@@ -16,6 +16,7 @@ from kasa.llm.types import (
     ChatResponse,
     Delta,
     Message,
+    ToolDef,
     ToolResultBlock,
     ToolUseBlock,
     Usage,
@@ -57,6 +58,17 @@ anything they said just now. Do the work and give the answer on its own terms.
 Do not thank them for asking, do not refer to it as something they just said,
 and do not open by explaining that this is a scheduled message."""
 
+#: Handed back for every tool call left outstanding when the budget runs out
+#: (#200), and it is the last thing the model reads before it has to answer.
+#: So it says what happened *and* what to do about it: the closing call carries
+#: no tools at all, and a model that does not know that will spend its final
+#: reply announcing the next search instead of reporting the last one.
+OUT_OF_TOOL_BUDGET = (
+    "This tool did not run: the turn is out of its tool budget, and no further tools "
+    "will run. Answer now from what you have already gathered. Give the person the "
+    "partial result rather than a plan, and say plainly what is still missing."
+)
+
 
 @dataclass(slots=True)
 class AgentConfig:
@@ -95,6 +107,15 @@ class AgentResult:
         """
         operational: str | None
         match self.stop_reason:
+            # Two ways to run out, and they ask different things of the reader.
+            # The loop now spends a tool-free call on an answer before it gives
+            # up (#200), so the usual outcome is real work that stopped early —
+            # partial, not failed, and nothing for the person to fix.
+            case "max_iterations" if self.text.strip():
+                operational = (
+                    f"this used up its budget of {self.tool_calls} tool call(s), so the "
+                    "answer covers only what it had found by then."
+                )
             case "max_iterations":
                 operational = (
                     f"stopped after {self.tool_calls} tool call(s) without an answer — "
@@ -117,6 +138,16 @@ class AgentResult:
             else None
         )
         return " ".join(note for note in (security, operational) if note) or None
+
+
+def _refused(uses: Sequence[ToolUseBlock]) -> Message:
+    """Results for tool calls that will never run, so the transcript stays valid."""
+    return Message.tool_results(
+        [
+            ToolResultBlock(tool_use_id=use.id, content=OUT_OF_TOOL_BUDGET, is_error=True)
+            for use in uses
+        ]
+    )
 
 
 def _restore_current_message(
@@ -250,20 +281,23 @@ class Agent:
                 # Out of iterations with calls outstanding. Answer them with an
                 # error rather than leaving an unanswered `tool_use` behind: no
                 # provider will accept that transcript on the next turn.
-                await self._store.append_message(
-                    session_id,
-                    Message.tool_results(
-                        [
-                            ToolResultBlock(
-                                tool_use_id=use.id,
-                                content="Tool iteration limit reached; stopping.",
-                                is_error=True,
-                            )
-                            for use in tool_uses
-                        ]
-                    ),
-                )
+                await self._store.append_message(session_id, _refused(tool_uses))
                 stop_reason = "max_iterations"
+                # Everything the turn found is sitting in the transcript. One
+                # more call, with no tools to reach for, is what turns it into
+                # an answer instead of throwing it away (#200).
+                closing, trace = await self._close_out(
+                    session_id, system_prompt, pinned, retrieved, on_delta
+                )
+                usage = usage + closing.usage
+                text = closing.text or text
+                await self._store.append_message(session_id, closing.message)
+                # A model handed no tools should not ask for one. The
+                # transcript still has to survive it doing so: an unanswered
+                # `tool_use` breaks every later turn in the session, and this
+                # is the one call whose reply nothing else checks.
+                if stray := closing.tool_uses:
+                    await self._store.append_message(session_id, _refused(stray))
                 break
 
             results = await self._dispatch_all(session_id, tool_uses, context)
@@ -285,15 +319,50 @@ class Agent:
 
     # -- internals -----------------------------------------------------------
 
-    def _request(self, packed: PackedContext) -> ChatRequest:
+    def _request(
+        self, packed: PackedContext, *, tools: tuple[ToolDef, ...] | None = None
+    ) -> ChatRequest:
         return ChatRequest(
             messages=packed.messages,
             system=packed.system,
             context=packed.context,
-            tools=self._tools.defs(),
+            tools=self._tools.defs() if tools is None else tools,
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
         )
+
+    async def _close_out(
+        self,
+        session_id: str,
+        system_prompt: str,
+        pinned: Sequence[str],
+        retrieved: Sequence[str],
+        on_delta: DeltaSink | None,
+    ) -> tuple[ChatResponse, PackTrace]:
+        """The last word of a turn that ran out of tool budget.
+
+        Sent with no tools at all, which is the point: asking a model to stop
+        calling tools is a request, and omitting them is a fact. Both compat
+        layers drop the key entirely when the tuple is empty, so there is
+        nothing for the model to reach for and prose is the only reply it can
+        give.
+
+        The prompt is packed exactly as every other pass packs it — same
+        system prefix, same pinned memory, same retrieval — so the cacheable
+        prefix stays byte-identical and this call reads the transcript it has
+        just spent eight rounds building. Only the tools are missing.
+        """
+        history = await self._store.recent_messages(session_id, self.config.history_limit)
+        packed = self._packer.pack(
+            system_prompt=system_prompt,
+            pinned=pinned,
+            retrieved=retrieved,
+            recent=history,
+            # Charged honestly: no schemas go out on this request, so none are
+            # counted against the system share in the trace.
+            tools=(),
+        )
+        return await self._call(session_id, self._request(packed, tools=()), on_delta), packed.trace
 
     async def _call(
         self, session_id: str, req: ChatRequest, on_delta: DeltaSink | None
