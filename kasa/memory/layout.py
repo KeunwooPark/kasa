@@ -14,7 +14,7 @@ from pathlib import Path
 MEMORY_DIR = "memory"
 
 #: Machinery: generated, written only by deterministic code. Inside `memory/`
-#: because `docs/DESIGN.md` §4.4 draws it there, so patch validation carves it
+#: because `docs/DESIGN.md` §4.5 draws it there, so patch validation carves it
 #: out explicitly rather than relying on it being somewhere else.
 KASA_DIR = f"{MEMORY_DIR}/.kasa"
 

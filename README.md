@@ -25,6 +25,11 @@ order, and many threads at once.
 Background jobs are rows in the same database, run by a scheduler inside the
 daemon: a restart loses nothing and a crashed job runs again.
 
+**v5 in progress — it acts on its own.** A standing task is a schedule somebody
+set up — *"every weekday at 9am, tell me what happened in AI overnight"*. Ask
+for one in the conversation you want it to answer in, and it fires there, with
+the same memory and the same tools as when you asked.
+
 | job | when | does |
 | --- | --- | --- |
 | `episode_close` | every 5 min | closes a thread that has gone quiet or grown long; summarizes it and extracts candidate facts |
@@ -34,6 +39,13 @@ daemon: a restart loses nothing and a crashed job runs again.
 | `forget` | weekly | archives what stopped mattering, and collects the archive after a grace period |
 | `reindex` | every minute | rebuilds the search index and the manifest for changed blobs |
 | `identity` | every 15 min | maps each Slack user id to one `people/` memory, and follows renames into it |
+| `task_run` | when a standing task is due | starts the turn a person scheduled, in the conversation they scheduled it from |
+
+Those first seven ship with Kasa and are the same in every install: they are how
+it keeps its own memory in order. `task_run` is the other kind. It does not know
+what it is running until it reads the `tasks` table, which holds whatever
+schedules people have set up on this install — user data, not product
+behaviour. The two stay in separate tables for exactly that reason.
 
 An episode is scored before anything expensive happens to it, so small talk
 closes with a summary and costs nothing further. `forget` makes no model call at
@@ -110,6 +122,12 @@ kasa inbox retry  requeue every dead-lettered event
 kasa job run <k>  run a background job now
 kasa job list     what each job is doing, and when it last ran
 kasa job retry    requeue every dead-lettered job
+kasa task list    standing tasks, and when each fires next
+kasa task add     create one: `--cron "0 9 * * 1-5" --tz Asia/Seoul`
+kasa task rm      delete one
+kasa task pause   stop it firing, without forgetting it
+kasa task resume  start it again, and clear the failures that stopped it
+kasa task run     fire one now, without waiting for the clock
 kasa review list  what is waiting on a person, and why
 kasa review done  mark a review as dealt with
 kasa db migrate   apply pending migrations
@@ -136,6 +154,59 @@ During a conversation the agent can:
 consolidation job reviews, so the interactive path and the background path share
 one validated write path. Anything scoped to a DM or a private channel stays
 there: retrieval filters on visibility before it ranks.
+
+## Standing tasks
+
+Ask for one where you want it to answer:
+
+> **you** — every weekday at 9am Seoul time, search for what happened in AI
+> overnight and give me the five things that matter
+>
+> **kasa** — Done. It next runs Mon 07 Sep 09:00, Tue 08 Sep 09:00 and
+> Wed 09 Sep 09:00, Asia/Seoul.
+
+At nine on Monday that prompt arrives in this thread as though you had typed it,
+and Kasa answers it there — same memory, same tools, same thread. It knows
+nobody spoke just now, so it gives you the news rather than thanking you for
+asking.
+
+The next fire times come back because they are the only part of this you can
+actually check. Nobody can proofread `0 9 * * 1-5`; anybody can notice that the
+first run is on a Monday.
+
+**A task answers where it was created, and nowhere else.** There is no way to
+ask for one that posts somewhere else — not a rule that is enforced, but an
+argument that does not exist. The channel, the thread and the visibility are
+copied off the conversation, so a task set up in a DM stays in the DM, and text
+Kasa merely *reads* cannot arrange for anything to be said in a public channel.
+Listing and cancelling are scoped the same way: one thread cannot see or delete
+another's schedules. The terminal is the exception, and deliberately so:
+`kasa task add --session` is the operator of the install choosing, which is a
+different thing from the model being able to.
+
+**Standing tasks need the daemon.** The clock runs inside `kasa run --slack`; on
+a terminal, `kasa task add` writes the row and nothing fires it (the command
+says so). `kasa task run <id>` fires one occurrence by hand.
+
+From the terminal:
+
+```bash
+uv run kasa task list
+uv run kasa task add "summarize yesterday" --cron "0 9 * * 1-5" --tz Asia/Seoul
+uv run kasa task pause <id>
+```
+
+Every firing is a full turn — retrieval, a frontier model, whatever tools it
+reaches for — and it is metered like any other, so it shows up in `kasa cost`.
+The `[budget]` ceiling pauses background utility work rather than a scheduled
+answer, which makes these the bounds that actually apply:
+
+```toml
+[tasks]
+max_per_owner          = 20   # per person, counting paused ones
+min_interval_minutes   = 15   # no schedule tighter than this
+disable_after_failures = 5    # then it pauses, and tells whoever created it
+```
 
 ## Web search
 

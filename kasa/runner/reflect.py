@@ -527,7 +527,7 @@ def _targets(patches: Sequence[MemoryPatch]) -> frozenset[str]:
 
 
 def journal_path(day: date) -> str:
-    """`memory/journal/YYYY/MM/DD.md` — the design's layout (§4.4).
+    """`memory/journal/YYYY/MM/DD.md` — the design's layout (§4.5).
 
     Derived from the date rather than from a title, which is what makes a
     re-run of one night find its own entry instead of writing a second.
