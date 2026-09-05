@@ -95,7 +95,10 @@ Return a JSON array of patch objects. The allowed operations are:
 - `{{"type": "update", "id": "<memory id>", "body": "<full new body>",
   "frontmatter": {{...}}}}` — the corpus already covers this subject. `body`
   replaces the old body entirely, so write the whole thing, not the change.
-  `frontmatter` carries only the fields you are changing.
+  `frontmatter` carries only the fields you are changing. Never include `id`,
+  `created`, or `updated` in an update's frontmatter: identity and creation time
+  are immutable, and Kasa stamps `updated` automatically. Omit `frontmatter`
+  when only the body changes.
 - `{{"type": "merge", "into": "<memory id>", "from_ids": [...], "body": "..."}}`
   — two existing memories say the same thing. The sources are archived, not
   deleted, and their ids keep resolving.
@@ -266,7 +269,7 @@ class Promoter:
             plan = decode_plan(response.text, job=JOB)
         except PatchError as exc:
             return [], str(exc)
-        return _with_scope(plan, group.scope), None
+        return _normalize_plan(plan, group.scope), None
 
     async def _competing(self, group: Group) -> dict[str, str]:
         """The memories already in the corpus that this group is about.
@@ -437,8 +440,8 @@ def _memory_ids(plan: Sequence[MemoryPatch]) -> list[str]:
     return ids
 
 
-def _with_scope(plan: Sequence[MemoryPatch], scope: str) -> list[MemoryPatch]:
-    """Force every document the plan creates to the group's audience.
+def _normalize_plan(plan: Sequence[MemoryPatch], scope: str) -> list[MemoryPatch]:
+    """Enforce scope and drop model-supplied update timestamps.
 
     Corrected rather than rejected. The scope is not the model's to choose, so
     a plan that got it wrong is not a plan to argue with — and rejecting it
@@ -452,16 +455,28 @@ def _with_scope(plan: Sequence[MemoryPatch], scope: str) -> list[MemoryPatch]:
                 corrected.append(patch.model_copy(update={"memory": _scoped(patch.memory, scope)}))
             case Supersede():
                 corrected.append(patch.model_copy(update={"new": _scoped(patch.new, scope)}))
-            case Update() if "visibility" in patch.frontmatter:
+            case Update() if {"visibility", "updated"} & patch.frontmatter.keys():
                 # An update may not change visibility at all: the memory's
                 # audience was set when it was written, and this plan is about
                 # one group's claims, not about who may read it.
-                log.warning("promote: dropped a visibility change from an update to %s", patch.id)
+                if "visibility" in patch.frontmatter:
+                    log.warning(
+                        "promote: dropped a visibility change from an update to %s", patch.id
+                    )
+                # Kasa owns this timestamp. Ignore the model's value so an
+                # otherwise valid observation does not exhaust its retries.
+                # Identity fields still reach the compiler and are rejected.
+                if "updated" in patch.frontmatter:
+                    log.warning(
+                        "promote: dropped an updated timestamp from an update to %s", patch.id
+                    )
                 corrected.append(
                     patch.model_copy(
                         update={
                             "frontmatter": {
-                                k: v for k, v in patch.frontmatter.items() if k != "visibility"
+                                k: v
+                                for k, v in patch.frontmatter.items()
+                                if k not in {"visibility", "updated"}
                             }
                         }
                     )

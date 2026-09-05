@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -467,3 +468,68 @@ async def test_a_run_is_bounded(clone: Path, store: Store) -> None:
 
     assert result.subjects == 2
     assert len(provider.requests) == 2
+
+
+@pytest.mark.parametrize("extra", [{}, {"confidence": 0.9}, {"visibility": "private:someone"}])
+async def test_update_ignores_model_timestamp_and_promotes(
+    clone: Path, store: Store, extra: dict[str, Any]
+) -> None:
+    existing = MemoryDoc.new(type="fact", title="AI news schedule", body="Wants daily news.")
+    path = write_memory(clone, existing)
+    observation = await observe(store, "AI news schedule", "Daily news runs at 9 AM KST.")
+    provider = Scripted(
+        json.dumps(
+            [
+                {
+                    "type": "update",
+                    "id": existing.id,
+                    "body": "Daily news runs at 9 AM KST.",
+                    "frontmatter": {"updated": "2099-01-01T00:00:00Z", **extra},
+                }
+            ]
+        )
+    )
+    before = datetime.now(UTC)
+
+    result = await (await promoter_for(clone, store, provider, max_attempts=1)).run()
+
+    assert result.promoted == 1
+    assert result.discarded == result.deferred == 0
+    written = MemoryDoc.parse((clone / path).read_text())
+    assert "Daily news runs at 9 AM KST." in written.body
+    assert written.id == existing.id
+    assert written.frontmatter.created == existing.frontmatter.created
+    assert before.replace(microsecond=0) <= written.frontmatter.updated <= datetime.now(UTC)
+    assert written.frontmatter.visibility == existing.frontmatter.visibility
+    if "confidence" in extra:
+        assert written.frontmatter.confidence == extra["confidence"]
+    rows = await store.raw("SELECT state, attempts FROM observations WHERE id = ?", (observation,))
+    assert rows == [{"state": "promoted", "attempts": 0}]
+
+
+@pytest.mark.parametrize("field", ["id", "created"])
+async def test_update_timestamp_normalization_does_not_allow_identity_changes(
+    clone: Path, store: Store, field: str
+) -> None:
+    existing = MemoryDoc.new(type="fact", title="AI news schedule", body="Wants daily news.")
+    path = write_memory(clone, existing)
+    original = (clone / path).read_text()
+    await observe(store, "AI news schedule", "Daily news runs at 9 AM KST.")
+    provider = Scripted(
+        json.dumps(
+            [
+                {
+                    "type": "update",
+                    "id": existing.id,
+                    "body": "Changed.",
+                    "frontmatter": {"updated": "2099-01-01T00:00:00Z", field: "invalid"},
+                }
+            ]
+        )
+    )
+
+    result = await (await promoter_for(clone, store, provider)).run()
+
+    assert result.promoted == 0
+    assert result.deferred == 1
+    assert (clone / path).read_text() == original
