@@ -780,7 +780,12 @@ Details that bite, in rough order of how quickly they will bite:
   is a decision with a person in it, not a default every public channel picks
   up on the way in.
 - **Streaming** = post a placeholder, then `chat.update` at roughly 1/sec. Never
-  per-token; you will hit rate limits and the UI flickers.
+  per-token; you will hit rate limits and the UI flickers. Frames may be
+  dropped; they may not be reordered. Only one write is in flight at a time and
+  the answer goes out after the last frame has landed — cancelling a frame
+  mid-request abandons this side of a write Slack has already accepted, and it
+  can then be applied *after* the answer, leaving the thread on a mid-sentence
+  prefix of a reply that was delivered in full.
 - **Identity mapping.** Slack user id → `people/<slug>.md`, so the same person is
   one memory across channels and DMs.
 - **Reactions are free feedback.** 👍 on an answer boosts the salience of the

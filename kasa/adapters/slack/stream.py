@@ -18,6 +18,10 @@ harder: intermediate frames are a nicety and the final one is the answer, so
 under rate-limit pressure this degrades to exactly what it replaced, a single
 message with the answer in it.
 
+Frames are droppable but not reorderable. Only one write is ever in flight, and
+the answer is written after the last frame has landed rather than on top of one
+still on its way — see `_stop_painting` for why cancelling is not enough (#192).
+
 No `slack_sdk` import. What it needs is two calls — post one message, rewrite
 one message — and taking them as a protocol is what lets the throttling and
 the degradation be tested without a socket or the `slack` extra.
@@ -98,6 +102,12 @@ class LiveMessage:
         self._ts = ts
         self._painter: asyncio.Task[None] | None = None
         self._refusals = 0
+        #: Held for the duration of one write, so a frame and the answer can
+        #: never be at Slack at the same time.
+        self._writing = asyncio.Lock()
+        #: Set once the answer is what should be written. A frame that was
+        #: waiting for the lock when it went up is dropped rather than sent.
+        self._sealed = False
 
         self._text: list[str] = []
         self._tools: list[str] = []
@@ -204,7 +214,10 @@ class LiveMessage:
             if frame == self._painted or self._ts is None:
                 continue
             try:
-                await self._poster.update(channel=self._channel, ts=self._ts, text=frame)
+                async with self._writing:
+                    if self._sealed:
+                        return
+                    await self._poster.update(channel=self._channel, ts=self._ts, text=frame)
             except SlackRateLimited as limit:
                 self._refusals += 1
                 if self._refusals >= MAX_REFUSALS:
@@ -219,10 +232,26 @@ class LiveMessage:
                 self._painted = frame
 
     async def _stop_painting(self) -> None:
-        if self._painter is None:
-            return
+        """Stop redrawing, without interrupting a redraw already under way.
+
+        Cancelling a painter that is mid-`chat.update` abandons this side of a
+        write Slack has already received. Slack still applies it, and nothing
+        then orders it against the answer that goes out a moment later — so the
+        frame can land last and leave the thread holding a mid-sentence prefix
+        of a reply that was delivered in full (#192).
+
+        Taking the lock first is what rules that out: an in-flight frame is
+        waited out, the message is sealed against any further one, and only
+        then is the painter cancelled. It costs nothing in the ordinary case,
+        where the painter is asleep between frames and the lock is free.
+        """
         painter, self._painter = self._painter, None
-        painter.cancel()
+        async with self._writing:
+            self._sealed = True
+            if painter is not None:
+                painter.cancel()
+        if painter is None:
+            return
         with contextlib.suppress(asyncio.CancelledError):
             await painter
 
@@ -230,7 +259,11 @@ class LiveMessage:
         assert self._ts is not None
         for attempt in range(1, FINAL_ATTEMPTS + 1):
             try:
-                await self._poster.update(channel=self._channel, ts=self._ts, text=final)
+                # Uncontended by now — `_stop_painting` sealed the message —
+                # but taken all the same, so "one write at a time" is a
+                # property of the class rather than of the order it is called in.
+                async with self._writing:
+                    await self._poster.update(channel=self._channel, ts=self._ts, text=final)
             except SlackRateLimited as limit:
                 if attempt == FINAL_ATTEMPTS:
                     raise

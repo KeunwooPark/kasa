@@ -8,6 +8,7 @@ happens when Slack says no — is reachable with a list and a clock.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -35,6 +36,13 @@ class FakePoster:
         #: How many of the next calls to refuse, and how.
         self.refuse_updates = 0
         self.fail_posts = 0
+        #: A write that has reached Slack and is waiting on it. `entered` is
+        #: set the moment one arrives; it lands when `gate` is set. Slack is
+        #: the slow half of a `chat.update` and this is the only way to hold a
+        #: test in the window that matters — the one where a frame is already
+        #: over there and the turn ends.
+        self.gate: asyncio.Event | None = None
+        self.entered = asyncio.Event()
 
     async def post(self, *, channel: str, thread_ts: str | None, text: str) -> str:
         if self.fail_posts:
@@ -47,6 +55,9 @@ class FakePoster:
         if self.refuse_updates:
             self.refuse_updates -= 1
             raise SlackRateLimited(0.0)
+        self.entered.set()
+        if self.gate is not None:
+            await self.gate.wait()
         self.updates.append(text)
 
 
@@ -207,6 +218,71 @@ async def test_a_final_update_that_never_lands_fails_the_turn() -> None:
 
     with pytest.raises(SlackRateLimited):
         await message.finish("It was Tuesday.")
+
+
+async def test_a_frame_already_in_flight_cannot_land_after_the_answer() -> None:
+    """#192: a reply left showing a mid-sentence prefix of an answer that was
+    delivered in full.
+
+    Cancelling the painter mid-`chat.update` abandons only this side of a write
+    Slack has already taken. Slack still applies it, and it can be applied
+    after the answer — which no fake poster can reproduce, because the reorder
+    happens at Slack. What is checkable here is the invariant that rules it
+    out: the frame is waited for rather than cancelled, and the answer is
+    written after it.
+    """
+    poster = FakePoster()
+    message = live(poster)
+    await message.open()
+    poster.gate = asyncio.Event()
+    await message.delta(text("half a sen"))
+    await asyncio.wait_for(poster.entered.wait(), timeout=1.0)
+
+    finishing = asyncio.create_task(message.finish("It was Tuesday."))
+    await ticks(2)
+    assert poster.updates == [], "the answer waited for the frame at Slack"
+    poster.gate.set()
+    await finishing
+
+    assert poster.updates == ["half a sen", "It was Tuesday."], "in that order, both of them"
+
+
+async def test_a_frame_waiting_its_turn_is_dropped_rather_than_sent_late() -> None:
+    """The other half of the same window. A frame that had not reached Slack
+    when the turn ended has nothing to say that the answer does not."""
+    poster = FakePoster()
+    message = live(poster)
+    await message.open()
+    poster.gate = asyncio.Event()
+    await message.delta(text("half a sen"))
+    await asyncio.wait_for(poster.entered.wait(), timeout=1.0)
+    # A second tick queues behind the first, which is still at Slack.
+    await message.delta(text("tence"))
+    await ticks(2)
+
+    finishing = asyncio.create_task(message.finish("It was Tuesday."))
+    await ticks(1)
+    poster.gate.set()
+    await finishing
+
+    assert poster.updates[-1] == "It was Tuesday."
+    assert "half a sentence" not in poster.updates, "the queued frame never went"
+
+
+async def test_finishing_does_not_wait_out_an_interval_to_stop_the_painter() -> None:
+    """Waiting for an in-flight frame must not become waiting for the next one.
+    With the painter asleep there is nothing to wait for, and the answer goes
+    straight out."""
+    poster = FakePoster()
+    message = LiveMessage(poster, channel=CHANNEL, thread_ts=THREAD, interval=5.0)  # type: ignore[arg-type]
+    await message.open()
+    await message.delta(text("It was Tuesday."))
+
+    started = time.monotonic()
+    await message.finish("It was Tuesday.")
+
+    assert time.monotonic() - started < 1.0
+    assert poster.updates == ["It was Tuesday."]
 
 
 # -- degrading ----------------------------------------------------------------
