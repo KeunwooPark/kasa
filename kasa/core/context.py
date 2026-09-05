@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from kasa.errors import ConfigError
 from kasa.llm.tokens import Tokenizer, count_message
-from kasa.llm.types import Message, ToolDef, ToolResultBlock
+from kasa.llm.types import Message, ToolDef, ToolResultBlock, starts_turn
 
 #: Counts tokens in a string.
 Counter = Callable[[str], int]
@@ -335,8 +335,7 @@ def group_turns(messages: Sequence[Message]) -> list[list[Message]]:
     current: list[Message] = []
 
     for msg in messages:
-        starts_turn = msg.role == "user" and not msg.tool_results_in
-        if starts_turn and current:
+        if starts_turn(msg) and current:
             groups.append(current)
             current = []
         current.append(msg)

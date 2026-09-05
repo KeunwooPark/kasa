@@ -821,6 +821,14 @@ Enforced by a tokenizer-aware packer with a fixed allocation:
 Segments are filled in priority order and truncated at their own boundary, so an
 overlong retrieval never evicts the recent turns.
 
+The history a turn is packed from starts at a turn boundary, not at a row
+count. A turn writes two rows per round of tool calls, so a long one runs past
+any limit, and a slice taken by count alone can begin with a `tool_result`
+whose `tool_use` was left behind — rejected outright by both provider families.
+The store widens such a slice back to the head of the turn rather than trimming
+forward to the next one: the turn in flight is what the answer depends on, and
+how much of it fits is the packer's decision, below.
+
 Recent turns truncate by whole exchanges, never inside one: an assistant
 `tool_use` whose `tool_result` was dropped is rejected outright by both provider
 families. That leaves the turn in flight, which cannot be dropped at all and
