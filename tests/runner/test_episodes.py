@@ -587,6 +587,16 @@ async def test_the_extractor_is_given_no_tools(store: Store) -> None:
     assert all(request.tools == () for request in provider.requests)
 
 
+async def test_assessment_has_room_for_reasoning_before_its_json_reply(store: Store) -> None:
+    await seed(store)
+    await make_idle(store)
+    closer, provider = closer_for(store, talking())
+
+    await closer.sweep()
+
+    assert provider.requests[0].max_tokens == 2_048
+
+
 async def test_a_pasted_wall_of_text_is_truncated_per_message(store: Store) -> None:
     await seed(store, turns=[("user", "jane", "x" * 50_000)])
     await make_idle(store)
