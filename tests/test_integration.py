@@ -84,8 +84,8 @@ async def test_tool_using_turn_end_to_end(store: Store, tokenizer: Tokenizer) ->
     # session. The per-turn block behind it is where anything that changes goes,
     # and since #201 the tool-budget countdown is one of those things.
     assert seen[0]["system"][0] == seen[1]["system"][0]
-    assert "8 tool rounds are left" in seen[0]["system"][1]["text"]
-    assert "7 tool rounds are left" in seen[1]["system"][1]["text"]
+    assert "40 tool rounds are left" in seen[0]["system"][1]["text"]
+    assert "39 tool rounds are left" in seen[1]["system"][1]["text"]
     assert "cache_control" not in seen[1]["system"][1]
 
     # The transcript replays.

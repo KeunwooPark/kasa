@@ -384,7 +384,12 @@ class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     system_prompt: str | None = None
-    max_tool_iterations: int = 8
+    #: Rounds of tool calls one turn may spend, and the wall clock it may spend
+    #: them over. Both bound the same thing — how much work a turn does before
+    #: it has to answer — and a turn that hits either writes up what it has
+    #: rather than returning nothing (#200).
+    max_tool_iterations: int = 40
+    max_turn_seconds: float = 600.0
     max_tokens: int = 4096
     temperature: float | None = None
     history_limit: int = 200
@@ -636,6 +641,7 @@ class Config(BaseModel):
         return AgentConfig(
             system_prompt=settings.system_prompt or base.system_prompt,
             max_tool_iterations=settings.max_tool_iterations,
+            max_turn_seconds=settings.max_turn_seconds,
             max_tokens=settings.max_tokens,
             temperature=settings.temperature,
             history_limit=settings.history_limit,
