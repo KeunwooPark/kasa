@@ -58,10 +58,20 @@ DEFAULT_TIMEOUT = 30.0
 #: idle at all. A fixed settle does.
 DEFAULT_SETTLE_MS = 3_000
 
-#: A page that wants more than this is not a page. Both are bounds on what one
-#: turn can cost, not on what a site may legitimately do.
+#: How many requests a render may actually *fetch*. Requests aborted on
+#: resource type are not among them: aborting an image costs no network and no
+#: DNS, and counting it consumed the budget for the ones that do — a measured
+#: page intercepted 4,381 requests, of which 4,311 were images and only ~70
+#: were real, and the cap fired at 600 having counted the free ones (#197).
 DEFAULT_MAX_REQUESTS = 600
 DEFAULT_MAX_BYTES = 20_000_000
+
+#: Requests a render may *decline* before it is stopped regardless. Absolute
+#: rather than a multiple of the cap above, because an abort costs no network
+#: and its ceiling has no reason to scale with the budget for the ones that do:
+#: a page fetching two things may legitimately decline thousands of images.
+#: This exists only because free is not unlimited.
+DEFAULT_MAX_INTERCEPTS = 50_000
 
 #: Turned off because none of it is this page: update pings, sync, safe-browsing
 #: lists, network prediction. Traffic `page.route` never sees is traffic worth
@@ -84,10 +94,21 @@ class Rendered:
 
     url: str
     html: str
+    #: Everything the page asked for, including what was never fetched.
     requests: int
+    #: What was aborted: the resource types a reader never sees, and anything
+    #: the guard refused.
     blocked: int
-    truncated: bool
-    """Whether a cap stopped the render before the page was finished."""
+    fetched: int
+    """What actually went to the network, and what the cap is measured against."""
+    incomplete: bool
+    """Whether a cap stopped the render while the page was still loading.
+
+    Not the same as the text being cut, and it must not be reported as if it
+    were: one says the page may have had more to draw, the other says there is
+    more text than fits. A render whose only aborts were images lost nothing
+    and is not incomplete (#197).
+    """
 
 
 class Launcher(Protocol):
@@ -111,6 +132,7 @@ class BrowserRenderer:
         settle_ms: int = DEFAULT_SETTLE_MS,
         max_requests: int = DEFAULT_MAX_REQUESTS,
         max_bytes: int = DEFAULT_MAX_BYTES,
+        max_intercepts: int = DEFAULT_MAX_INTERCEPTS,
         resolver: Resolver | None = None,
         launcher: Launcher | None = None,
     ) -> None:
@@ -118,6 +140,7 @@ class BrowserRenderer:
         self._settle_ms = settle_ms
         self._max_requests = max_requests
         self._max_bytes = max_bytes
+        self._max_intercepts = max_intercepts
         self._resolver = resolver
         self._launcher = launcher
         self._playwright: Any = None
@@ -204,7 +227,7 @@ class BrowserRenderer:
             accept_downloads=False,
         )
         page = await context.new_page()
-        tally = _Tally(self._max_requests, self._max_bytes)
+        tally = _Tally(self._max_requests, self._max_bytes, self._max_intercepts)
         await page.route("**/*", _guarding(tally, self._resolver))
 
         try:
@@ -223,28 +246,47 @@ class BrowserRenderer:
             html=html,
             requests=tally.seen,
             blocked=tally.blocked,
-            truncated=tally.capped,
+            fetched=tally.fetched,
+            incomplete=tally.capped,
         )
 
 
 class _Tally:
-    """What a render has spent, and whether it may spend more."""
+    """What a render has spent, and whether it may spend more.
 
-    def __init__(self, max_requests: int, max_bytes: int) -> None:
+    Two counts, because they cost different things. `fetched` is what went to
+    the network and is what `max_requests` bounds. `seen` is everything the
+    page asked for, most of which is aborted for free, and is bounded only
+    loosely — as a runaway guard rather than as a budget.
+    """
+
+    def __init__(self, max_requests: int, max_bytes: int, max_intercepts: int) -> None:
         self.seen = 0
         self.blocked = 0
+        self.fetched = 0
         self.capped = False
         self._max_requests = max_requests
         self._max_bytes = max_bytes
+        self._max_intercepts = max_intercepts
 
-    def allow(self) -> bool:
+    def intercept(self) -> bool:
+        """Count one request arriving. False once even asking is too much."""
         self.seen += 1
-        if self.seen > self._max_requests:
+        if self.seen > self._max_intercepts:
             self.capped = True
             return False
         return True
 
+    def fetch(self) -> bool:
+        """Count one request about to go to the network."""
+        if self.fetched >= self._max_requests:
+            self.capped = True
+            return False
+        self.fetched += 1
+        return True
+
     def refuse(self) -> None:
+        """Count one request that was never sent. Costs nothing, bounds nothing."""
         self.blocked += 1
 
 
@@ -254,13 +296,14 @@ def _guarding(tally: _Tally, resolver: Resolver | None) -> Any:
 
     async def handle(route: Any) -> None:
         request = route.request
-        if not tally.allow():
+        if not tally.intercept():
             tally.refuse()
             await _quietly(route.abort())
             return
         if request.resource_type in SKIPPED_TYPES:
             # Not judged, because not fetched. Cheaper than resolving a name
-            # for a photograph nobody will read.
+            # for a photograph nobody will read — and free, so it is counted
+            # as refused rather than against the fetch budget (#197).
             tally.refuse()
             await _quietly(route.abort())
             return
@@ -279,6 +322,12 @@ def _guarding(tally: _Tally, resolver: Resolver | None) -> Any:
             else:
                 approved[host] = True
         if not approved[host]:
+            tally.refuse()
+            await _quietly(route.abort())
+            return
+        # Counted here, at the last moment before it goes to the network, so
+        # the budget measures what a render actually costs.
+        if not tally.fetch():
             tally.refuse()
             await _quietly(route.abort())
             return
