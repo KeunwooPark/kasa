@@ -300,7 +300,7 @@ class EpisodeCloser:
                 system=ASSESS_SYSTEM,
                 prompt=_untrusted(lines),
                 tag="episode_close.assess",
-                max_tokens=512,
+                max_tokens=2_048,
             )
         except _UNUSABLE as exc:
             log.error("episode %s could not be assessed: %s", episode_id, exc)
