@@ -28,6 +28,7 @@ from urllib.parse import urljoin
 import httpx
 
 from kasa.errors import FetchError
+from kasa.fetch.browser import BrowserRenderer
 from kasa.fetch.guard import Resolver, Target, approve
 from kasa.fetch.readable import clamp, readable
 
@@ -79,6 +80,15 @@ class Page:
     text: str
     truncated: bool
     redirects: int
+    #: Whether a browser ran the page, rather than the served HTML being read.
+    rendered: bool = False
+    #: Set when the served HTML looks like a shell that fills itself in later —
+    #: little text for its size, plenty of script. A fact about the page, not
+    #: advice: what to *do* about it depends on whether this install has a
+    #: browser, and only the tool knows that. It is what turns "there is
+    #: nothing here" into "there is nothing here *yet*", which is the
+    #: difference between the model giving up and asking for a render (#195).
+    scripted: bool = False
 
 
 class WebFetcher:
@@ -93,12 +103,16 @@ class WebFetcher:
         max_redirects: int = MAX_REDIRECTS,
         resolver: Resolver | None = None,
         client: httpx.AsyncClient | None = None,
+        renderer: BrowserRenderer | None = None,
     ) -> None:
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._max_chars = max_chars
         self._max_redirects = max_redirects
         self._resolver = resolver
+        #: None when the browser extra is absent or `[browser]` is off, which
+        #: is also when the tool stops offering `render` at all.
+        self._renderer = renderer
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=timeout,
@@ -111,12 +125,25 @@ class WebFetcher:
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
 
+    @property
+    def can_render(self) -> bool:
+        return self._renderer is not None
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+        if self._renderer is not None:
+            await self._renderer.aclose()
 
-    async def fetch(self, url: str) -> Page:
-        """Read `url`, or raise `Blocked` / `FetchError` saying why not."""
+    async def fetch(self, url: str, *, render: bool = False) -> Page:
+        """Read `url`, or raise `Blocked` / `FetchError` saying why not.
+
+        `render` runs the page in a browser instead of reading what the server
+        sent. It is the expensive path — seconds and hundreds of megabytes —
+        so it is asked for rather than guessed at.
+        """
+        if render:
+            return await self._rendered(url)
         seen: list[str] = []
         current = url
         for hop in range(self._max_redirects + 1):
@@ -140,6 +167,33 @@ class WebFetcher:
         raise FetchError("that URL redirected more than expected.")  # pragma: no cover
 
     # -- internals -----------------------------------------------------------
+
+    async def _rendered(self, url: str) -> Page:
+        """The same page, by way of a browser.
+
+        Only the acquisition differs. Extraction is `readable` exactly as it is
+        for served HTML, so what reaches the model — and the boundary it
+        arrives behind — does not depend on how the bytes were got.
+        """
+        if self._renderer is None:
+            raise FetchError(
+                "rendering is not available on this install; reading the page as served instead "
+                "is the only option. Ask again without render."
+            )
+        page = await self._renderer.render(url)
+        title, text, cut = readable(page.html, limit=self._max_chars)
+        if not text:
+            raise FetchError("that page rendered with no readable text in it.")
+        return Page(
+            url=page.url,
+            status=200,
+            content_type="text/html",
+            title=title,
+            text=text,
+            truncated=cut or page.truncated,
+            redirects=0,
+            rendered=True,
+        )
 
     async def _get(self, target: Target) -> httpx.Response:
         """Send one request, to the address the guard approved.
@@ -205,7 +259,7 @@ class WebFetcher:
             title, text, cut = readable(decoded, limit=self._max_chars)
         else:
             title, (text, cut) = None, clamp(decoded, limit=self._max_chars)
-        if not text:
+        if not text and not _is_shell(decoded, content_type):
             raise FetchError(f"that URL returned {content_type} with no readable text in it.")
         return Page(
             url=target.url,
@@ -215,6 +269,7 @@ class WebFetcher:
             text=text,
             truncated=cut or oversize,
             redirects=redirects,
+            scripted=_is_shell(decoded, content_type),
         )
 
     async def _body(self, response: httpx.Response) -> tuple[bytes, bool]:
@@ -233,6 +288,45 @@ class WebFetcher:
                 log.debug("stopped reading %s at %d bytes", response.url, size)
                 return b"".join(chunks)[: self._max_bytes], True
         return b"".join(chunks), False
+
+
+#: What share of a document has to survive as readable text before it counts as
+#: a page rather than a shell waiting to be filled in. Measured rather than
+#: guessed, against pages of both kinds:
+#:
+#:     megabox timetable (the shell)   2.4%   28 <script
+#:     github repo page                5.1%   14
+#:     wikipedia article               7.9%    5
+#:     hacker news                    10.7%    1
+#:     python docs                    15.4%   13
+#:     example.com                    23.1%    0
+#:
+#: 4% sits in the gap, with the nearest content-bearing page nearly a third
+#: clear of it.
+SHELL_RATIO = 0.04
+
+#: And enough script to explain where the content went. A short, script-free
+#: page is just short.
+SHELL_SCRIPTS = 5
+
+#: Below this a document is too small for the ratio to mean anything.
+SHELL_FLOOR = 2_000
+
+
+def _is_shell(html: str, content_type: str) -> bool:
+    """Whether this looks like a page whose content has not arrived yet.
+
+    Deliberately crude, and deliberately only ever used to *offer* a render.
+    Getting it wrong costs one sentence of advice the model is free to ignore;
+    saying nothing is what left an agent reporting that a timetable did not
+    exist when it was one XHR away.
+    """
+    if content_type not in HTML_TYPES or len(html) < SHELL_FLOOR:
+        return False
+    if html.lower().count("<script") < SHELL_SCRIPTS:
+        return False
+    _, text, _ = readable(html, limit=len(html))
+    return len(text) < SHELL_RATIO * len(html)
 
 
 def _media_type(header: str) -> str:

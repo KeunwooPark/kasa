@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from kasa.core.agent import AgentConfig
 from kasa.core.context import ContextBudget
 from kasa.errors import ConfigError
+from kasa.fetch.browser import BrowserRenderer
 from kasa.fetch.client import WebFetcher
 from kasa.llm.anthropic_compat import AnthropicCompatProvider
 from kasa.llm.base import LLMProvider
@@ -518,12 +519,46 @@ class FetchSettings(BaseModel):
     #: Zero by default and still counted, on the same terms as search.
     cost_per_call_usd: float = Field(default=0.0, ge=0)
 
-    def build(self) -> WebFetcher:
+    def build(self, renderer: BrowserRenderer | None = None) -> WebFetcher:
         return WebFetcher(
             timeout=self.timeout_seconds,
             max_bytes=self.max_bytes,
             max_chars=self.max_chars,
             max_redirects=self.max_redirects,
+            renderer=renderer,
+        )
+
+
+class BrowserSettings(BaseModel):
+    """Running a page rather than reading it, off unless an install asks.
+
+    The opposite default from `[fetch]`, and for a reason `[fetch]`'s docstring
+    does not apply to: this one is not free. It needs an extra whose browser is
+    about 650MB on disk, and a render costs several seconds and a few hundred
+    megabytes of RSS while it runs. A capability with that price attached is one
+    an install should choose, and until it does the tool does not mention it —
+    the `render` parameter is absent from the schema, not present and refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    #: The whole render: launch, navigate, and the settle below.
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    #: How long script is allowed to keep working after the document is ready.
+    #: Fixed rather than waiting for network idle, which a page that polls never
+    #: reaches.
+    settle_ms: int = Field(default=3_000, ge=0, le=30_000)
+    #: A page wanting more than this is not a page.
+    max_requests: int = Field(default=600, ge=1)
+    max_bytes: int = Field(default=20_000_000, ge=1_024)
+
+    def build(self) -> BrowserRenderer:
+        return BrowserRenderer(
+            timeout=self.timeout_seconds,
+            settle_ms=self.settle_ms,
+            max_requests=self.max_requests,
+            max_bytes=self.max_bytes,
         )
 
 
@@ -588,6 +623,7 @@ class Config(BaseModel):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     fetch: FetchSettings = Field(default_factory=FetchSettings)
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
     tasks: TaskSettings = Field(default_factory=TaskSettings)
     #: USD per million tokens, keyed by model-name prefix. Empty by default:
@@ -822,6 +858,7 @@ def render_toml(cfg: Config) -> str:
         # default, so a fresh config says nothing about it — and a config that
         # does mention it is a config where somebody moved a limit.
         ("fetch", cfg.fetch),
+        ("browser", cfg.browser),
         ("memory", cfg.memory),
         ("episodes", cfg.episodes),
         ("promote", cfg.promote),

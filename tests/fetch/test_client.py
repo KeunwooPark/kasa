@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from kasa.errors import Blocked, FetchError
-from kasa.fetch.client import USER_AGENT, WebFetcher
+from kasa.fetch.client import SHELL_SCRIPTS, USER_AGENT, WebFetcher
 
 PUBLIC = "93.184.216.34"
 
@@ -234,6 +234,53 @@ async def test_an_unknown_charset_still_yields_the_page() -> None:
     page = await fetcher(handler).fetch("https://example.invalid/")
 
     assert "Tuesday" in page.text
+
+
+# -- pages whose content has not arrived yet ----------------------------------
+
+
+def shell(text_chars: int, html_chars: int, scripts: int = SHELL_SCRIPTS) -> str:
+    """A document of `html_chars` holding `text_chars` of readable text."""
+    body = f"<p>{'w' * text_chars}</p>"
+    padding = "<div data-x='" + "p" * max(html_chars - len(body) - 40 * scripts, 0) + "'></div>"
+    return f"<html><body>{body}{padding}{'<script>x=1</script>' * scripts}</body></html>"
+
+
+async def test_a_shell_page_is_flagged_as_one() -> None:
+    """Measured, not guessed: the cinema page this came from carried 2.4% of
+    its bytes as readable text behind 28 script tags, while every
+    content-bearing page checked was 5.1% or more."""
+    page = await fetcher(serving(shell(text_chars=300, html_chars=40_000))).fetch(
+        "https://example.invalid/"
+    )
+
+    assert page.scripted
+
+
+async def test_a_page_with_content_is_not_flagged_however_much_script_it_has() -> None:
+    """A modern content site is full of script and still has its article in the
+    document. Flagging those would train the model to render everything."""
+    page = await fetcher(serving(shell(text_chars=9_000, html_chars=40_000, scripts=30))).fetch(
+        "https://example.invalid/"
+    )
+
+    assert not page.scripted
+
+
+async def test_a_short_page_without_script_is_just_short() -> None:
+    page = await fetcher(serving("<html><body><p>Closed today.</p></body></html>")).fetch(
+        "https://example.invalid/"
+    )
+
+    assert not page.scripted
+
+
+async def test_something_that_is_not_html_is_never_a_shell() -> None:
+    page = await fetcher(serving("just words", content_type="text/plain")).fetch(
+        "https://example.invalid/x.txt"
+    )
+
+    assert not page.scripted
 
 
 # -- failures the model has to read -------------------------------------------

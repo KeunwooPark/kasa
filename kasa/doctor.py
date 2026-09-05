@@ -79,6 +79,7 @@ async def diagnose(
     checks += _embeddings(cfg)
     checks.append(_search(cfg))
     checks.append(_fetch(cfg))
+    checks.append(_browser(cfg))
     return Report(tuple(checks))
 
 
@@ -179,6 +180,41 @@ def _fetch(cfg: Config) -> Check:
         Status.OK,
         f"up to {fetch.max_chars:,} chars, {fetch.timeout_seconds:.0f}s, "
         f"{fetch.max_redirects} redirect(s)",
+    )
+
+
+def _browser(cfg: Config) -> Check:
+    """Whether a page can be rendered, and whether there is a browser to do it.
+
+    The import is the check. `playwright` being installed is what separates
+    "off because nobody asked" from "on, and it will fail on the first render",
+    and the second is exactly the kind of thing `doctor` exists to say before a
+    turn discovers it.
+    """
+    if not cfg.fetch.enabled:
+        return Check(
+            "page rendering", Status.SKIP, "web fetch is off, so there is nothing to render"
+        )
+    if not cfg.browser.enabled:
+        return Check(
+            "page rendering",
+            Status.SKIP,
+            "off; a page that draws itself in the browser comes back without its content",
+        )
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return Check(
+            "page rendering",
+            Status.FAIL,
+            "enabled, but the browser extra is not installed — "
+            "`uv sync --extra browser && uv run playwright install chromium`",
+        )
+    return Check(
+        "page rendering",
+        Status.OK,
+        f"chromium, up to {cfg.browser.timeout_seconds:.0f}s and "
+        f"{cfg.browser.max_requests} request(s) per page",
     )
 
 
