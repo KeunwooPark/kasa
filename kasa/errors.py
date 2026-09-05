@@ -103,6 +103,25 @@ class SearchError(KasaError):
     """
 
 
+class FetchError(KasaError):
+    """A URL could not be read. Travels the same route as `SearchError`.
+
+    Its message is shown to the model, so it says what went wrong and never
+    quotes the response that went wrong — an error page is somebody else's
+    text, and the whole point of `kasa/fetch` is that such text arrives on the
+    untrusted side of a delimiter or not at all.
+    """
+
+
+class Blocked(FetchError):
+    """The URL was refused before anything was sent to it.
+
+    Its own class because it is the one fetch failure that is a decision rather
+    than an accident: rephrasing will not help and retrying will not either,
+    and `kasa/fetch/guard.py` is the only thing that raises it.
+    """
+
+
 class StoreError(KasaError):
     """The database could not be opened or read.
 

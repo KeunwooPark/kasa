@@ -6,8 +6,17 @@ from typing import Any
 import httpx
 import pytest
 
-from kasa.config import Config, SearchSettings, SlackSettings, write_config
-from kasa.doctor import Check, Report, Status, _search, _slack, diagnose, verify_repo_visibility
+from kasa.config import Config, FetchSettings, SearchSettings, SlackSettings, write_config
+from kasa.doctor import (
+    Check,
+    Report,
+    Status,
+    _fetch,
+    _search,
+    _slack,
+    diagnose,
+    verify_repo_visibility,
+)
 from kasa.errors import ConfigError
 from kasa.github import GitHubClient
 from kasa.memory.bootstrap import bootstrap
@@ -555,6 +564,27 @@ async def test_a_configured_search_says_where_its_key_came_from(
 
     assert check.status is Status.OK
     assert check.detail == "brave via KASA_BRAVE"
+
+
+# -- web fetch ---------------------------------------------------------------
+
+
+async def test_fetching_is_on_and_says_what_its_limits_are() -> None:
+    """ "The page came back cut off" is otherwise a mystery, and the answer is
+    a number in a config file nobody has open."""
+    check = _fetch(Config())
+
+    assert check.status is Status.OK
+    assert "20,000 chars" in check.detail
+
+
+async def test_fetching_turned_off_is_a_skip_not_a_failure() -> None:
+    """An install that wants the outbound surface gone made a choice; the
+    report should not treat it as damage."""
+    check = _fetch(Config(fetch=FetchSettings(enabled=False)))
+
+    assert check.status is Status.SKIP
+    assert "cannot open a page" in check.detail
 
 
 async def test_the_key_is_resolved_from_the_vault_as_well_as_the_environment(

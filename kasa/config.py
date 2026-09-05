@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from kasa.core.agent import AgentConfig
 from kasa.core.context import ContextBudget
 from kasa.errors import ConfigError
+from kasa.fetch.client import WebFetcher
 from kasa.llm.anthropic_compat import AnthropicCompatProvider
 from kasa.llm.base import LLMProvider
 from kasa.llm.cost import CostMeter, Price, PriceBook
@@ -487,6 +488,45 @@ class SearchSettings(BaseModel):
         )
 
 
+class FetchSettings(BaseModel):
+    """Reading a page, on unless an install says otherwise.
+
+    The other way round from `[search]`, and for a reason that is not
+    inconsistency: search cannot work without a key somebody went and got, so
+    its absence is the honest default. Fetching needs nothing, and a capability
+    that has to be discovered and enabled is a capability that is missing on
+    the day it was needed — the model searched, found the page that had the
+    answer, and could not open it.
+
+    What makes fetching safe is `kasa/fetch/guard.py`, not this flag. The flag
+    is for an install that wants the whole outbound surface gone: set
+    `enabled = false` and the tool is not registered, the same as an unnamed
+    search `kind`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    #: The whole request, redirects included. A page is a detour on a turn
+    #: somebody is waiting through.
+    timeout_seconds: float = Field(default=15.0, gt=0)
+    #: Off the wire, before any text is extracted from it.
+    max_bytes: int = Field(default=2_000_000, ge=1_024)
+    #: Handed to the model. What actually costs context.
+    max_chars: int = Field(default=20_000, ge=500)
+    max_redirects: int = Field(default=4, ge=0, le=10)
+    #: Zero by default and still counted, on the same terms as search.
+    cost_per_call_usd: float = Field(default=0.0, ge=0)
+
+    def build(self) -> WebFetcher:
+        return WebFetcher(
+            timeout=self.timeout_seconds,
+            max_bytes=self.max_bytes,
+            max_chars=self.max_chars,
+            max_redirects=self.max_redirects,
+        )
+
+
 class BudgetSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -547,6 +587,7 @@ class Config(BaseModel):
     store: StoreSettings = Field(default_factory=StoreSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    fetch: FetchSettings = Field(default_factory=FetchSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
     tasks: TaskSettings = Field(default_factory=TaskSettings)
     #: USD per million tokens, keyed by model-name prefix. Empty by default:
@@ -777,6 +818,10 @@ def render_toml(cfg: Config) -> str:
         )
 
     for name, section in (
+        # Only what an install changed. Fetching is on with every bound at its
+        # default, so a fresh config says nothing about it — and a config that
+        # does mention it is a config where somebody moved a limit.
+        ("fetch", cfg.fetch),
         ("memory", cfg.memory),
         ("episodes", cfg.episodes),
         ("promote", cfg.promote),

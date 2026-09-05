@@ -64,6 +64,29 @@ async def run(tool: Any, **args: Any) -> str:
     return str(await tool.handler(args, ToolContext(session_id="s1")))
 
 
+# -- what the model is told about it -----------------------------------------
+
+
+async def test_the_description_says_there_is_no_fetch_tool_when_there_is_not() -> None:
+    """A model told a capability exists will spend a turn discovering it does
+    not, and then apologize for it. The same reason `[search]` registers
+    nothing when it names no `kind`."""
+    tool = web_search_tool(provider=FakeSearch())
+
+    assert "no tool for fetching a page" in tool.description
+    assert "web_fetch" not in tool.description
+
+
+async def test_the_description_points_at_web_fetch_when_there_is_one() -> None:
+    """The other half, and the one that matters for #186: a search that has
+    found the page with the answer on it should say so rather than stop at the
+    snippet."""
+    tool = web_search_tool(provider=FakeSearch(), can_fetch=True)
+
+    assert "web_fetch" in tool.description
+    assert "no tool for fetching" not in tool.description
+
+
 # -- the untrusted boundary --------------------------------------------------
 
 

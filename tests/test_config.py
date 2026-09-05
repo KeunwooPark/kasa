@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from kasa.config import Config, SearchSettings, config_from_env, load_config, write_config
+from kasa.config import (
+    Config,
+    FetchSettings,
+    SearchSettings,
+    config_from_env,
+    load_config,
+    write_config,
+)
 from kasa.errors import ConfigError
 from kasa.llm.registry import ModelRole
 
@@ -347,3 +354,46 @@ def test_a_search_key_is_never_written_into_the_config(tmp_path: Path) -> None:
 def test_a_search_asking_for_more_results_than_the_tool_allows_is_refused() -> None:
     with pytest.raises(ValidationError):
         SearchSettings(kind="brave", max_results=50)
+
+
+# -- web fetch ---------------------------------------------------------------
+
+
+def test_fetching_is_on_without_being_asked_for() -> None:
+    """The other way round from search, and not by accident. Search cannot work
+    without a key somebody went and got, so its absence is honest. Fetching
+    needs nothing, and a capability that has to be discovered and enabled is a
+    capability that is missing on the day it was needed (#186)."""
+    assert Config().fetch.enabled
+
+
+def test_fetching_can_be_turned_off_entirely() -> None:
+    """For an install that wants the outbound surface gone. What makes it safe
+    is `kasa/fetch/guard.py`; this is for people who want neither."""
+    assert not Config(fetch=FetchSettings(enabled=False)).fetch.enabled
+
+
+def test_the_fetch_settings_survive_the_round_trip(tmp_path: Path) -> None:
+    cfg = Config(fetch=FetchSettings(enabled=False, max_chars=5_000, max_redirects=1))
+    path = tmp_path / "config.toml"
+    write_config(cfg, path)
+
+    assert load_config(path) == cfg
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"timeout_seconds": 0},
+        {"max_bytes": 10},
+        {"max_chars": 10},
+        {"max_redirects": -1},
+        {"max_redirects": 50},
+        {"cost_per_call_usd": -1},
+    ],
+)
+def test_a_bound_that_is_not_a_bound_is_refused(kwargs: dict[str, float]) -> None:
+    """Every field here exists to cap something. A cap of zero redirects is a
+    choice; a cap of fifty is the absence of one."""
+    with pytest.raises(ValidationError):
+        FetchSettings(**kwargs)

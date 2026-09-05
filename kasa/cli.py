@@ -30,6 +30,7 @@ from kasa.core.schedule_tools import schedule_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError, KasaError
+from kasa.fetch import WebFetcher, web_fetch_tool
 from kasa.init import run_init
 from kasa.llm.tokens import default_tokenizer
 from kasa.memory.document import Problem
@@ -990,6 +991,21 @@ async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
         tools = builtin_tools()
         retriever = None
         search: SearchProvider | None = None
+        fetcher: WebFetcher | None = None
+
+        # Before search, because `web_search`'s description has to say whether
+        # there is a tool for opening a result. A model told there is none will
+        # not go looking for one.
+        if cfg.fetch.enabled:
+            fetcher = cfg.fetch.build()
+            tools.append(
+                web_fetch_tool(
+                    fetcher=fetcher,
+                    meter=registry.meter,
+                    cost_per_call_usd=cfg.fetch.cost_per_call_usd,
+                    timeout=cfg.fetch.timeout_seconds + 5.0,
+                )
+            )
 
         if cfg.search.configured:
             try:
@@ -1007,6 +1023,7 @@ async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
                         default_results=cfg.search.max_results,
                         cost_per_call_usd=cfg.search.cost_per_call_usd,
                         timeout=cfg.search.timeout_seconds + 5.0,
+                        can_fetch=fetcher is not None,
                     )
                 )
 
@@ -1054,6 +1071,8 @@ async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
             await registry.aclose()
             if search is not None:
                 await search.aclose()
+            if fetcher is not None:
+                await fetcher.aclose()
 
 
 async def _repl(cfg: Config) -> None:
