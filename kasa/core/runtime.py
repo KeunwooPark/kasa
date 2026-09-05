@@ -197,6 +197,10 @@ class Runtime:
                 # stored for it (#25).
                 external_id=turn.event.external_id,
                 credential_scrubbed=turn.event.credential_scrubbed,
+                # Whether anybody actually said this just now (#179). The
+                # session's is not an alternative here: origin is a property of
+                # the event, and a thread can carry both kinds.
+                origin=turn.event.origin,
             )
         except BaseException:
             # Including cancellation, which is what a shutdown mid-turn is. A

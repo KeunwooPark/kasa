@@ -493,6 +493,31 @@ class BudgetSettings(BaseModel):
     daily_usd_ceiling: float | None = Field(default=None, ge=0)
 
 
+class TaskSettings(BaseModel):
+    """Bounds on the schedules a person may create.
+
+    Every firing of a standing task is a full turn — retrieval, a frontier
+    model, however many tools it reaches for — so an unbounded table is a bill
+    rather than a feature. These are the three numbers that keep it one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Per person, counting active and paused. Generous enough that nobody
+    #: bumps into it doing the obvious thing, low enough that a runaway loop of
+    #: "make me a schedule" cannot fill the table.
+    max_per_owner: int = Field(default=20, ge=1)
+
+    #: The floor between two fires, checked on the gap the expression actually
+    #: produces rather than on how it is written. `*/15` and `0,15,30,45` are
+    #: the same schedule and are treated as one.
+    min_interval_minutes: int = Field(default=15, ge=1)
+
+    #: Consecutive failed runs before a task is paused and its owner told. A
+    #: task failing quietly forever is worse than one that stops.
+    disable_after_failures: int = Field(default=5, ge=1)
+
+
 class RetrySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -523,6 +548,7 @@ class Config(BaseModel):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
+    tasks: TaskSettings = Field(default_factory=TaskSettings)
     #: USD per million tokens, keyed by model-name prefix. Empty by default:
     #: a stale built-in price table is worse than an absent one.
     pricing: dict[str, PriceSettings] = Field(default_factory=dict)
@@ -762,6 +788,7 @@ def render_toml(cfg: Config) -> str:
         ("store", cfg.store),
         ("retry", cfg.retry),
         ("budget", cfg.budget),
+        ("tasks", cfg.tasks),
     ):
         lines += _table(name, section)
     for model, price in cfg.pricing.items():

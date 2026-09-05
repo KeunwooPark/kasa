@@ -31,13 +31,23 @@ class SlackPostError(KasaError):
 
 
 async def post_message(
-    token: str, channel: str, text: str, *, client: httpx.AsyncClient | None = None
+    token: str,
+    channel: str,
+    text: str,
+    *,
+    thread_ts: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> str:
     """Post `text` to `channel`, returning the message timestamp.
 
     Slack answers a rejected call with HTTP 200 and `{"ok": false}`, so the
     status code is not the check — a caller that only looked at it would report
     a digest as delivered every night while nothing was ever posted.
+
+    `thread_ts` puts the message in a thread rather than in the channel. The
+    digest wants the channel; a standing task that had to be paused wants the
+    thread it was created in, because that is the only place its owner has any
+    context for what was paused (#179).
     """
     owned = client is None
     http = client or httpx.AsyncClient(timeout=TIMEOUT)
@@ -45,7 +55,9 @@ async def post_message(
         response = await http.post(
             POST_MESSAGE,
             headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text},
+            json=(
+                {"channel": channel, "text": text} | ({"thread_ts": thread_ts} if thread_ts else {})
+            ),
         )
         body: dict[str, Any] = response.json()
     except httpx.HTTPError as exc:

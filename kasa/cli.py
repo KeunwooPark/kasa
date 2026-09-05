@@ -40,6 +40,15 @@ from kasa.memory.retrieve import Retriever
 from kasa.redact import Redactor
 from kasa.runner.jobs import default_specs
 from kasa.runner.scheduler import Scheduler, UnknownJob
+from kasa.runner.tasks import (
+    ACTIVE,
+    PAUSED,
+    TASK_KIND,
+    Task,
+    TaskError,
+    Tasks,
+    render_fires,
+)
 from kasa.search import SearchProvider, web_search_tool
 from kasa.store import Store
 from kasa.vault import Vault, check_placement, clear_cache, load_vault, vault_path
@@ -58,6 +67,8 @@ job_app = typer.Typer(help="Background jobs.", no_args_is_help=True)
 app.add_typer(job_app, name="job")
 review_app = typer.Typer(help="Things Kasa decided not to decide alone.", no_args_is_help=True)
 app.add_typer(review_app, name="review")
+task_app = typer.Typer(help="Schedules a person created.", no_args_is_help=True)
+app.add_typer(task_app, name="task")
 vault_app = typer.Typer(
     help="Secrets held on this machine, and nowhere else.", no_args_is_help=True
 )
@@ -638,6 +649,190 @@ def job_retry(config: ConfigOption = None) -> None:
     _run(main())
 
 
+TaskIdArgument = Annotated[str, typer.Argument(help="The task, as `kasa task list` shows it.")]
+
+
+@task_app.command("list")
+def task_list(config: ConfigOption = None) -> None:
+    """Show every standing task, and when each fires next."""
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            tasks = await Tasks(store, cfg.tasks).all()
+        if not tasks:
+            console.print("[dim]no standing tasks[/dim]")
+            return
+        table = Table(show_header=True)
+        for column in ("id", "owner", "schedule", "next", "state", "last run"):
+            table.add_column(column, no_wrap=column != "schedule", overflow="fold")
+        for task in tasks:
+            table.add_row(
+                task.id,
+                task.owner,
+                task.label,
+                _next_fire(task),
+                _task_state(task),
+                str(task.last_run_at or "")[:16] or "[dim]never[/dim]",
+            )
+        console.print(table)
+        # The prompt is what somebody typed, and a task created in a DM carries
+        # a DM's text. Printed on the operator's own terminal with the scope
+        # beside it, the way `review list` prints a claim, and never anywhere a
+        # channel can read.
+        for task in tasks:
+            console.print(f"\n[bold]{task.id}[/bold] [dim]({task.scope} · {task.session_id})[/dim]")
+            console.print(f"  {task.prompt}")
+            if task.last_error:
+                err.print(f"  [red]last error[/red]: {task.last_error}")
+
+    _run(main())
+
+
+@task_app.command("add")
+def task_add(
+    prompt: Annotated[str, typer.Argument(help="What to ask, each time it fires.")],
+    cron: Annotated[str, typer.Option("--cron", help="Five fields: `0 9 * * 1-5`.")],
+    timezone: Annotated[
+        str | None, typer.Option("--tz", help="IANA zone the hour is read in, e.g. Asia/Seoul.")
+    ] = None,
+    session: Annotated[
+        str, typer.Option("--session", help="The conversation it runs and answers in.")
+    ] = "cli",
+    owner: Annotated[str, typer.Option("--owner", help="Who it belongs to.")] = "cli",
+    once: Annotated[bool, typer.Option("--once", help="Fire once, then finish.")] = False,
+    config: ConfigOption = None,
+) -> None:
+    """Create a standing task.
+
+    The destination is the session, and there is no option for it here for the
+    same reason there is no argument for it in the tools: a task answers in the
+    conversation it belongs to.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            try:
+                task = await Tasks(store, cfg.tasks).create(
+                    owner=owner,
+                    surface="cli",
+                    session_id=session,
+                    prompt=prompt,
+                    cron=cron,
+                    timezone=timezone,
+                    fire_once=once,
+                )
+            except TaskError as exc:
+                err.print(f"[red]error[/red]: {exc}")
+                raise typer.Exit(1) from exc
+        console.print(f"[green]created[/green] {task.id}")
+        for fire in render_fires(task.next_fires(), task.timezone):
+            console.print(f"  {fire}")
+        if not cfg.slack.configured:
+            # Nothing in this install stays up, so nothing will fire this. Said
+            # here rather than left to be discovered, because a schedule that
+            # silently never runs is the worst thing this command could do.
+            err.print(
+                "[yellow]![/yellow] no daemon is configured in this build, so nothing will fire"
+                " this on its own. `kasa run --slack` is the process that does;"
+                f" `kasa task run {task.id}` fires it by hand."
+            )
+
+    _run(main())
+
+
+@task_app.command("rm")
+def task_rm(task_id: TaskIdArgument, config: ConfigOption = None) -> None:
+    """Delete a task. An occurrence already queued for it will not post."""
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            gone = await Tasks(store, cfg.tasks).cancel(task_id)
+        if not gone:
+            err.print(f"[yellow]![/yellow] no task {task_id}")
+            raise typer.Exit(1)
+        console.print(f"[green]deleted[/green] {task_id}")
+
+    _run(main())
+
+
+@task_app.command("pause")
+def task_pause(task_id: TaskIdArgument, config: ConfigOption = None) -> None:
+    """Stop a task firing, without forgetting it."""
+    _set_state(task_id, PAUSED, config)
+
+
+@task_app.command("resume")
+def task_resume(task_id: TaskIdArgument, config: ConfigOption = None) -> None:
+    """Start it again, and forget the failures that stopped it."""
+    _set_state(task_id, ACTIVE, config)
+
+
+@task_app.command("run")
+def task_run(task_id: TaskIdArgument, config: ConfigOption = None) -> None:
+    """Fire one task now, without waiting for the clock.
+
+    This queues the turn; it does not answer it. What answers an inbox row is
+    a running dispatcher, so on a terminal this is how you check that a task
+    reaches the queue with the right session and scope — and `kasa run --slack`
+    is what makes the answer appear.
+    """
+
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            if await Tasks(store, cfg.tasks).get(task_id) is None:
+                err.print(f"[red]error[/red]: no task {task_id}")
+                raise typer.Exit(1)
+            job = await Scheduler(store, default_specs(cfg, store)).run_now(
+                TASK_KIND, {"task_id": task_id}
+            )
+        if job["state"] == "done":
+            console.print(f"queued a turn for {task_id}")
+            return
+        err.print(f"[red]{task_id} {job['state']}[/red]: {job['last_error'] or 'it never ran'}")
+        raise typer.Exit(1)
+
+    _run(main())
+
+
+def _set_state(task_id: str, state: str, config: Path | None) -> None:
+    async def main() -> None:
+        cfg = _load(config)
+        async with await Store.open(cfg.store.resolved()) as store:
+            tasks = Tasks(store, cfg.tasks)
+            moved = await (tasks.resume(task_id) if state == ACTIVE else tasks.pause(task_id))
+        if not moved:
+            err.print(f"[yellow]![/yellow] no task {task_id}")
+            raise typer.Exit(1)
+        console.print(f"[green]{state}[/green] {task_id}")
+
+    _run(main())
+
+
+def _next_fire(task: Task) -> str:
+    """When this fires next, or why it never will.
+
+    A schedule that stopped parsing — a zone this machine has no database
+    entry for — must show up here rather than as an empty cell: it is the one
+    thing `kasa task list` is for.
+    """
+    if task.state != ACTIVE:
+        return "[dim]—[/dim]"
+    try:
+        return render_fires(task.next_fires(1), task.timezone)[0]
+    except KasaError as exc:
+        return f"[red]{exc}[/red]"
+
+
+def _task_state(task: Task) -> str:
+    if task.state == PAUSED and task.consecutive_failures:
+        return f"[red]paused[/red] ({task.consecutive_failures} failure(s))"
+    return task.state
+
+
 def _by_kind(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, tuple[str, str]]]:
     """`{kind: {state: (count, last run)}}`, from one row per (kind, state)."""
     grouped: dict[str, dict[str, tuple[str, str]]] = {}
@@ -869,6 +1064,11 @@ async def _serve_slack(cfg: Config) -> None:
             agent.store,
             default_specs(cfg, agent.store, agent.registry),
             pause_when=agent.registry.meter.daily_ceiling_reached,
+            # The second half of the clock: schedules a person created, read
+            # from the tasks table on every tick rather than compiled in. Only
+            # here, because this is the process that is still running at nine
+            # in the morning.
+            clocks=[Tasks(agent.store, cfg.tasks)],
         )
         console.print(
             f"[green]Connected[/green] to Slack as {adapter.context.bot_user_id}"

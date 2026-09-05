@@ -46,6 +46,17 @@ cannot verify it rather than inventing an answer.
 
 If you do not know something, say so."""
 
+#: Added to the system prompt for a turn a standing task started (#179).
+#: Without it the model has a user message it cannot account for: nobody spoke,
+#: the thread may have been quiet for a week, and the obvious reading of "give
+#: me the overnight AI news" arriving out of nowhere is that it was asked a
+#: moment ago. Answering the question is still the whole job — this only says
+#: where the question came from.
+SCHEDULED_TURN = """This turn was started by a standing task the person set up earlier, not by
+anything they said just now. Do the work and give the answer on its own terms.
+Do not thank them for asking, do not refer to it as something they just said,
+and do not open by explaining that this is a scheduled message."""
+
 
 @dataclass(slots=True)
 class AgentConfig:
@@ -164,6 +175,7 @@ class Agent:
         on_delta: DeltaSink | None = None,
         external_id: str | None = None,
         credential_scrubbed: bool = False,
+        origin: str = "message",
     ) -> AgentResult:
         await self._store.ensure_session(session_id, surface=surface, scope=scope)
         # `external_id` is the surface's own key for this message, and it is
@@ -175,6 +187,11 @@ class Agent:
             session_id, Message.user(user_text), author=author, external_id=external_id
         )
         context = ToolContext(session_id=session_id, scope=scope)
+        # Built once, outside the loop: it is the same on every pass, and the
+        # system block is the head of the cacheable prefix.
+        system_prompt = self.config.system_prompt
+        if origin == "scheduled":
+            system_prompt = f"{system_prompt}\n\n{SCHEDULED_TURN}"
 
         usage = Usage()
         pinned: list[str] = []
@@ -198,7 +215,7 @@ class Agent:
             if iteration == 1:
                 pinned, retrieved, recalled = await self._recall(user_text, history, scope)
             packed = self._packer.pack(
-                system_prompt=self.config.system_prompt,
+                system_prompt=system_prompt,
                 pinned=pinned,
                 retrieved=retrieved,
                 recent=history,

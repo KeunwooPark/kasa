@@ -51,11 +51,12 @@ TERMINAL = frozenset({"done", "failed"})
 def only_spec(cfg: Config, store: Store) -> JobSpec:
     """The reindex spec.
 
-    `config_for` deliberately has no model configured, so the only other thing
-    that registers alongside it is `forget`, which needs no model either.
+    `config_for` deliberately has no model configured, so the only other things
+    that register alongside it are `forget`, which needs no model either, and
+    `task_run`, which registers on nothing at all.
     """
     specs = {spec.kind: spec for spec in default_specs(cfg, store)}
-    assert sorted(specs) == ["forget", "reindex"]
+    assert sorted(specs) == ["forget", "reindex", "task_run"]
     return specs["reindex"]
 
 
@@ -77,11 +78,11 @@ def with_model(cfg: Config) -> Config:
 def test_episode_close_registers_wherever_there_is_a_model(store: Store) -> None:
     """No repo, and it still registers: it writes to SQLite, and it is what
     fills the queue `promote` will later drain."""
-    specs = default_specs(with_model(Config()), store)
+    specs = {spec.kind: spec for spec in default_specs(with_model(Config()), store)}
 
-    assert [spec.kind for spec in specs] == ["episode_close"]
-    assert specs[0].cron is not None
-    assert specs[0].cron.expression == EVERY_FIVE_MINUTES
+    assert sorted(specs) == ["episode_close", "task_run"]
+    assert specs["episode_close"].cron is not None
+    assert specs["episode_close"].cron.expression == EVERY_FIVE_MINUTES
 
 
 def test_a_build_with_no_model_registers_no_consolidation(clone: Path, store: Store) -> None:
