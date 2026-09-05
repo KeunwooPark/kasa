@@ -3,7 +3,7 @@
 The repo is meant to be opened by a person. A directory holding two hundred
 files named after slugs is not something anybody browses, so `reorganize`
 regenerates an index beside them — the human entry point the design asks for
-(§4.4).
+(§4.5).
 
 Generated from the manifest and never by a model. These are the one place in
 `memory/` where a file is not somebody's claim about the world, which is why
