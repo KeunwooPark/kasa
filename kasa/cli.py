@@ -26,6 +26,7 @@ from kasa.core.agent import Agent
 from kasa.core.context import ContextPacker
 from kasa.core.inbox import Inbox
 from kasa.core.memory_tools import memory_tools
+from kasa.core.schedule_tools import schedule_tools
 from kasa.core.tools import ToolRegistry, builtin_tools
 from kasa.doctor import Report, Status, diagnose, verify_repo_visibility
 from kasa.errors import ConfigError, KasaError
@@ -959,11 +960,17 @@ def _print_report(report: Report) -> None:
 
 
 @asynccontextmanager
-async def _agent(cfg: Config) -> AsyncIterator[Agent]:
+async def _agent(cfg: Config, *, daemon: bool = False) -> AsyncIterator[Agent]:
     """Everything a surface talks to, built once and torn down on every path.
 
     Shared by the terminal and by Slack, so a conversation held in one is
     indistinguishable in the database from one held in the other.
+
+    `daemon` is the one thing the two do not share: whether this process will
+    still be running later. The scheduling tools are registered only when it
+    will be, because a REPL is not alive at nine in the morning, and a tool
+    that silently creates rows nothing will ever fire is worse than a tool that
+    is absent (#180). The terminal keeps `kasa task add`, which says so.
     """
     # A repo that silently became public is a serious incident, so visibility is
     # re-checked on every start rather than trusted from setup time.
@@ -1028,6 +1035,11 @@ async def _agent(cfg: Config) -> AsyncIterator[Agent]:
                 )
                 tools += memory_tools(retriever=retriever, memory=memory, store=store)
 
+        if daemon:
+            # No repo and no model needed: a schedule is a row, and what fires
+            # it is the clock this same process runs.
+            tools += schedule_tools(Tasks(store, cfg.tasks))
+
         try:
             yield Agent(
                 registry=registry,
@@ -1054,7 +1066,7 @@ async def _serve_slack(cfg: Config) -> None:
     # must keep working on an install that never asked for Slack.
     from kasa.adapters.slack import SlackAdapter
 
-    async with _agent(cfg) as agent:
+    async with _agent(cfg, daemon=True) as agent:
         adapter = await SlackAdapter.connect(
             agent, cfg.slack, scrub=Redactor.from_config(cfg).scrub
         )

@@ -35,6 +35,16 @@ class ToolContext:
 
     session_id: str = "cli"
     scope: str = "workspace"
+    #: The platform id of whoever is speaking, not a display name. A tool that
+    #: creates something owned — a standing task (#180) — needs to know whose
+    #: it is, and the model must not be the one to say.
+    author: str | None = None
+    #: Where an answer in this conversation goes, exactly as the event carried
+    #: it. Opaque here, and only a surface reads it back. `schedule_create`
+    #: copies these onto the task it writes, which is what makes a task fire
+    #: into the thread it was asked for in and nowhere else.
+    channel: str | None = None
+    reply_to: str | None = None
     #: Memory ids the tools pulled into this turn, in the order they were
     #: reached. Mutable inside a frozen context on purpose: the scope above is
     #: a permission and must not be reassignable, while this is a notebook the
