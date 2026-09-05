@@ -45,7 +45,11 @@ Use the available tools when you need information that is current or not present
 in the conversation or memory. If no suitable tool is available, say that you
 cannot verify it rather than inventing an answer.
 
-If you do not know something, say so."""
+If you do not know something, say so.
+
+A "# Turn status" section, when present, is Kasa's own note about the turn you
+are in — how much tool budget is left, and anything else about how it is
+running. It is operational fact, not something the person said."""
 
 #: Added to the system prompt for a turn a standing task started (#179).
 #: Without it the model has a user message it cannot account for: nobody spoke,
@@ -138,6 +142,35 @@ class AgentResult:
             else None
         )
         return " ".join(note for note in (security, operational) if note) or None
+
+
+def _tool_budget(remaining: int) -> str:
+    """What the model is told about how much room the turn has left (#201).
+
+    The ceiling has always been enforced silently, so the model planned as
+    though it were unbounded and the loop stopped it mid-plan: eight rounds
+    spent collecting profile URLs and none left to open one. A model that knows
+    it is on its last round writes up what it has instead.
+
+    Said as a budget rather than a warning. "Two rounds left" is something to
+    spend well; "you are about to be cut off" is something to panic about, and
+    a model that panics stops searching a round early on every turn that was
+    going to finish comfortably.
+    """
+    if remaining <= 0:
+        return (
+            "No tool rounds are left in this turn. Answer now from what you already have; "
+            "anything you call will not run."
+        )
+    if remaining == 1:
+        return (
+            "One tool round is left in this turn. Use it or answer now — anything you call "
+            "after it will not run."
+        )
+    return (
+        f"{remaining} tool rounds are left in this turn. Spend them on what the answer most "
+        "needs; when they run out you answer with whatever you have by then."
+    )
 
 
 def _refused(uses: Sequence[ToolUseBlock]) -> Message:
@@ -257,12 +290,20 @@ class Agent:
             # cacheable prefix for material that has not changed.
             if iteration == 1:
                 pinned, retrieved, recalled = await self._recall(user_text, history, scope)
+            tools = self._tools.defs()
             packed = self._packer.pack(
                 system_prompt=system_prompt,
                 pinned=pinned,
                 retrieved=retrieved,
                 recent=history,
-                tools=self._tools.defs(),
+                tools=tools,
+                # Counted from this pass, which is itself one of the rounds:
+                # the first of eight has eight left, and the extra pass past
+                # the ceiling has none. A turn with no tools registered has no
+                # budget to report and is told nothing about one.
+                status=_tool_budget(self.config.max_tool_iterations - iteration + 1)
+                if tools
+                else None,
             )
             trace = packed.trace
 
@@ -359,7 +400,9 @@ class Agent:
             retrieved=retrieved,
             recent=history,
             # Charged honestly: no schemas go out on this request, so none are
-            # counted against the system share in the trace.
+            # counted against the system share in the trace. No budget line
+            # either — there are no tools to budget, and the refused results
+            # this call is answering already say the turn is out of them.
             tools=(),
         )
         return await self._call(session_id, self._request(packed, tools=()), on_delta), packed.trace

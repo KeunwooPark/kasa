@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from kasa.core.agent import Agent, AgentConfig, AgentResult
-from kasa.core.context import ContextPacker
+from kasa.core.context import STATUS_HEADER, ContextPacker
 from kasa.core.tools import Tool, ToolContext, ToolRegistry
 from kasa.llm.registry import ModelRole, ProviderRegistry
 from kasa.llm.tokens import Tokenizer
@@ -259,6 +259,60 @@ async def test_iteration_limit_still_answers_outstanding_calls(
     used = {b.id for m in stored for b in m.tool_uses}
     answered = {b.tool_use_id for m in stored for b in m.tool_results_in}
     assert used == answered
+
+
+async def test_the_model_is_told_how_much_tool_budget_is_left(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """#201: the ceiling was enforced silently, so the model could not pace itself."""
+    agent, provider = build(
+        store,
+        tokenizer,
+        [calls("weather"), calls("weather"), says("4C in Seoul")],
+        config=AgentConfig(max_tool_iterations=4),
+    )
+    await agent.respond("s1", "weather?")
+
+    said = [req.context or "" for req in provider.requests]
+    assert "4 tool rounds are left" in said[0]
+    assert "3 tool rounds are left" in said[1]
+    assert "2 tool rounds are left" in said[2]
+    # Kasa's own voice, not something recalled from memory.
+    assert all(line.startswith(STATUS_HEADER) for line in said)
+
+
+async def test_the_last_tool_round_says_it_is_the_last(store: Store, tokenizer: Tokenizer) -> None:
+    """The pass that matters most: one round left, then none at all."""
+    agent, provider = build(
+        store,
+        tokenizer,
+        [calls("weather"), calls("weather"), calls("weather"), says("partial")],
+        config=AgentConfig(max_tool_iterations=2),
+    )
+    await agent.respond("s1", "weather?")
+
+    said = [req.context or "" for req in provider.requests]
+    assert "2 tool rounds are left" in said[0]
+    assert "One tool round is left" in said[1]
+    assert "No tool rounds are left" in said[2]
+    # The closing call has no tools at all, so it is told about no budget.
+    assert STATUS_HEADER not in said[3]
+
+
+async def test_a_turn_with_no_tools_is_told_nothing_about_a_budget(
+    store: Store, tokenizer: Tokenizer
+) -> None:
+    """A budget line is only meaningful to a model that has something to spend."""
+    provider = ScriptedProvider([says("hello")])
+    agent = Agent(
+        registry=ProviderRegistry({ModelRole.CHAT: [provider]}),
+        store=store,
+        tools=ToolRegistry([]),
+        packer=ContextPacker(tokenizer=tokenizer),
+    )
+    await agent.respond("s1", "hi")
+
+    assert STATUS_HEADER not in (provider.requests[0].context or "")
 
 
 async def test_running_out_of_tool_budget_still_answers_with_what_it_found(

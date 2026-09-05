@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from kasa.core.agent import Agent
-from kasa.core.context import ContextPacker
+from kasa.core.context import RETRIEVED_HEADER, ContextPacker
 from kasa.core.memory_tools import memory_tools
 from kasa.core.tools import ToolContext, ToolRegistry
 from kasa.llm.registry import ModelRole, ProviderRegistry
@@ -447,7 +447,10 @@ async def test_the_agent_can_answer_from_tools_when_injection_missed(
 
     result = await agent.respond("cli:1", "Who should I nudge about shipping?")
 
-    assert provider.contexts[0] is None, "pre-injection found nothing to inject"
+    # The turn's own status is always there (#201); retrieved memory is not.
+    assert RETRIEVED_HEADER not in (provider.contexts[0] or ""), (
+        "pre-injection found nothing to inject"
+    )
     assert result.tool_calls == 1
     assert result.text == "Jane owns it."
 
